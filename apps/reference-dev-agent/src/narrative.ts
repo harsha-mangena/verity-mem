@@ -19,6 +19,14 @@ export interface NarrativeOptions {
 
 const RULE = "─".repeat(78);
 
+/**
+ * Build the narrative writer.
+ *
+ * A factory rather than a module-level set of `console.log` calls so the test can
+ * capture every line the run prints and assert on it. A demo whose printed numbers
+ * could drift from its assertions is the failure this project exists to criticise,
+ * and the only way to rule that out is to read the same bytes a person reads.
+ */
 export function createNarrative(options: NarrativeOptions): {
   step(step: number, name: string, detail: Record<string, unknown>): void;
   header(lines: readonly string[]): void;

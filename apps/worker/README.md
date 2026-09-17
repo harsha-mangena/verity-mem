@@ -108,6 +108,22 @@ the row by the outbox. `worker.stopping` carries `in_flight`, which says whether
 batch was still running when the signal arrived. `worker.drained` is emitted by
 `--once` with the totals.
 
+## Watching it work
+
+```bash
+# one event through the whole write path, with the decisions and the projection it produced
+SMOKE_TENANT=worker-smoke node --experimental-strip-types apps/worker/src/smoke.ts
+
+# the worker's own assertions: kind registration, model-extractor degradation, lag, log shape
+node --experimental-strip-types --test apps/worker/src/worker.test.ts
+```
+
+`smoke.ts` writes to a *named* tenant rather than a fresh one, so running it twice
+appends to the same stream. It is deliberately not part of `pnpm test` for that
+reason. Claiming, completing, backoff and dispatch are asserted in
+`packages/ledger/src/outbox.test.ts`; `worker.test.ts` asserts only what is specific
+to this app.
+
 ## Graceful shutdown
 
 `SIGINT` and `SIGTERM` do the same four things, in this order:

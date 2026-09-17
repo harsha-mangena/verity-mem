@@ -114,6 +114,14 @@ export function startWorker(config: WorkerConfig, logger: Logger): WorkerHandle 
     }
   }
 
+  /**
+   * Initialization, then the claim loop.
+   *
+   * `started` resolves when the processors are built and the worker is claiming, not
+   * when the loop exits. Those are different moments and conflating them deadlocks
+   * `--once`: `drainOnce` waits for `started`, and a `started` that only resolved on
+   * loop exit is waiting for the shutdown that `drainOnce` has not asked for yet.
+   */
   const started = (async () => {
     const entailment = await createEntailmentBackend({
       db,
@@ -162,6 +170,17 @@ export function startWorker(config: WorkerConfig, logger: Logger): WorkerHandle 
       });
     }
 
+  })();
+
+  /**
+   * The loop, started after initialization and never awaited by the caller.
+   *
+   * A rejection here would otherwise become an unhandled rejection and kill the
+   * process without a log line, so it is caught and reported as
+   * `worker.loop_failed`.
+   */
+  const loop = (async () => {
+    await started;
     while (!closing) {
       const cycle = runCycleOnce();
       inFlight = cycle;
@@ -170,7 +189,11 @@ export function startWorker(config: WorkerConfig, logger: Logger): WorkerHandle 
       if (closing) break;
       await sleep(config.pollIntervalMs);
     }
-  })();
+  })().catch((error: unknown) => {
+    logger.error("worker.loop_failed", { ...describeError(error) });
+    process.exitCode = 1;
+  });
+  void loop;
 
   return {
     started,

@@ -213,6 +213,25 @@ export async function lexicalChannel(
  * call the default path is allowed to make *if* a hosted embedder is configured.
  * The hashing embedder is local, so the default configuration makes zero network
  * calls; `isModelCall` on the backend is what the packet reports.
+ *
+ * **The read side and the write side must agree on one `model_id`, or this channel
+ * returns nothing with no error.** The filter below is `e.model_id = $n`, so a reader
+ * whose backend reports a different id than the writer's matches zero rows — and a
+ * channel that ran and found nothing is indistinguishable, to the caller, from an
+ * authorization denial. There is no warning, because from the database's point of view
+ * nothing is wrong: it is being asked for rows that do not exist.
+ *
+ * This is not hypothetical. `HashEmbeddingBackend` appends its dimension count to the
+ * default id, so `new HashEmbeddingBackend({ modelId: "hash-ngram-v1" })` and
+ * `new HashEmbeddingBackend({ modelId: "hash-ngram-v1", dimensions: 1024 })` are two
+ * different models and two disjoint halves of one corpus. Both applications in this
+ * repository therefore construct the backend once and share the instance.
+ *
+ * The check is deliberate rather than incidental, and it is the right trade: an
+ * embedding from a different model is not a worse vector, it is a vector in a different
+ * space, and comparing across spaces produces confident nonsense. When a model changes,
+ * `/v1/replay` reports the digest move and the projection is rebuilt under the new id —
+ * that path is what makes this constraint a migration rather than a corruption.
  */
 export async function denseChannel(
   executor: QueryExecutor,

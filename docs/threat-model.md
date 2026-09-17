@@ -1119,3 +1119,43 @@ build as a whole. It checks, in order:
 - **Four evaluation stages are `not_implemented`** rather than scored zero:
   retrieval, composition, abstention and the action gate are exercised by the tests and
   the demo, but no fixture stage scores them.
+
+
+---
+
+# Addendum 5 — two operational hazards, documented after the acceptance run
+
+Neither is a security defect. Both are silent-failure shapes found by the agents that
+built the worker and the reference workload, and both are now recorded where someone
+will hit them.
+
+## A dense channel that returns nothing, with no error, when the model ids differ
+
+`denseChannel` filters on `claim_embeddings.model_id`. A reader whose embedding backend
+reports a different id than the writer's matches zero rows, and a channel that ran and
+found nothing is indistinguishable — to the caller — from an authorization denial. There
+is no warning, because the database is not doing anything wrong: it is being asked for
+rows that do not exist.
+
+This is not hypothetical. `HashEmbeddingBackend` appends its dimension count to the
+default id, so passing `modelId` alone versus `modelId` with `dimensions` produces two
+different models and two disjoint halves of one corpus. Both applications in this
+repository construct the backend once and share the instance. Recorded in
+`packages/retrieval/src/channels.ts`.
+
+## An action gate's authority comes from participation
+
+`evaluateAction` resolves reach through `principal_scopes`, which is written when a
+principal *writes* in a scope. A release manager who has only written inside their own
+user scope cannot authorise an action citing a project-scope CI claim: it refuses
+`action.denied_unknown_claim`. That is correct for the authorization model and is a real
+onboarding cliff for a new workload. Recorded as ADR 0011, together with why a role table
+is deferred rather than added now.
+
+One detail from that ADR belongs here as a threat-model observation: the refusal code
+does not distinguish "you have no relationship to this claim" from "this claim does not
+exist". For **reads** that ambiguity is deliberate and load-bearing — distinguishing them
+would make the API an existence oracle for claims a caller cannot reach. For the
+**action gate** the caller is authenticated, is about to take a side effect, and cannot
+debug the refusal from the code alone. Whether that ambiguity should be preserved at the
+action gate is an open question, and it is flagged rather than resolved.
