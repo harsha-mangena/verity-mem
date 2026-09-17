@@ -49,7 +49,7 @@ import {
   type EntailmentBackend,
   LexicalEntailmentBackend,
   UnavailableEntailmentBackend,
-  createOnnxEntailmentBackend,
+  OnnxEntailmentBackend,
 } from "@veritymem/gate";
 import {
   HashEmbeddingBackend,
@@ -106,17 +106,33 @@ export function loadServerConfig(overrides: Partial<Record<string, string>> = {}
  */
 export async function buildEntailmentBackend(config: ServerConfig): Promise<EntailmentBackend> {
   if (config.gate.backend === "onnx") {
-    if (config.gate.modelPath === null || config.gate.modelPath.length === 0) {
-      return new UnavailableEntailmentBackend(
-        "GATE_ENTAILMENT_BACKEND=onnx but GATE_MODEL_PATH is unset; the gate degrades to needs_review rather than to ungated",
-      );
-    }
-    return createOnnxEntailmentBackend({
-      modelPath: config.gate.modelPath,
-      modelSha256: config.gate.modelSha256,
+    // Throws rather than degrading. A deployment that configured the ONNX backend has
+    // said it wants evidence-backed entailment; substituting the lexical stand-in would
+    // weaken the gate without telling anyone, and `decisions.detail.entailment_backend`
+    // would name a model that never ran. The escape hatch is an explicit configuration
+    // change back to `lexical`, which is visible in the decision record.
+    return OnnxEntailmentBackend.load({
+      modelPath: requireGatePath(config, config.gate.modelPath, "GATE_MODEL_PATH"),
+      tokenizerPath: requireGatePath(config, config.gate.tokenizerPath, "GATE_TOKENIZER_PATH"),
+      ...(config.gate.modelSha256 !== null ? { modelSha256: config.gate.modelSha256 } : {}),
+      entailmentThreshold: config.gate.entailmentThreshold,
+      contradictionThreshold: config.gate.contradictionThreshold,
     });
   }
   return new LexicalEntailmentBackend({ floor: config.commitPolicy.thresholds.lexicalEntailmentFloor });
+}
+
+/** Fail with the variable's name, so an operator knows what to set. */
+function requireGatePath(config: ServerConfig, value: string | null, variable: string): string {
+  if (value === null || value.length === 0) {
+    throw new Error(
+      `GATE_ENTAILMENT_BACKEND=onnx requires ${variable}. Provision the assets with ` +
+        `'node scripts/fetch-model.mjs', or set GATE_ENTAILMENT_BACKEND=lexical to use the ` +
+        `documented stand-in.`,
+    );
+  }
+  void config;
+  return value;
 }
 
 /**

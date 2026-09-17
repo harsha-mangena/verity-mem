@@ -209,102 +209,18 @@ export class UnavailableEntailmentBackend implements EntailmentBackend {
   }
 }
 
-/**
- * ONNX-backed entailment.
+/*
+ * The ONNX backend used to live here as a documented placeholder: it fed the model a
+ * `pseudoTokenize` that hashed tokens into arbitrary ids, and it read the logits in the
+ * order `[contradiction, neutral, entailment]` when the checkpoint declares
+ * `[contradiction, entailment, neutral]`. Both were wrong in ways that produced
+ * confident, plausible-shaped output, which is the worst property a verifier can have.
  *
- * Loaded lazily through a dynamic import so that a deployment which never uses it
- * does not need `onnxruntime-node` installed, and so the failure mode of a
- * missing dependency is a clear "unavailable" rather than a startup crash.
+ * The real implementation is in `onnx-entailment.ts`: it loads the model's own
+ * tokenizer, uses the checkpoint's actual label order, validates the session's declared
+ * inputs, and pins the model, tokenizer and normaliser by digest. It throws rather than
+ * degrading when an asset is missing.
  */
-export interface OnnxEntailmentOptions {
-  readonly modelPath: string;
-  readonly modelSha256?: string | null;
-  readonly maxLength?: number;
-}
-
-export async function createOnnxEntailmentBackend(
-  options: OnnxEntailmentOptions,
-): Promise<EntailmentBackend> {
-  const fs = await import("node:fs/promises");
-  try {
-    await fs.access(options.modelPath);
-  } catch {
-    return new UnavailableEntailmentBackend(`model not found at ${options.modelPath}`);
-  }
-
-  // `onnxruntime-node` is an optional peer: a deployment that uses the lexical
-  // backend or the test suite must not be forced to install a native inference
-  // runtime. The dynamic import keeps it out of the module graph, and the catch
-  // turns a missing dependency into an explicit "unavailable" verdict rather
-  // than a startup crash.
-  // The module is optional, so its types are described structurally here rather
-  // than imported. That keeps a deployment on the lexical backend from needing the
-  // native runtime's type declarations at all.
-  interface OrtTensorLike {
-    readonly data: ArrayLike<number>;
-  }
-  interface OrtSessionLike {
-    run(feeds: Record<string, unknown>): Promise<Record<string, OrtTensorLike>>;
-  }
-  interface OrtModule {
-    InferenceSession: { create(path: string): Promise<OrtSessionLike> };
-    Tensor: new (type: string, data: BigInt64Array, dims: number[]) => unknown;
-  }
-  let ort: OrtModule;
-  try {
-    // @ts-ignore optional peer dependency, absent unless the ONNX backend is enabled
-    ort = (await import("onnxruntime-node")) as OrtModule;
-  } catch {
-    return new UnavailableEntailmentBackend(
-      "onnxruntime-node is not installed (add it to enable GATE_ENTAILMENT_BACKEND=onnx)",
-    );
-  }
-
-  const session = await ort.InferenceSession.create(options.modelPath);
-  const maxLength = options.maxLength ?? 512;
-
-  // The model hash is verified against the configured expectation so that a gate
-  // swap cannot happen silently: the digest is recorded on every decision.
-  let modelSha256 = options.modelSha256 ?? null;
-  if (modelSha256 === null) {
-    const bytes = await fs.readFile(options.modelPath);
-    modelSha256 = createHash("sha256").update(bytes).digest("hex");
-  }
-
-  return {
-    name: "onnx-deberta-v3-mnli",
-    modelSha256,
-    isModelCall: false,
-    async entails(request: EntailmentRequest): Promise<EntailmentVerdict> {
-      // A real implementation tokenises with the model's own tokenizer. Until that
-      // artefact is pinned alongside the weights, this refuses rather than
-      // guessing: an entailment model fed the wrong tokenisation produces
-      // confident nonsense.
-      const ids = pseudoTokenize(request.premise, request.hypothesis, maxLength);
-      const feeds = {
-        input_ids: new ort.Tensor("int64", BigInt64Array.from(ids.inputIds.map(BigInt)), [1, ids.length]),
-        attention_mask: new ort.Tensor("int64", BigInt64Array.from(ids.attentionMask.map(BigInt)), [1, ids.length]),
-        token_type_ids: new ort.Tensor("int64", BigInt64Array.from(ids.tokenTypeIds.map(BigInt)), [1, ids.length]),
-      };
-      const output = await session.run(feeds);
-      const logits = output["logits"] ?? Object.values(output)[0];
-      if (!logits) return verdict("unknown", 0);
-      const data = Array.from(logits.data as Float32Array);
-      // MNLI label order: contradiction, neutral, entailment.
-      const [contradiction, , entailment] = [data[0] ?? 0, data[1] ?? 0, data[2] ?? 0];
-      const shifted = softmax([contradiction ?? 0, data[1] ?? 0, entailment ?? 0]);
-      const entailmentScore = shifted[2] ?? 0;
-      const contradictionScore = shifted[0] ?? 0;
-      if (entailmentScore >= 0.5 && entailmentScore > contradictionScore) {
-        return { result: "entailed", score: entailmentScore, backend: "onnx-deberta-v3-mnli", modelSha256 };
-      }
-      if (contradictionScore >= 0.5) {
-        return { result: "contradiction", score: contradictionScore, backend: "onnx-deberta-v3-mnli", modelSha256 };
-      }
-      return { result: "neutral", score: shifted[1] ?? 0, backend: "onnx-deberta-v3-mnli", modelSha256 };
-    },
-  };
-}
 
 function verdict(result: EntailmentResult, score: number): EntailmentVerdict {
   return { result, score, backend: "lexical-overlap@1", modelSha256: null };

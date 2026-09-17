@@ -11,5 +11,8 @@
   "dependencies": {
     "@veritymem/contracts": "workspace:*",
     "@veritymem/ledger": "workspace:*"
+  },
+  "optionalDependencies": {
+    "onnxruntime-node": "1.23.0"
   }
 }

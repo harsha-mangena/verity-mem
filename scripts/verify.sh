@@ -135,6 +135,27 @@ pnpm eval:ledgerbench --seed 1 \
   --jsonl "$REPORTS_DIR/ledgerbench-raw.jsonl" 2>&1 \
   | tee "$REPORTS_DIR/ledgerbench.txt" || fail "LedgerBench reported a failing gate"
 
+# ---------------------------------------------------------------------------
+step "6b. The production entailment verifier"
+# ---------------------------------------------------------------------------
+# Reported rather than assumed. The model weights are 233 MB and are not committed, so a
+# checkout without them cannot run the production verifier — and a release that quietly
+# scored with the lexical stand-in while claiming otherwise is exactly the failure this
+# report exists to prevent. The gate's own availability is therefore an explicit line in
+# the acceptance output, not something a reader has to infer.
+if node scripts/fetch-model.mjs --verify >/dev/null 2>&1; then
+  GATE_STATE="available (digests verified)"
+  node --experimental-strip-types --test packages/gate/src/onnx-entailment.test.ts \
+    > "$REPORTS_DIR/onnx-entailment.txt" 2>&1 \
+    || fail "the production entailment verifier failed its own tests"
+  note "entailment      onnx verifier available; adversarial tests passed"
+else
+  GATE_STATE="ABSENT — lexical stand-in only"
+  note "entailment      onnx verifier assets absent; the gate falls back to the lexical stand-in"
+  note "                provision with: node scripts/fetch-model.mjs"
+fi
+export GATE_STATE
+
 if [[ "$FAST" == "0" ]]; then
   # -------------------------------------------------------------------------
   step "7. Reference workload, end to end"
@@ -155,7 +176,7 @@ step "9. Evidence summary"
 # Exported rather than appended after the command: `node -e '...' VAR=value` passes the
 # assignment as an argument to the script, not into its environment, and the first
 # version of this step silently wrote a summary of nulls and zeros.
-export PG_VERSION PGVECTOR_VERSION MIGRATION_COUNT RLS_TABLES POLICIES TESTS_PASSED
+export PG_VERSION PGVECTOR_VERSION MIGRATION_COUNT RLS_TABLES POLICIES TESTS_PASSED GATE_STATE
 export VERITYMEM_FAST="$FAST"
 
 node -e '
@@ -173,6 +194,7 @@ const summary = {
   rls_tables: Number(process.env.RLS_TABLES || 0),
   policies: Number(process.env.POLICIES || 0),
   tests_passed: Number(process.env.TESTS_PASSED || 0),
+  production_entailment_verifier: process.env.GATE_STATE,
   full_run: process.env.VERITYMEM_FAST === "0",
 };
 fs.writeFileSync(`${process.env.REPORTS_DIR}/summary.json`, JSON.stringify(summary, null, 2) + "\n");

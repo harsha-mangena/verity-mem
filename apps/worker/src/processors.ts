@@ -22,7 +22,7 @@
  */
 import { DEFAULT_COMMIT_POLICY } from "@veritymem/contracts";
 import { LedgerError, type Clock, type Db, type IdGenerator, type Ledger, type OutboxProcessor } from "@veritymem/ledger";
-import { CommitGate, createOnnxEntailmentBackend, LexicalEntailmentBackend, type EntailmentBackend } from "@veritymem/gate";
+import { CommitGate, LexicalEntailmentBackend, OnnxEntailmentBackend, type EntailmentBackend } from "@veritymem/gate";
 import {
   DETERMINISTIC_EXTRACTORS,
   type Extractor,
@@ -105,27 +105,45 @@ export interface GateFactoryOptions {
   readonly modelPath: string | null;
   readonly modelSha256: string | null;
   readonly lexicalFloor: number;
+  /**
+   * Required only when `backend` is `onnx`; a lexical deployment has no model. Optional
+   * rather than nullable so a lexical configuration cannot accidentally carry a stale
+   * path that a later switch to onnx would then trust.
+   */
+  readonly tokenizerPath?: string | null;
+  /** Per-backend: a softmax probability, not the lexical token-overlap fraction. */
+  readonly entailmentThreshold?: number;
+  readonly contradictionThreshold?: number;
 }
 
 /**
  * Build the entailment backend the gate runs with.
  *
- * `onnx` with no artefact on disk degrades to `UnavailableEntailmentBackend`
- * inside `createOnnxEntailmentBackend`, which returns `unknown` and therefore
- * sends candidates to `needs_review` instead of accepting them. That is the
- * correct failure direction, so this function does not substitute the lexical
- * stand-in when ONNX is requested and missing: silently swapping the gate would
- * make `decisions.detail.entailment_backend` describe a model that never ran.
+ * `onnx` with a missing or unpinned artefact **throws**, and the worker refuses to
+ * start. Earlier this degraded to an `unavailable` backend that returned `unknown` and
+ * sent everything to review; that was the right failure *direction* but the wrong
+ * severity, because a worker that starts with a dead gate looks healthy while every
+ * write it processes goes unreviewed in a queue nobody is watching. The escape hatch is
+ * an explicit configuration change back to `lexical`, which the decision record then
+ * shows.
  */
 export async function createEntailmentBackend(options: GateFactoryOptions): Promise<EntailmentBackend> {
   if (options.backend === "onnx") {
-    // A null path becomes an empty one rather than a fallback: the factory turns a
-    // missing artefact into an explicitly `unavailable` backend, and an operator
-    // who asked for ONNX is better served by "the gate is down" than by a silent
-    // downgrade to a stand-in that computes something else.
-    return createOnnxEntailmentBackend({
-      modelPath: options.modelPath ?? "",
-      modelSha256: options.modelSha256,
+    // Throws when the assets are missing or unpinned. An operator who asked for ONNX is
+    // better served by "the gate is down" than by a silent downgrade to a stand-in that
+    // computes something else under the same decision record.
+    if (!options.modelPath || !options.tokenizerPath) {
+      throw new Error(
+        "GATE_ENTAILMENT_BACKEND=onnx requires GATE_MODEL_PATH and GATE_TOKENIZER_PATH. " +
+          "Provision with 'node scripts/fetch-model.mjs', or use the lexical stand-in explicitly.",
+      );
+    }
+    return OnnxEntailmentBackend.load({
+      modelPath: options.modelPath,
+      tokenizerPath: options.tokenizerPath,
+      ...(options.modelSha256 != null ? { modelSha256: options.modelSha256 } : {}),
+      entailmentThreshold: options.entailmentThreshold ?? 0.5,
+      contradictionThreshold: options.contradictionThreshold ?? 0.5,
     });
   }
   return new LexicalEntailmentBackend({ floor: options.lexicalFloor });

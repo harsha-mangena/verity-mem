@@ -41,8 +41,17 @@ export interface Env {
   readonly gate: {
     readonly backend: "lexical" | "onnx";
     readonly modelPath: string | null;
+    readonly tokenizerPath: string | null;
     readonly modelSha256: string | null;
-    readonly confidenceThreshold: number;
+    /**
+     * Threshold on the entailment probability, per backend.
+     *
+     * One number cannot serve both backends: the lexical stand-in reports a token-overlap
+     * fraction and the ONNX model reports a softmax probability. Sharing a threshold
+     * between them is how a calibrated gate silently becomes an uncalibrated one.
+     */
+    readonly entailmentThreshold: number;
+    readonly contradictionThreshold: number;
   };
   readonly embedding: {
     readonly backend: "hash" | "openai";
@@ -136,8 +145,10 @@ export function loadEnv(overrides: Partial<Record<string, string>> = {}): Env {
     gate: {
       backend: (get("GATE_ENTAILMENT_BACKEND") ?? "lexical") === "onnx" ? "onnx" : "lexical",
       modelPath: get("GATE_MODEL_PATH") ?? null,
+      tokenizerPath: get("GATE_TOKENIZER_PATH") ?? null,
       modelSha256: get("GATE_MODEL_SHA256") ?? null,
-      confidenceThreshold: Number.parseFloat(get("GATE_CONFIDENCE_THRESHOLD") ?? "0.5"),
+      entailmentThreshold: Number.parseFloat(get("GATE_ENTAILMENT_THRESHOLD") ?? get("GATE_CONFIDENCE_THRESHOLD") ?? "0.5"),
+      contradictionThreshold: Number.parseFloat(get("GATE_CONTRADICTION_THRESHOLD") ?? "0.5"),
     },
     embedding: {
       backend: (get("EMBEDDING_BACKEND") ?? "hash") === "openai" ? "openai" : "hash",

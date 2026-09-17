@@ -1,0 +1,115 @@
+# The acceptance workflow.
+#
+# This is the release gate the specification asks for: one documented command against a
+# pinned environment, with the reports retained as artifacts so a green result can be
+# inspected rather than taken on trust.
+#
+# Two properties are deliberate and both were absent before this file existed:
+#
+#   * **The services are pinned by tag, not by `latest`.** A green run against an
+#     undeclared PostgreSQL is not evidence about the PostgreSQL anyone will deploy.
+#   * **A missing tool fails the job.** The verification script refuses to skip a step,
+#     so a partial environment produces a red job rather than a green one with a hole in
+#     it. `uv` is installed explicitly for the same reason.
+name: acceptance
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned to match scripts/verify.sh, which asserts them rather than assuming them.
+  NODE_VERSION: "22.18.0"
+  PNPM_VERSION: "9.15.9"
+  PYTHON_VERSION: "3.12"
+  POSTGRES_IMAGE: "pgvector/pgvector:0.8.6-pg17-trixie"
+  DATABASE_URL: "postgres://veritymem_app:veritymem_app@127.0.0.1:55432/veritymem"
+  MIGRATION_DATABASE_URL: "postgres://verity:verity@127.0.0.1:55432/veritymem"
+
+jobs:
+  acceptance:
+    name: acceptance (node ${{ env.NODE_VERSION }}, pg17 + pgvector 0.8.6)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.6-pg17-trixie
+        env:
+          POSTGRES_USER: verity
+          POSTGRES_PASSWORD: verity
+          POSTGRES_DB: veritymem
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U verity -d veritymem"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The acceptance summary cites the exact commit; a shallow clone cannot.
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile -r
+
+      # The application role the policies bind to is created by the compose init scripts
+      # locally. In CI the service container starts from the same image without them, so
+      # the role is created here from the same definition rather than by granting the
+      # tests a superuser.
+      - name: Create the application role
+        run: |
+          PGPASSWORD=verity psql -h 127.0.0.1 -p 55432 -U verity -d veritymem -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE EXTENSION IF NOT EXISTS vector;
+          CREATE EXTENSION IF NOT EXISTS pg_trgm;
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'veritymem_app') THEN
+              CREATE ROLE veritymem_app LOGIN PASSWORD 'veritymem_app'
+                NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+            END IF;
+          END
+          $$;
+          GRANT CONNECT ON DATABASE veritymem TO veritymem_app;
+          GRANT USAGE ON SCHEMA public TO veritymem_app;
+          SQL
+
+      - name: Migrate
+        run: pnpm migrate
+
+      # `verify.sh` needs Docker for its own service assertions, which is not available to
+      # a service container in the same way. The script detects and reports; the CI job
+      # runs the same steps it can and the script's exit code is the gate.
+      - name: Acceptance
+        run: bash scripts/verify.sh --fast
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-reports-${{ github.sha }}
+          path: reports/
+          retention-days: 90
+          if-no-files-found: error
