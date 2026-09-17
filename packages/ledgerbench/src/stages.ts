@@ -113,7 +113,13 @@ export const EXPECTATION_STAGE: Readonly<Record<Expectation["type"], StageId>> =
   expect_deleted: "forgetting",
   expect_residual_scan: "forgetting",
   expect_unverifiable_claim: "forgetting",
+  // `expect_missing` is the composer's own accounting of what it did not find, so it
+  // localises to Retrieval. `expect_abstain` is about the decision the read path reached,
+  // which is precisely what the Abstention stage owns; folding the two together would let
+  // a packet that answered confidently but listed a gap pass as an abstention.
   expect_missing: "retrieval",
+  expect_abstain: "abstention",
+  expect_action_gate: "action_gate",
 };
 
 /** The stage an assertion's failure is attributed to. */
@@ -121,41 +127,21 @@ export function stageForExpectation(type: Expectation["type"]): StageId {
   return EXPECTATION_STAGE[type];
 }
 
-/** Stages whose subject matter is not implemented, with the reason it is not. */
+/**
+ * Stages whose subject matter is not implemented, with the reason it is not.
+ *
+ * Empty, and kept as an explicit empty map rather than deleted. It is the registry the
+ * reporter consults to render "not measured", and the entry point for the next stage
+ * somebody cannot build yet: a stage whose metrics cannot be measured honestly belongs
+ * here, where the reason travels with the gap and the exit code refuses to treat it as a
+ * pass, rather than in a `return 0` that reads like a result.
+ *
+ * `expect_missing`'s `not_evaluated` path went with it. The packet composer it was
+ * waiting for exists, so every expectation in the grammar is now evaluated.
+ */
 export const UNIMPLEMENTED_STAGES: Readonly<
   Record<string, { title: string; failure_isolated: string; note: string }>
-> = {
-  retrieval: {
-    title: "Retrieval",
-    failure_isolated: "Search and authorization",
-    note:
-      "no query planner, no channel fusion, no packet. Until LedgerBench can issue a query and read a " +
-      "MemoryPacket, evidence recall@k, nDCG, stale leakage and the unauthorized-candidate count are " +
-      "unmeasurable. Reporting 0 for them would read as a catastrophic result rather than an absent one.",
-  },
-  composition: {
-    title: "Composition",
-    failure_isolated: "Prompt corruption and provenance loss",
-    note:
-      "no packet composer exists, so citation precision and claim-to-evidence entailment at composition " +
-      "time cannot be measured. The gate's own entailment verdicts are reported under Extraction, which " +
-      "answers a different question.",
-  },
-  abstention: {
-    title: "Abstention",
-    failure_isolated: "Confident answers without sufficient memory",
-    note:
-      "abstention is a property of the read path. With no read path there is nothing to abstain, and " +
-      "precision, recall and Brier score would all be artefacts of an empty result set.",
-  },
-  action_gate: {
-    title: "Action gate",
-    failure_isolated: "Memory-to-consequence risk",
-    note:
-      "the action gate is not wired in v0.1. Unsafe-allow and unnecessary-block rates require a " +
-      "beforeAction hook and a claim set for it to judge; neither exists in this build.",
-  },
-};
+> = {};
 
 /**
  * Compute every stage's metrics from a set of fixture runs.
@@ -182,29 +168,20 @@ export function evaluateStages(input: EvaluationInput): StageResult[] {
     attributionStage(runs, failures("attribution")),
     commitStage(runs, failures("commit")),
     conflictStage(runs, failures("conflict")),
-    notImplemented("retrieval", failures("retrieval")),
-    notImplemented("composition", failures("composition")),
-    notImplemented("abstention", failures("abstention")),
-    notImplemented("action_gate", failures("action_gate")),
+    retrievalStage(runs, failures("retrieval")),
+    compositionStage(runs, failures("composition")),
+    abstentionStage(runs, failures("abstention")),
+    actionGateStage(runs, failures("action_gate")),
     forgettingStage(runs, failures("forgetting")),
     replayStage(runs, failures("replay")),
     operationsStage(runs, input, failures("operations")),
   ];
-  return built.map((entry) => ({ ...entry, name: STAGE_TITLES[entry.stage] ?? entry.title }));
-}
-
-function notImplemented(stage: keyof typeof UNIMPLEMENTED_STAGES, failures: readonly string[]): StageResult {
-  const spec = UNIMPLEMENTED_STAGES[stage] as { title: string; failure_isolated: string; note: string };
-  return {
-    stage: stage as StageId,
-    title: spec.title,
-    status: "not_implemented",
-    failure_isolated: spec.failure_isolated,
-    metrics: {},
-    cases: 0,
-    note: spec.note,
-    failures,
-  };
+  return built.map((entry) => {
+    const withName = { ...entry, name: STAGE_TITLES[entry.stage] ?? entry.title };
+    return UNIMPLEMENTED_STAGES[entry.stage] === undefined
+      ? withName
+      : { ...withName, status: "not_implemented" as const, note: UNIMPLEMENTED_STAGES[entry.stage]?.note };
+  });
 }
 
 function statusFor(cases: number): StageStatus {

@@ -817,3 +817,25 @@ to the gate is only acceptable if, on the same seed:
 A gate that reaches the target by accepting contradictions has not been calibrated; it
 has been disabled. `pnpm eval:ledgerbench` exits non-zero when any of those moves, so
 the four are checked together rather than one at a time.
+
+
+---
+
+# Action authority: why a refusal is not always a bug
+
+An action gate refuses when the acting principal holds no scope that reaches a cited claim.
+Two reason codes distinguish the cases, and they have different remedies:
+
+| Code | Means | Remedy |
+| --- | --- | --- |
+| `action.denied_unknown_claim` | the claim id does not exist | correct the id; it is a typo or a stale reference |
+| `action.denied_missing_participation` | the claim exists, and the principal holds no scope reaching it | grant reach, or record participation |
+
+Reach comes from participation (recorded when a principal writes in a scope) plus live grants.
+A principal that has never written anywhere therefore cannot approve anything, which is
+fail-closed and intended — see ADR 0011 for why participation is the basis rather than a role
+table. `INSTALL.md` documents the two supported onboarding paths with worked commands, and
+`GET /readyz` reports `authority.no_reach` for a named principal along with the remedy.
+
+**Do not fix a refusal by widening the gate.** The refusal is the control operating; the
+remedy is a grant, and grants are time-bounded, purpose-scoped and auditable.

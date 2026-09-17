@@ -108,6 +108,62 @@ A privileged tool (`memory_decide`, `memory_share`, `memory_forget`) is **never 
 an ordinary session**, and the default profile is `contributor`. The server re-authorizes
 every call as well, because tool visibility is not a security boundary.
 
+## Onboarding a principal that must approve before it has written anything
+
+Reach is computed from state the server owns:
+
+```
+reach(principal) = scopes the principal participates in  ∪  live grants naming it
+```
+
+Participation is recorded when a principal **writes** in a scope, and grants are explicit. So
+a principal that has never written anywhere can read nothing and the action gate will refuse
+any claim it cites — with `action.denied_missing_participation`, which is deliberately a
+different code from `action.denied_unknown_claim`. Those two have different remedies and
+conflating them leaves an operator unable to tell a typo from an onboarding problem.
+
+This is fail-closed and correct, and it is still a cliff: a release manager who has only ever
+written inside their own user scope cannot authorise an action citing a project-scope CI
+claim. There are two supported remedies.
+
+**Grant reach explicitly.** This is the right one, because it is time-bounded, purpose-scoped
+and revocable:
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/v1/grants \
+  -H "authorization: Bearer $ADMIN_TOKEN" -H 'content-type: application/json' \
+  -d '{
+        "subject": "user:dana",
+        "resource_pattern": { "tenant": "acme", "project": "payments" },
+        "actions": ["read"],
+        "purpose": ["release_planning"],
+        "expires_at": "2026-12-31T00:00:00Z"
+      }' | jq
+```
+
+The grant lands in the same reach computation the query planner and the action gate both use,
+so one call fixes both. `GET /readyz` reports whether a named principal holds any membership
+or grant at all, and the `authority.no_reach` finding carries this instruction.
+
+**Record administrative participation.** For a principal that genuinely belongs in a scope
+rather than being granted into it:
+
+```sql
+SELECT veritymem.record_participation(
+  '00000000-0000-0000-0000-000000000000'::uuid,  -- tenant id
+  'user:dana',
+  '<scope uuid>'::uuid
+);
+```
+
+The row is labelled `admin`, so an operator reading the table can tell an administrative act
+from organic participation — which matters because participation is *evidence* (the principal
+wrote here, with a timestamp) while a grant is an *assertion*. ADR 0011 records why the
+authorization model keeps that distinction rather than adding a role table.
+
+**What not to do.** Do not widen the principal's token or bypass the gate to make the refusal
+go away. The refusal is the control working; the remedy is a grant, and a grant is auditable.
+
 ## Verifying an installation
 
 ```bash
