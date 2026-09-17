@@ -259,12 +259,21 @@ export async function recordAdminParticipation(
   }
 }
 
-/** The reachable scope ids, for binding a request context. */
+/**
+ * The reachable scope ids, for binding a request context.
+ *
+ * Takes a `QueryFn` rather than a `QueryExecutor`, because the two are not
+ * interchangeable to the compiler even though every executor satisfies the shape at
+ * runtime: `QueryExecutor.query` is generic over `R extends QueryResultRow` — an
+ * index-signature type — while `QueryFn` is generic over `R extends Record<string,
+ * unknown>`. Callers inside a transaction pass
+ * `(text, params) => executor.query(text, params)`.
+ */
 export async function callerScopeIds(
-  executor: QueryExecutor,
+  query: QueryFn,
   input: { readonly tenantId: string; readonly principal: string; readonly now: string },
 ): Promise<string[]> {
-  return (await callerScopes(executor, input)).map((scope) => scope.scope_id);
+  return (await callerScopes(query, input)).map((scope) => scope.scope_id);
 }
 
 /** The scope ids a caller reaches, together with the purposes those scopes carry. */

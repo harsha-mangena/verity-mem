@@ -908,7 +908,25 @@ const EVENT_SELECT = `
  * of a round trip and makes a mis-scoped query impossible to hide behind a
  * tenant-name join.
  */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Derive a stable tenant UUID from a slug.
+ *
+ * **Idempotent.** A value that is already a UUID is returned unchanged, and that is not
+ * a convenience: `append` resolves a slug to a UUID and then hands the result to
+ * `ensureScope`, which resolved it *again*. A caller passing a slug therefore wrote
+ * under `resolveTenantId(resolveTenantId(slug))` — a perfectly valid partition that the
+ * caller could not predict and that its own read path would never look in, because the
+ * read path derives the id once. `tenants.slug` recorded the intermediate UUID rather
+ * than the slug, so the table that exists to map the two mapped neither.
+ *
+ * It was not a security hole: row-level security held, because whichever id was written
+ * was also the id bound for that request. It was a correctness hole that cost a real
+ * afternoon, and the fix is that double resolution is now a no-op.
+ */
 export function resolveTenantId(slug: string): string {
+  if (UUID_PATTERN.test(slug)) return slug.toLowerCase();
   const hash = createHash("sha256").update(`veritymem:tenant:${slug}`, "utf8").digest();
   const bytes = Buffer.from(hash.subarray(0, 16));
   // Version 5 (name-based, SHA-1 in the RFC; SHA-256 here) and RFC 4122 variant.

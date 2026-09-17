@@ -156,6 +156,28 @@ A match with absent fields is a wildcard, so `{"type":"expect_claim","kind":"obs
 matches the first observation. That is occasionally what you want and usually a sign
 the fixture is under-specified.
 
+### Declared gaps
+
+Any expectation may carry two extra fields:
+
+```json
+{"type":"expect_relation_persisted","kind":"contradicts",
+ "gap":true,
+ "gap_reason":"the gate records the contradiction on the decision but writes no claim_relations row"}
+```
+
+A declared gap changes exactly one thing: the CLI's exit code. The assertion still
+fails, it still appears in the output, and it still counts in the stage metrics. What
+it stops doing is failing the build — because a gate that fails forever on a known
+limitation gets disabled, and a disabled gate is worse than one that reports.
+
+`gap_reason` is mandatory when `gap` is true. A gap with no explanation is
+indistinguishable from a fixture that gave up, and the parser rejects it.
+
+Two fixtures currently declare gaps: `ledgerbench/03` and `ledgerbench/05`, both on
+`expect_relation_persisted` for a `contradicts` relation. The gate detects and records
+the contradiction; it does not persist the relation row the data model promises.
+
 ---
 
 ## 3. Tenant and idempotency

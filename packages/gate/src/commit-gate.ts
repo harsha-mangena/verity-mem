@@ -504,6 +504,10 @@ export class CommitGate {
     const sensitive = candidate.sensitivity === "high";
     if (sensitive) reasonCodes.push(REASON_CODES.ADMISSION_SENSITIVE);
 
+    // Valid time is resolved here, before the decision, because the outcome determines
+    // *whether* a claim is written and the claim needs the timestamp either way.
+    const validFrom = await this.resolveValidFrom(executor, candidate.source_event_id, this.deps.clock.now().toISOString());
+
     // ---- 8. The decision ---------------------------------------------------
     const integrityOk = supporting.length > 0 && usableSupport.length === supporting.length;
     const entailmentOk =
@@ -565,7 +569,7 @@ export class CommitGate {
       outcome === "accept_limited_scope" ? candidate.event_scope_id : candidate.requested_scope_id;
     const claimId =
       outcome === "accept" || outcome === "accept_limited_scope"
-        ? await this.insertClaim(executor, candidate, acceptedScopeId, conflicts)
+        ? await this.insertClaim(executor, candidate, acceptedScopeId, conflicts, validFrom)
         : null;
 
     const decisionId = await this.insertDecision(executor, candidate, {
@@ -698,14 +702,10 @@ export class CommitGate {
     candidate: CandidateForGate,
     acceptedScopeId: string,
     conflicts: readonly ConflictHit[],
+    validFrom: string,
   ): Promise<string> {
     const claimId = this.deps.ids.next("clm");
-    const now = this.deps.clock.now().toISOString();
-
-    // Valid time starts at the moment the claim became true, which is the time of
-    // the observation it rests on — not the time the gate ran. A claim extracted
-    // today from a two-year-old document is two years old.
-    const validFrom = await this.resolveValidFrom(executor, candidate.source_event_id, now);
+    const recordedAt = this.deps.clock.now().toISOString();
 
     await executor.query(
       `INSERT INTO claims (
@@ -727,7 +727,7 @@ export class CommitGate {
         JSON.stringify(candidate.object ?? null),
         candidate.authority,
         validFrom,
-        now,
+        recordedAt,
         stripPrefix(candidate.source_event_id),
         candidate.extractor,
         candidate.model_version,
@@ -760,11 +760,15 @@ export class CommitGate {
     // Nothing is deleted; the history stays readable.
     for (const hit of conflicts) {
       if (hit.rel !== "supersedes" && hit.rel !== "duplicates") continue;
+      // Closed at the *superseding* claim's valid_from, not at the gate clock. The
+      // earlier claim was believed until the moment the new one became true, and using
+      // the clock instead can produce an interval whose bounds cross.
       await executor.query(
         `UPDATE claims
             SET status = 'superseded', valid_to = $2::timestamptz
-          WHERE claim_id = $1::uuid AND valid_to IS NULL AND claim_id <> $3::uuid`,
-        [stripPrefix(hit.claim_id), now, stripPrefix(claimId)],
+          WHERE claim_id = $1::uuid AND valid_to IS NULL AND claim_id <> $3::uuid
+            AND valid_from <= $2::timestamptz`,
+        [stripPrefix(hit.claim_id), validFrom, stripPrefix(claimId)],
       );
     }
 

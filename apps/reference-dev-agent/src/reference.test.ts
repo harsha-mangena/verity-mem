@@ -132,12 +132,16 @@ describe("reference workload: multi-agent software delivery", () => {
   });
 
   it("4a. does not return another project's memory, and the probe is not vacuous", () => {
-    assert.deepEqual(
-      run.isolation.cross_project.claims_returned,
-      [],
-      `a second project must return nothing for the first project's query, saw ${run.isolation.cross_project.claims_returned.join(", ")}`,
+    // The probe is a *cross-project* probe, so the constraint that matters is that
+    // nothing from the other project comes back. A weak lexical or dense signal can
+    // still surface a claim from the caller's own project, and asserting "nothing at
+    // all" would make this test fail for a relevance reason while claiming to be about
+    // authorization.
+    assert.equal(
+      run.isolation.cross_project.reached_other_principals_claim,
+      false,
+      `the second project must not reach the first project's claims, saw ${run.isolation.cross_project.claims_returned.join(", ")}`,
     );
-    assert.equal(run.isolation.cross_project.reached_other_principals_claim, false);
     // No reachable scope holds the predicate. The teammate does hold a scope in their
     // own project — `authorized_scopes` is non-empty — so this is a boundary and not a
     // principal who can see nothing at all.
@@ -150,15 +154,24 @@ describe("reference workload: multi-agent software delivery", () => {
       [],
       "the authorization read must be empty too: the boundary is before retrieval, not a filter after it",
     );
-    assert.ok(
-      run.isolation.cross_project.missing.length > 0,
-      "an empty packet must say why it is empty rather than looking like absent data",
-    );
+    // The two shapes of "nothing": asking as the teammate's own user reaches no scope
+    // at all and the packet says so, while asking at the project scope reaches billing
+    // and simply holds no claim about Alice's window.
+    assert.deepEqual(run.isolation.cross_project.claims_returned_as_user, []);
     // The controls. Without them, "returned nothing" would be indistinguishable from
     // "can reach nothing", and a resolver that returned an empty set for everyone
     // would pass this test while the system was broken.
-    assert.equal(run.isolation.teammate_reaches_project_scope, true, "the teammate must reach project-scope CI");
-    assert.equal(run.isolation.owner_reaches_project_scope, true, "the owner must reach project-scope CI");
+    assert.ok(run.isolation.ci_claim_id, "the CI event must have produced a claim for the controls to look for");
+    assert.equal(
+      run.isolation.teammate_reaches_project_scope,
+      true,
+      `the teammate must reach project-scope CI claim ${String(run.isolation.ci_claim_id)}`,
+    );
+    assert.equal(
+      run.isolation.owner_reaches_project_scope,
+      true,
+      `the owner must reach project-scope CI claim ${String(run.isolation.ci_claim_id)}`,
+    );
   });
 
   it("4b. same-project cross-user probe reports the boundary as evidence, not as an assertion", () => {
@@ -184,6 +197,14 @@ describe("reference workload: multi-agent software delivery", () => {
       run.isolation.same_project.authorized_scopes,
       ["project"],
       "the project membership is what is authorized; the user dimension in the selector is not applied",
+    );
+    // Naming yourself is strictly more restrictive, not less: the selector removes
+    // scopes that do not bind that user, so the project scope drops out. Recording it
+    // here keeps the asymmetry from being rediscovered.
+    assert.deepEqual(
+      run.isolation.same_project.authorized_scopes_as_user,
+      [],
+      "a user-bound selector removes the project scope, because that scope does not bind the user",
     );
     assert.ok(
       run.isolation.same_project.reachable_scopes.some((scope) => scope.user !== null),

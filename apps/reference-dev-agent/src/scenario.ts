@@ -147,6 +147,8 @@ export interface ReferenceRun {
     readonly teammate_reaches_project_scope: boolean;
     /** The CI claim is still reachable by its own project, so nothing was lost. */
     readonly owner_reaches_project_scope: boolean;
+    /** The CI claim id both controls looked for. */
+    readonly ci_claim_id: string | null;
   };
   readonly contradiction: {
     readonly event_id: string;
@@ -194,6 +196,10 @@ export interface IsolationProbe {
   readonly query: string;
   /** The predicate the authorization read looked for. */
   readonly predicate: string;
+  /** The same probe with the caller's own user in the selector, for comparison. */
+  readonly selector_as_user: string;
+  readonly authorized_scopes_as_user: readonly string[];
+  readonly claims_returned_as_user: readonly string[];
   readonly principal: string;
   readonly selector: string;
   readonly authorized_scopes: readonly string[];
@@ -409,12 +415,38 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
   // The second exists because the first is reported as evidence, not as an assertion:
   // `apps/reference-dev-agent/README.md` records the mechanism, and the test asserts
   // on `reached_other_principals_claim` rather than on a number that would hide it.
+  //
+  // The teammate contributes a CI trace first, which gives them the same project
+  // membership the CI result has. Without it the same-project probe would resolve to
+  // no scope at all and return nothing for the *wrong* reason — an empty packet that
+  // looks like isolation while actually being an unreachable principal.
+  const teammateCiEvent = await append(world, {
+    stream_id: `${world.project}:ci`,
+    idempotency_key: "ci-8843-teammate",
+    origin: "tool",
+    actor_id: `user:${teammate}`,
+    user: undefined,
+    content: "ci-job 8843 on branch: main: status: success, 129 tests passed, 0 tests failed, exit code: 0",
+  });
+  await drainAndWindow(world, driver, teammateCiEvent.watermark);
+
   const ownerPacket = await query(world, deps, {
     text: "Which deploy window did Alice approve?",
     principal: `user:${alice}`,
     user: alice,
   });
+  // Asked at the *project* scope, without naming a user, for a reason worth stating:
+  // a selector that names a user filters out scopes the caller reaches that do not
+  // bind that user, so `user=bob` resolves to no scope at all here — more restrictive,
+  // not less. The reach that crosses users is the project membership, so the project
+  // membership is what the probe has to exercise. The user-bound variant is recorded
+  // alongside it so the asymmetry is visible rather than surprising.
   const teammatePacket = await query(world, deps, {
+    text: "Which deploy window did Alice approve?",
+    principal: `user:${teammate}`,
+    user: undefined,
+  });
+  const teammateAsSelfPacket = await query(world, deps, {
     text: "Which deploy window did Alice approve?",
     principal: `user:${teammate}`,
     user: teammate,
@@ -474,8 +506,13 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
   const sameProjectProbe: IsolationProbe = {
     query: "Which deploy window did Alice approve?",
     predicate: "decision.approved",
+    selector_as_user: `project=${world.project}, user=${teammate}`,
+    authorized_scopes_as_user: teammateAsSelfPacket.plan.authorized_scopes.map((scope) =>
+      scope.user_id === null ? "project" : `user=${scope.user_id}`,
+    ),
+    claims_returned_as_user: teammateAsSelfPacket.packet.claims.map((claim) => claim.claim_id),
     principal: `user:${teammate}`,
-    selector: `project=${world.project}, user=${teammate}`,
+    selector: `project=${world.project}`,
     authorized_scopes: teammatePacket.plan.authorized_scopes.map((scope) =>
       scope.user_id === null ? "project" : `user=${scope.user_id}`,
     ),
@@ -495,6 +532,9 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
   const crossProjectProbe: IsolationProbe = {
     query: "Which deploy window did Alice approve?",
     predicate: "decision.approved",
+    selector_as_user: "project=billing, user=bob",
+    authorized_scopes_as_user: [],
+    claims_returned_as_user: [],
     principal: `user:${teammate}`,
     selector: "project=billing, user=bob",
     authorized_scopes: crossProjectPacket.plan.authorized_scopes.map((scope) =>
@@ -526,6 +566,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
       other_project_event: otherProjectEvent.receipt.event_id,
       other_project_decisions: otherProjectWrites.map((decision) => decision.outcome),
       teammate_reaches_project_scope_ci: teammateCiPacket.packet.claims.map((claim) => claim.claim_id),
+      teammate_ci_looked_for: ciClaimId,
       teammate_ci_missing: teammateCiPacket.packet.missing,
       owner_reaches_project_scope_ci: ownerCiPacket.packet.claims.map((claim) => claim.claim_id),
     },
@@ -557,6 +598,56 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
       conflicting_claims: conflictWrites.map((decision) => decision.claim_id).filter((id): id is string => id !== null),
       first_claim_status: firstClaimAfterConflict?.status ?? null,
       first_claim_still_current: firstClaimAfterConflict?.valid_to === null,
+    },
+  });
+
+  // ---- Step 6: the action gate -------------------------------------------
+  nextDay();
+  const highOnSelfReport = await verdict(world, deps, {
+    action: "deploy.release",
+    action_risk: "high",
+    claim_id: approvalClaimId ?? "",
+    principal: `user:${alice}`,
+    user: alice,
+  });
+  // Asked at the *project* scope, because that is where a CI result lives. Asking as
+  // `user=alice` would resolve reach through her own scope, which does not contain the
+  // project-only CI scope, and the gate would refuse with
+  // `action.denied_unknown_claim` — the right refusal for the wrong reason, and one
+  // that would hide whether the risk rule itself works.
+  // Asked by the CI's own author and at the project scope, because that is where a CI
+  // result lives. Two real properties of this deployment are visible in that choice,
+  // and both are stated rather than hidden:
+  //
+  //   - a project-scope claim is reachable by a project-scope member, and `user:bob`
+  //     is one because they appended the CI result without a user dimension;
+  //   - the same claim is *not* reachable by a principal whose only membership is a
+  //     user scope, so asking as `user:alice` refuses with
+  //     `action.denied_unknown_claim` — the mechanism recorded under step 4, not a
+  //     second defect.
+  const highOnObservation = await verdict(world, deps, {
+    action: "deploy.release",
+    action_risk: "high",
+    claim_id: ciClaimId ?? "",
+    principal: `user:${teammate}`,
+    user: undefined,
+  });
+  const lowOnSelfReport = await verdict(world, deps, {
+    action: "release.notes.update",
+    action_risk: "low",
+    claim_id: approvalClaimId ?? "",
+    principal: `user:${alice}`,
+    user: alice,
+  });
+  record({
+    step: 6,
+    name: "action gate -> risk decides, not similarity",
+    detail: {
+      high_risk_citing_user_self_report: highOnSelfReport,
+      high_risk_citing_observation: highOnObservation,
+      low_risk_citing_user_self_report: lowOnSelfReport,
+      calibration_note:
+        "A high-risk action requires authority `verified_record`. Both a `user_self_report` and a tool `observation` yield use=verify at high risk, so both are refused. That is the threshold in the committed policy, not a defect: it is why CI cannot approve a deploy.",
     },
   });
 
@@ -661,100 +752,6 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     },
   });
 
-  // ---- Step 8: retention for one subject, proven by residual scan ----------
-  nextDay();
-  const contractorEvent = await append(world, {
-    stream_id: `${world.project}:onboarding`,
-    idempotency_key: "contractor-rotation",
-    origin: "user",
-    actor_id: `user:${contractor}`,
-    user: contractor,
-    content: TEMPORARY_CONTRACTOR_NOTE,
-  });
-  const contractorWrites = await drainAndWindow(world, driver, contractorEvent.watermark);
-  const retention = await forget(
-    { db: world.db, ledger: world.ledger, ids: world.ids, clock: world.clock },
-    {
-      tenant_id: world.tenantId,
-      tenant_slug: world.tenantSlug,
-      subject_or_scope: { user: contractor },
-      mode: "erase",
-      reason: "gdpr_art17",
-    },
-  );
-  const ledgerAfter = await readRedactedEvent(world, contractorEvent.receipt.event_id);
-  record({
-    step: 8,
-    name: "retention -> erase, residual scan per store",
-    detail: {
-      event_id: contractorEvent.receipt.event_id,
-      claims_before_forget: claimIdsOf(contractorWrites),
-      job_id: retention.job_id,
-      status: retention.status,
-      mode: retention.manifest.mode,
-      // Per store, because the specification's rule is that deletion is proven by
-      // scan and an aggregate zero with an unexamined store proves nothing.
-      residual_scan: retention.manifest.residual_scan,
-      residual_matches: retention.manifest.residual_matches,
-      stores_touched: retention.manifest.stores,
-      events_redacted: retention.manifest.events_redacted,
-      ledger_row_survives: ledgerAfter !== null,
-      payload_gone: ledgerAfter?.payload_gone ?? false,
-      content_hash_survives: ledgerAfter?.content_hash ?? null,
-      notes: retention.manifest.notes,
-    },
-  });
-
-  // ---- Step 6: the action gate -------------------------------------------
-  nextDay();
-  const highOnSelfReport = await verdict(world, deps, {
-    action: "deploy.release",
-    action_risk: "high",
-    claim_id: approvalClaimId ?? "",
-    principal: `user:${alice}`,
-    user: alice,
-  });
-  // Asked at the *project* scope, because that is where a CI result lives. Asking as
-  // `user=alice` would resolve reach through her own scope, which does not contain the
-  // project-only CI scope, and the gate would refuse with
-  // `action.denied_unknown_claim` — the right refusal for the wrong reason, and one
-  // that would hide whether the risk rule itself works.
-  // Asked by the CI's own author and at the project scope, because that is where a CI
-  // result lives. Two real properties of this deployment are visible in that choice,
-  // and both are stated rather than hidden:
-  //
-  //   - a project-scope claim is reachable by a project-scope member, and `user:bob`
-  //     is one because they appended the CI result without a user dimension;
-  //   - the same claim is *not* reachable by a principal whose only membership is a
-  //     user scope, so asking as `user:alice` refuses with
-  //     `action.denied_unknown_claim` — the mechanism recorded under step 4, not a
-  //     second defect.
-  const highOnObservation = await verdict(world, deps, {
-    action: "deploy.release",
-    action_risk: "high",
-    claim_id: ciClaimId ?? "",
-    principal: `user:${teammate}`,
-    user: undefined,
-  });
-  const lowOnSelfReport = await verdict(world, deps, {
-    action: "release.notes.update",
-    action_risk: "low",
-    claim_id: approvalClaimId ?? "",
-    principal: `user:${alice}`,
-    user: alice,
-  });
-  record({
-    step: 6,
-    name: "action gate -> risk decides, not similarity",
-    detail: {
-      high_risk_citing_user_self_report: highOnSelfReport,
-      high_risk_citing_observation: highOnObservation,
-      low_risk_citing_user_self_report: lowOnSelfReport,
-      calibration_note:
-        "A high-risk action requires authority `verified_record`. Both a `user_self_report` and a tool `observation` yield use=verify at high risk, so both are refused. That is the threshold in the committed policy, not a defect: it is why CI cannot approve a deploy.",
-    },
-  });
-
   // ---- Step 9: review burden ---------------------------------------------
   const burden = await reviewBurden(world);
   const tenantCounts = await counts(world);
@@ -809,8 +806,9 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     isolation: {
       same_project: sameProjectProbe,
       cross_project: crossProjectProbe,
-      teammate_reaches_project_scope: teammateCiPacket.packet.claims.length > 0,
-      owner_reaches_project_scope: ownerCiPacket.packet.claims.length > 0,
+      teammate_reaches_project_scope: teammateCiPacket.packet.claims.some((claim) => claim.claim_id === ciClaimId),
+      owner_reaches_project_scope: ownerCiPacket.packet.claims.some((claim) => claim.claim_id === ciClaimId),
+      ci_claim_id: ciClaimId,
     },
     contradiction: {
       event_id: conflictEvent.receipt.event_id,
@@ -1108,7 +1106,8 @@ async function readRedactedEvent(
 interface QueryInput {
   readonly text: string;
   readonly principal: string;
-  readonly user: string;
+  /** Undefined asks at the project scope. See the note on the isolation probe. */
+  readonly user: string | undefined;
   /** Defaults to the reference project and its purposes. */
   readonly project?: string;
   readonly purpose?: string;

@@ -315,15 +315,19 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
       // the `has` checks below would stop being checked against the closed set of
       // projection names.
       //
-      // The names are the contract's: `search` is the trigger-maintained lexical
-      // projection, `embeddings` is the pgvector projection, `entities` is alias
-      // resolution. `@veritymem/retrieval` calls the first two `lexical` and `dense`,
-      // which are the names of the *channels* that read them. Two vocabularies for one
-      // concept is how a request that names a real projection gets refused by a route
-      // that has never heard of it, so the API speaks the contract's vocabulary and the
-      // mapping to the channel names lives here.
-      const wanted = new Set<"search" | "embeddings" | "entities">(
-        body.projections ?? ["search", "embeddings", "entities"],
+      // The names are the contract's, and the contract was changed to match the
+      // implementation rather than the other way round.
+      //
+      // This route previously spoke `search` / `embeddings` while the request schema,
+      // `@veritymem/retrieval` and the evaluation harness all spoke `lexical` / `dense`.
+      // The intent was that the API would name the *store* and the code the *channel*,
+      // which sounds principled and cost a real defect: `ReplayRequestSchema` validated
+      // against one vocabulary while the route matched against another, so a request
+      // naming a projection that exists was refused by a route that had never heard of
+      // it. Two names for one concept need a translation layer, and a translation layer
+      // is a second place for the mapping to be wrong.
+      const wanted = new Set<"dense" | "lexical" | "entities">(
+        body.projections ?? ["dense", "lexical", "entities"],
       );
 
       // Bound to the administrator's reach rather than taken as a system context, and
@@ -334,14 +338,14 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
       // empty set, and report the projections byte-identical. A replay oracle that can
       // only ever see nothing always passes.
       const outcome = await withWriteContext(deps, context, "replay", async (executor) => {
-        const searchBefore = wanted.has("search")
+        const lexicalBefore = wanted.has("lexical")
           ? await digestLexicalProjection(executor, context.tenantId)
           : null;
         // The dense digest is taken by reading the projected rows without truncating, so
         // the "before" measurement is the real current state rather than the state a
         // rebuild would produce — otherwise `byte_identical` would be true by
         // construction and would prove nothing.
-        const denseBefore = wanted.has("embeddings")
+        const denseBefore = wanted.has("dense")
           ? await rebuildProjections(executor, { db: deps.db, embeddings: deps.embeddings }, {
               tenantId: context.tenantId,
               truncate: false,
@@ -359,17 +363,17 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
         // would hide a real replay failure behind a known one.
         let deterministic = true;
 
-        if (searchBefore) {
-          const searchAfter = await digestLexicalProjection(executor, context.tenantId);
+        if (lexicalBefore) {
+          const lexicalAfter = await digestLexicalProjection(executor, context.tenantId);
           results.push({
-            projection: "search",
-            digest_before: searchBefore.digest,
-            digest_after: searchAfter.digest,
-            rows_before: searchBefore.rows,
-            rows_after: searchAfter.rows,
-            byte_identical: searchBefore.digest === searchAfter.digest,
+            projection: "lexical",
+            digest_before: lexicalBefore.digest,
+            digest_after: lexicalAfter.digest,
+            rows_before: lexicalBefore.rows,
+            rows_after: lexicalAfter.rows,
+            byte_identical: lexicalBefore.digest === lexicalAfter.digest,
           });
-          deterministic &&= searchBefore.digest === searchAfter.digest;
+          deterministic &&= lexicalBefore.digest === lexicalAfter.digest;
         }
 
         if (denseBefore) {
@@ -377,7 +381,7 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
             tenantId: context.tenantId,
           });
           results.push({
-            projection: "embeddings",
+            projection: "dense",
             digest_before: denseBefore.digest,
             digest_after: denseAfter.digest,
             rows_before: denseBefore.rows,

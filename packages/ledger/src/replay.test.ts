@@ -210,3 +210,51 @@ describe("ledger replay", () => {
 
   void ensureScope;
 });
+
+describe("tenant derivation", () => {
+  let h: Harness;
+  before(async () => {
+    h = await harness("tenant-derivation");
+  });
+  after(async () => {
+    await h.close();
+  });
+
+  it("is idempotent, so passing a slug or its derived id lands in the same partition", async () => {
+    // The bug this asserts against: `append` resolved the slug, then `ensureScope`
+    // resolved the result again, so a caller passing a slug wrote under
+    // `resolveTenantId(resolveTenantId(slug))` — a valid partition it could not predict
+    // and its own read path would never look in.
+    const once = resolveTenantId(h.tenantSlug);
+    assert.equal(resolveTenantId(once), once, "resolving an already-resolved tenant must be a no-op");
+
+    const a = await h.ledger.append({
+      stream_id: "s",
+      origin: "user",
+      actor_id: "user:alice",
+      scope: { tenant: h.tenantSlug, project: "payments", user: "alice", purpose: ["p"] },
+      occurred_at: "2026-09-10T00:00:00Z",
+      content: "written with a slug",
+    });
+    const b = await h.ledger.append({
+      stream_id: "s2",
+      origin: "user",
+      actor_id: "user:alice",
+      scope: { tenant: once, project: "payments", user: "alice", purpose: ["p"] },
+      occurred_at: "2026-09-10T00:00:00Z",
+      content: "written with the derived id",
+    });
+    assert.equal(
+      a.scope.tenant_id,
+      b.scope.tenant_id,
+      "a slug and its derived id must resolve to the same tenant, not to two partitions",
+    );
+  });
+
+  it("records the slug a caller used, not an intermediate id", async () => {
+    const rows = await h.db.withSystemContext({ tenant: h.tenantId, actor: "test" }, (executor) =>
+      executor.query<{ slug: string }>(`SELECT slug FROM tenants WHERE tenant_id = $1::uuid`, [h.tenantId]),
+    );
+    assert.equal(rows.rows[0]?.slug, h.tenantSlug, "the tenants table must map the slug a caller used");
+  });
+});

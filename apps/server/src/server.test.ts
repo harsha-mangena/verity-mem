@@ -820,7 +820,7 @@ describe("veritymem server", () => {
     assert.ok(body.ledger_watermark >= 1);
     assert.ok(body.projections.length >= 1, "replay must report every projection it examined");
     assert.ok(
-      body.projections.some((projection) => projection.projection === "embeddings"),
+      body.projections.some((projection) => projection.projection === "dense"),
       `expected the dense projection in the report: ${replay.body}`,
     );
     assert.equal(body.deterministic, true);

@@ -227,13 +227,20 @@ message, and contains identifiers, counts and policy versions and **no stored te
 
 `POST /v1/events`, `GET /v1/claims/{id}`, `POST /v1/query`, `POST /v1/actions/gate`.
 
-The first three are in the specification's REST list. **The action-gate route is not.**
-The specification specifies `ActionGateRequest`/`ActionGateVerdict` as contracts and
-requires the gate to be wired before any medium- or high-risk side effect, but its route
-list omits a path for it; `@veritymem/sdk-ts` and this package both default to
-`/v1/actions/gate` and both allow the path to be overridden
-(`new HttpVerityClient({ baseUrl, routes: { actionGate: "/v1/…" } })`). Confirm against
-`apps/server` before relying on it.
+All four are implemented by `apps/server`, and the shapes have been checked against it:
+the append route answers `202` with the bare `EventAppendResponse`, the query route
+answers `200` with the bare `MemoryPacket`, the action-gate route answers `200` with the
+bare verdict — including when it denies — and the claim read answers with the
+`{ claim, relations }` envelope, which `HttpVerityClient` validates rather than casting,
+so a body without `claim` fails loudly instead of producing an item whose every field is
+`undefined`.
+
+The action-gate route is the one path **not in the specification's REST list**. The
+specification specifies `ActionGateRequest`/`ActionGateVerdict` as contracts and requires
+the gate to be wired before any medium- or high-risk side effect, but its route list
+omits a path for it; `apps/server` and `@veritymem/sdk-ts` both mount it at
+`/v1/actions/gate`, which is this package's default, and the path is overridable
+(`new HttpVerityClient({ baseUrl, routes: { actionGate: "/v1/…" } })`).
 
 Nothing here calls an admin route. An agent token that can reach `/v1/grants` or
 `/v1/forget` is a design failure, so this adapter has no code path that tries.
