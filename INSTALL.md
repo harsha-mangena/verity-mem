@@ -14,24 +14,27 @@ does **not** give you — the difference matters more than the instructions.
 Requires Docker. From a checkout of the commit you want:
 
 ```bash
-cp .env.example .env
-docker compose -f deploy/compose/docker-compose.yml \
-               -f deploy/compose/docker-compose.app.yml up -d --build
+WORKER_TENANT_SLUGS=my-tenant \
+  docker compose -f deploy/compose/docker-compose.app.yml up -d --build
 ```
 
 That brings up PostgreSQL 17 with pgvector 0.8.6, the server on `http://127.0.0.1:8787` with
 its OpenAPI document at `/docs`, and a worker. The server image applies migrations before it
-listens.
+listens. This file is self-contained — it does **not** layer on top of `docker-compose.yml`,
+which is the backing services a developer needs for `pnpm test`.
 
-`WORKER_TENANT_SLUGS` must be set, and the compose file refuses to start without it:
+`WORKER_TENANT_SLUGS` is required and has no default, deliberately. Two alternatives were tried
+and both are worse:
 
-```bash
-WORKER_TENANT_SLUGS=my-tenant docker compose ... up -d
-```
+- **Defaulting to one tenant** means the worker polls a tenant nobody writes to. The queue
+  grows, and the only symptom is that queries return nothing — indistinguishable from a
+  memory-quality problem. Verified by doing it: one event appended for `container-probe`, one
+  message pending, and a worker logging `claimed: 0` indefinitely.
+- **Claiming from every tenant** means picking up another deployment's queue, and a backlog in
+  one tenant starving every other tenant behind it in queue order. `OutboxWorker` rejects an
+  empty list for the same reason.
 
-That is not ceremony. A worker claiming from every tenant would pick up another deployment's
-queue, and a backlog in one tenant would starve every other tenant behind it in queue order.
-An empty list is rejected by `OutboxWorker` rather than silently claiming nothing.
+Set it to the tenants this worker serves, comma-separated. The worker logs the list at startup.
 
 ### The entailment verifier
 

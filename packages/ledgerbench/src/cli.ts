@@ -5,17 +5,26 @@
  *   node --experimental-strip-types packages/ledgerbench/src/cli.ts \
  *     --seed 1 --out bench/run.json --jsonl bench/run.jsonl
  *
- * Exits non-zero when a fixture assertion fails or a required conformance check
- * fails, so it is usable as a gate in CI. It does *not* exit non-zero merely
- * because stages are unimplemented: that is a fact about the build, reported at the
- * top of the output, and a gate that fails for a known and recorded reason gets
- * disabled, which is worse than a gate that reports.
+ * **The exit code is the release gate, and a target that is not measured is not a
+ * target that passed.** That is the whole contract:
+ *
+ *   * 0 — every v0.1 exit target passed, every fixture assertion passed, and every
+ *     required conformance check passed.
+ *   * 1 — the run completed and something is unmet: a target failed, a target could not
+ *     be measured, an assertion failed, or a required conformance check failed. The
+ *     reasons are printed and travel in the report's `unmet_targets`.
+ *   * 2 — the run could not be completed (a fixture parse error, a refused backend).
+ *
+ * An earlier version exited zero for "declared known gaps" and for unimplemented stages.
+ * That made a partial run look like a passing one, which is the failure the instrument
+ * exists to prevent: `scripts/verify.sh` reads this exit code as the release decision, so
+ * a benchmark that cannot measure a target has to say the release gate is unmet.
  */
 import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { LexicalEntailmentBackend } from "@veritymem/gate";
+import { GATE_BACKENDS, resolveGateBackend, type GateBackendChoice } from "./backend.ts";
 import { FixtureRunner } from "./run.ts";
 import { loadConformanceTraces, loadFixtures } from "./parse.ts";
 import { runConformance } from "./conformance.ts";
@@ -32,10 +41,17 @@ interface Options {
   readonly runScope: string | undefined;
   readonly quiet: boolean;
   readonly conformanceOnly: boolean;
+  readonly gateBackend: GateBackendChoice;
+  /** Refuse the lexical stand-in. `--gate-required`. */
+  readonly gateRequired: boolean;
+  /** Root of the pinned model assets. */
+  readonly modelsRoot: string;
 }
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_FIXTURES = resolve(HERE, "../../../fixtures");
+const REPO_ROOT = resolve(HERE, "../../..");
+const DEFAULT_MODELS = resolve(REPO_ROOT, ".veritymem/models");
 
 export function parseArgs(argv: readonly string[]): Options {
   let seed = 1;
@@ -47,6 +63,10 @@ export function parseArgs(argv: readonly string[]): Options {
   let runScope: string | undefined;
   let quiet = false;
   let conformanceOnly = false;
+  let modelsRoot = DEFAULT_MODELS;
+  let gateBackend: GateBackendChoice =
+    (process.env["LEDGERBENCH_GATE_BACKEND"] as GateBackendChoice | undefined) ?? "auto";
+  let gateRequired = false;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -87,6 +107,20 @@ export function parseArgs(argv: readonly string[]): Options {
       case "--conformance-only":
         conformanceOnly = true;
         break;
+      case "--models":
+        modelsRoot = resolve(next());
+        break;
+      case "--gate-backend": {
+        const value = next();
+        if (!(GATE_BACKENDS as readonly string[]).includes(value)) {
+          throw new Error(`--gate-backend must be one of ${GATE_BACKENDS.join(", ")}`);
+        }
+        gateBackend = value as GateBackendChoice;
+        break;
+      }
+      case "--gate-required":
+        gateRequired = true;
+        break;
       case "--quiet":
         quiet = true;
         break;
@@ -108,6 +142,9 @@ export function parseArgs(argv: readonly string[]): Options {
     runScope,
     quiet,
     conformanceOnly,
+    gateBackend,
+    gateRequired,
+    modelsRoot,
   };
 }
 
@@ -123,8 +160,15 @@ Usage: node --experimental-strip-types src/cli.ts [options]
   --jsonl <file>        write one JSON line per fixture run (raw traces)
   --run-scope <token>   re-enter a previous run's tenant; ids stay freshly seeded
   --conformance-only    run only the ten Phase 0 traces
+  --gate-backend <b>    auto | onnx | lexical (default: auto, or $LEDGERBENCH_GATE_BACKEND)
+  --gate-required       refuse to fall back to the lexical stand-in
+  --models <dir>        pinned model assets root (default: <repo>/.veritymem/models)
   --quiet               only print the summary block
   -h, --help            this message
+
+Exit codes: 0 every v0.1 target, assertion and required conformance check passed;
+            1 the run completed with something unmet (see the report's unmet_targets);
+            2 the run could not be completed.
 `;
 
 async function main(): Promise<number> {
@@ -133,8 +177,23 @@ async function main(): Promise<number> {
   const started = Date.now();
   const runId = `evr_${randomUUID().replace(/-/g, "")}`;
 
+  // Resolved before any fixture runs: a gate the run cannot load must stop it, not be
+  // discovered after the numbers exist. `--gate-required` turns the fallback into an error.
+  const gate = await resolveGateBackend({
+    choice: options.gateBackend,
+    required: options.gateRequired,
+    modelsRoot: options.modelsRoot,
+  });
+  if (!options.quiet) {
+    process.stdout.write(
+      `gate      ${gate.name} (${gate.kind})${gate.modelSha256 === null ? "" : ` model ${gate.modelSha256.slice(0, 12)}…`}\n` +
+        `          ${gate.reason}\n`,
+    );
+  }
+
   const runner = new FixtureRunner({
     seed: options.seed,
+    entailment: gate.backend,
     ...(options.runScope !== undefined ? { runScope: options.runScope } : {}),
   });
 
@@ -193,8 +252,7 @@ async function main(): Promise<number> {
       runId,
       startedAt,
       durationMs: Date.now() - started,
-      gateBackend: new LexicalEntailmentBackend().name,
-      gateModelSha256: null,
+      gate,
     });
 
     printSummary(report);
@@ -210,11 +268,11 @@ async function main(): Promise<number> {
       process.stdout.write(`raw traces: ${options.jsonl}\n`);
     }
 
-    // A failure the fixture declares as a known unmet requirement is still a
-    // failure and still counted in the metrics; it just does not fail the build.
-    // The alternative — treating every declared gap as a passing check — would hide
-    // the gap, and the alternative to *that* — failing on it forever — gets the gate
-    // disabled, which is worse.
+    // Every failure is a failure. A fixture may still *declare* a gap, and the
+    // declaration is reported so the reader knows it was expected — but it changes what the
+    // report says, not whether the process exits non-zero. The earlier behaviour let a
+    // declared gap pass the build, which made the release gate advisory: a "known
+    // limitation" list that grows is indistinguishable from a gate that never fires.
     const undeclared = runs.flatMap((run) =>
       run.lines.flatMap((line) =>
         line.assertions
@@ -229,18 +287,43 @@ async function main(): Promise<number> {
       ),
     );
     const declaredGaps = runs.reduce((sum, run) => sum + run.assertions_failed, 0) - undeclared.length;
+    const notEvaluated = runs.reduce((sum, run) => sum + run.assertions_not_evaluated, 0);
     const conformanceFailures = conformance?.required_checks_failed ?? 0;
     if (declaredGaps > 0) {
       process.stdout.write(
-        `\n  ${declaredGaps} assertion(s) failed against requirements the fixtures declare as known gaps; ` +
-          `they are reported above and counted in the metrics, and they do not fail this build.\n`,
+        `\n  ${declaredGaps} assertion(s) failed against requirements the fixtures declare as known gaps. ` +
+          `Declaring a gap does not make it pass: it is counted in the metrics and it fails this run.\n`,
       );
     }
     if (undeclared.length > 0) {
       process.stderr.write(`\nundeclared failures (${undeclared.length}):\n`);
       for (const entry of undeclared) process.stderr.write(`  ${entry}\n`);
     }
-    return undeclared.length + conformanceFailures > 0 ? 1 : 0;
+    if (notEvaluated > 0) {
+      process.stderr.write(
+        `\n${notEvaluated} expectation(s) were not evaluated; an assertion that never ran is not a pass.\n`,
+      );
+    }
+
+    // The exit code is derived from the report's own unmet list, so the published table
+    // and the process status cannot disagree. `unmet_targets` carries a reason for every
+    // entry, including the unmeasurable ones — a non-zero exit with no explanation is a
+    // gate nobody can act on, which is how gates get disabled.
+    const gateFailures = [
+      ...report.unmet_targets.map(
+        (entry) => `target ${entry.id} [${entry.verdict}] — ${entry.reason}`,
+      ),
+      ...(undeclared.length > 0 ? [`${undeclared.length} undeclared fixture assertion failure(s)`] : []),
+      ...(declaredGaps > 0 ? [`${declaredGaps} declared-gap assertion failure(s)`] : []),
+      ...(notEvaluated > 0 ? [`${notEvaluated} expectation(s) not evaluated`] : []),
+      ...(conformanceFailures > 0 ? [`${conformanceFailures} required conformance check(s) failed`] : []),
+    ];
+    if (gateFailures.length > 0) {
+      process.stdout.write(`\n  release gate FAILED (${gateFailures.length} reason(s)):\n`);
+      for (const failure of gateFailures) process.stdout.write(`    - ${failure}\n`);
+      return 1;
+    }
+    return 0;
   } finally {
     await runner.close();
   }

@@ -1,20 +1,57 @@
-# The reference deployment: database, blob storage, server and worker.
+# The reference deployment, self-contained: database, blob storage, server and worker.
 #
-# Separate from `docker-compose.yml`, which starts only the two backing services a developer
-# needs for `pnpm test`. Mixing them would mean every test run pulls an application image.
+# Deliberately complete rather than layered on top of `docker-compose.yml`. An earlier version
+# was a second file meant to be combined with the first, and it did not work: both declared a
+# `postgres` service, so `docker compose -f a.yml -f b.yml up` tried to create the same
+# container twice and failed with a name conflict. A reference deployment that cannot be
+# started by the command in its own documentation is worse than no reference deployment,
+# because the instructions look complete.
 #
-#   docker compose -f deploy/compose/docker-compose.yml \
-#                  -f deploy/compose/docker-compose.app.yml up -d
+# `docker-compose.yml` remains the backing services a developer needs for `pnpm test`. This
+# file is the application, with its own project name so the two never collide.
+#
+#   docker compose -f deploy/compose/docker-compose.app.yml up -d --build
 #
 name: veritymem-app
 
 services:
+  postgres:
+    image: pgvector/pgvector:0.8.6-pg17-trixie
+    environment:
+      POSTGRES_USER: verity
+      POSTGRES_PASSWORD: verity
+      POSTGRES_DB: veritymem
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U verity -d veritymem"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # Content-addressed blob storage, so the reference deployment exercises the same store shape
+  # a real one would. The filesystem store is the default and is equally valid; this exists to
+  # prove the deployment works against an object store too.
+  minio:
+    profiles: ["blobs"]
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    environment:
+      MINIO_ROOT_USER: verity
+      MINIO_ROOT_PASSWORD: veritysecret
+    ports:
+      - "59000:9000"
+      - "59001:9001"
+    volumes:
+      - miniodata:/data
+    command: server /data --console-address ":9001"
+
   server:
     build:
       context: ../..
       dockerfile: deploy/compose/Dockerfile.server
     image: veritymem-server:0.1.0
-    container_name: veritymem-server
     depends_on:
       postgres:
         condition: service_healthy
@@ -24,40 +61,56 @@ services:
       HOST: 0.0.0.0
       PORT: "8787"
       # The lexical stand-in, explicitly. Switching this to `onnx` requires the mounted model
-      # below, and the server will refuse to start without it rather than weaken the gate.
-      GATE_ENTAILMENT_BACKEND: lexical
+      # below, and the server refuses to start without it rather than weakening the gate.
+      GATE_ENTAILMENT_BACKEND: ${GATE_ENTAILMENT_BACKEND:-lexical}
+      GATE_MODEL_PATH: /app/.veritymem/models/nli-deberta-v3-base/model_qint8_arm64.onnx
+      GATE_TOKENIZER_PATH: /app/.veritymem/models/nli-deberta-v3-base/tokenizer.json
       EMBEDDING_BACKEND: hash
+      AGENT_TOKEN: ${AGENT_TOKEN:-dev-agent-token}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
     ports:
       - "8787:8787"
     volumes:
-      # Provision the production entailment verifier with:
-      #   node scripts/fetch-model.mjs
-      # then set GATE_ENTAILMENT_BACKEND=onnx. The mount is read-only: the server never
-      # writes to its own model assets.
+      # Provision the production entailment verifier with `node scripts/fetch-model.mjs` and
+      # set GATE_ENTAILMENT_BACKEND=onnx. Read-only: the server never writes its own assets.
       - ../../.veritymem/models:/app/.veritymem/models:ro
+    # Migrations run before the listener, so a fresh volume needs no manual step.
     command:
       - sh
       - -c
-      - "node --experimental-strip-types scripts/migrate.ts && node --experimental-strip-types apps/server/src/main.ts"
+      - "node --experimental-strip-types scripts/migrate.ts && exec node --experimental-strip-types apps/server/src/main.ts"
 
   worker:
     image: veritymem-server:0.1.0
-    container_name: veritymem-worker
     depends_on:
       server:
         condition: service_started
     environment:
       DATABASE_URL: postgres://veritymem_app:veritymem_app@postgres:5432/veritymem
       MIGRATION_DATABASE_URL: postgres://verity:verity@postgres:5432/veritymem
-      # Required: a worker that claims from every tenant would pick up another deployment's
-      # queue, and a backlog in one tenant would starve the rest.
-      WORKER_TENANT_SLUGS: ${WORKER_TENANT_SLUGS:?set WORKER_TENANT_SLUGS to a comma-separated tenant list}
-      GATE_ENTAILMENT_BACKEND: lexical
+      # Required, and deliberately without a default.
+      #
+      # The first version of this file defaulted it to `default`, on the reasoning that a fresh
+      # checkout should start. That was wrong in a way worth recording: the worker then polls a
+      # tenant nobody writes to, the queue grows, and the only symptom is that queries return
+      # nothing — indistinguishable from a memory-quality problem. Verified by doing exactly
+      # that: one event appended for `container-probe`, one message pending, and a worker
+      # logging `claimed: 0` forever.
+      #
+      # A worker claiming from *every* tenant is the other bad option: it would pick up another
+      # deployment's queue, and a backlog in one tenant would starve the rest. So the variable is
+      # required, and an unset value stops the deployment at startup where it is obvious.
+      WORKER_TENANT_SLUGS: ${WORKER_TENANT_SLUGS:?set WORKER_TENANT_SLUGS to the tenants this worker serves, comma-separated}
+      GATE_ENTAILMENT_BACKEND: ${GATE_ENTAILMENT_BACKEND:-lexical}
+      GATE_MODEL_PATH: /app/.veritymem/models/nli-deberta-v3-base/model_qint8_arm64.onnx
+      GATE_TOKENIZER_PATH: /app/.veritymem/models/nli-deberta-v3-base/tokenizer.json
       EMBEDDING_BACKEND: hash
     volumes:
       - ../../.veritymem/models:/app/.veritymem/models:ro
-      - veritymem_blobs:/app/.veritymem/blobs
+      - blobs:/app/.veritymem/blobs
     command: ["node", "--experimental-strip-types", "apps/worker/src/main.ts"]
 
 volumes:
-  veritymem_blobs:
+  pgdata:
+  miniodata:
+  blobs:

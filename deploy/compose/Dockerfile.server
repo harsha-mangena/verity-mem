@@ -51,6 +51,12 @@ COPY packages ./packages
 COPY apps ./apps
 COPY deploy ./deploy
 
+# The build runs as root, so the copied tree inherits root-only modes. The container runs as
+# the unprivileged `node` user, which then cannot *read* its own source — the failure is
+# EACCES on `scripts/migrate.ts` at startup, which looks like a missing file. Normalising the
+# modes here is what makes `USER node` actually work.
+RUN chmod -R a+rX /app
+
 # Runs as the unprivileged `node` user that the base image already provides. Nothing in this
 # image needs root, and the server holds a credential.
 USER node

@@ -195,6 +195,14 @@ export interface QueryOutcome {
   /** True when the fixture declares the memory holds an answer to this query. */
   readonly has_answer: boolean | null;
   readonly limit: number;
+  /**
+   * Gold claims that exist but did not make the top 10.
+   *
+   * Reported next to recall rather than folded into it: "the read path did not find it" and
+   * "the read path found it at rank 14" are the same recall number and different bugs, and
+   * only the second is fixed by re-ranking.
+   */
+  readonly gold_outside_window: number;
   readonly decision: string;
   readonly decision_reason_codes: readonly string[];
   readonly returned: readonly ReturnedClaimRecord[];
@@ -204,6 +212,14 @@ export interface QueryOutcome {
   readonly channels_used: readonly string[];
   readonly plan_denied_dimensions: readonly string[];
   readonly latency_ms: number;
+  /**
+   * Model calls the composer made for this packet.
+   *
+   * Read from the packet rather than inferred from configuration: "zero model calls on the
+   * default read path" is a v0.1 target, and a run whose only evidence is that it
+   * configured a hash embedder has not measured it.
+   */
+  readonly model_calls: number;
   readonly relevant: readonly QueryMatchHit[];
   readonly stale: readonly QueryMatchHit[];
   readonly absent: readonly QueryMatchHit[];
@@ -229,6 +245,14 @@ export interface ActionGateRecord {
   readonly reason_codes: readonly string[];
   readonly claims_resolved: number;
   readonly claims_declared: number;
+  /**
+   * The verdict the fixture requires for this action, or null if it declared none.
+   *
+   * Copied from the assertion rather than re-derived at scoring time so the stage and the
+   * assertion cannot disagree about what was expected — a disagreement there would report a
+   * safe gate and a failing fixture in the same run.
+   */
+  readonly required: "allow" | "block" | null;
   readonly defects: readonly string[];
 }
 
@@ -1028,7 +1052,7 @@ class RunState {
    * these outcomes.
    */
   private async runDeclaredQueries(entry: FixtureBodyLine): Promise<void> {
-    if (entry.kind !== "append_event" && entry.kind !== "resolve_claim") return;
+    if (entry.kind === "create_grant") return;
     for (const query of entry.query ?? []) {
       const outcome = await this.runQuery(entry.line_id, query);
       this.queryOutcomes.push(outcome);
@@ -1084,6 +1108,10 @@ class RunState {
         tenant_id: this.tenantId,
         query: query.query,
         scope: {
+          // `compose` ignores this dimension and binds `tenant_id` above, which is the
+          // partition the run's rows are actually in. The contract requires a tenant in the
+          // selector, so the run's own uuid is the only value that cannot disagree with it.
+          tenant: this.tenantId,
           ...(query.project !== undefined ? { project: query.project } : {}),
           ...(query.user !== undefined ? { user: query.user } : {}),
           ...(query.agent !== undefined ? { agent: query.agent } : {}),
@@ -1096,6 +1124,18 @@ class RunState {
     );
 
     const returned = await this.describeReturned(declared.packet);
+    const relevant = matchGroups(returned, query.relevance);
+    const limit = query.limit ?? 12;
+    // "Not in the top 10" is derived from the fixture's own relevance judgement, not from
+    // a second judgement the runner makes. The window is the overlap of the measured
+    // window and the packet's own limit: a claim beyond the packet's limit was never
+    // returned, which is a recall miss, not a ranking miss.
+    const window = Math.min(10, limit);
+    const goldInsidePacket = relevant.flatMap((hit) => hit.claim_ids);
+    const goldOutside = goldInsidePacket.filter((claimId) => {
+      const rank = returned.findIndex((claim) => claim.claim_id === claimId) + 1;
+      return rank > window;
+    }).length;
     const outcome: QueryOutcome = {
       query_id: declared.packet.trace_id,
       fixture_id: this.deps.fixture.header.fixture_id,
@@ -1104,7 +1144,8 @@ class RunState {
       principal: query.principal,
       purpose,
       has_answer: query.has_answer ?? null,
-      limit: query.limit ?? 12,
+      limit,
+      gold_outside_window: goldOutside,
       decision: declared.packet.decision,
       decision_reason_codes: [...declared.packet.decision_reason_codes],
       returned,
@@ -1114,7 +1155,8 @@ class RunState {
       channels_used: [...declared.packet.coverage.channels_used],
       plan_denied_dimensions: [...declared.plan.denied_dimensions],
       latency_ms: declared.packet.latency_ms,
-      relevant: matchGroups(returned, query.relevance),
+      model_calls: declared.packet.model_calls,
+      relevant,
       stale: matchGroups(returned, query.stale),
       absent: matchGroups(returned, query.absent),
       defects,
@@ -1224,6 +1266,7 @@ class RunState {
         reason_codes: [...verdict.reason_codes],
         claims_resolved: resolved.ids.length,
         claims_declared: expectation.claims.length,
+        required: expectation.verdict,
         defects,
       });
     }
@@ -1239,7 +1282,7 @@ class RunState {
    * nobody.
    */
   private actionPrincipal(entry: FixtureBodyLine): string {
-    if (entry.kind === "append_event" || entry.kind === "resolve_claim") {
+    if (entry.kind !== "create_grant") {
       const first = entry.query?.[0];
       if (first) return first.principal;
     }

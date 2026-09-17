@@ -537,6 +537,14 @@ export interface FixtureEraseSubject {
    */
   readonly redact_actor_events?: boolean;
   readonly expect: readonly Expectation[];
+  /**
+   * See `FixtureAppendEvent.query`.
+   *
+   * A retention job is where "the memory had an answer and no longer does" is decided, so
+   * the abstention fixtures read here: the query runs after the erase and the packet is the
+   * evidence that the read path stopped answering.
+   */
+  readonly query?: readonly FixtureQuery[];
   readonly note?: string;
 }
 

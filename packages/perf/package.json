@@ -1,0 +1,25 @@
+{
+  "name": "@veritymem/perf",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "One-million-claim performance benchmark: a synthetic corpus, a resumable bulk loader, and a declared-query-mix latency measurement over the real compose() read path.",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "bench": "node --experimental-strip-types src/cli.ts",
+    "test": "node --experimental-strip-types --test src/perf.test.ts"
+  },
+  "dependencies": {
+    "@veritymem/contracts": "workspace:*",
+    "@veritymem/ledger": "workspace:*",
+    "@veritymem/retrieval": "workspace:*",
+    "pg": "8.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.18.1",
+    "@types/pg": "8.15.5"
+  }
+}

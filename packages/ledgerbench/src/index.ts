@@ -11,6 +11,7 @@
  * this package emits and is deliberately offline: nothing here depends on it, and
  * nothing on the online path depends on either.
  */
+export * from "./backend.ts";
 export * from "./errors.ts";
 export * from "./types.ts";
 export * from "./parse.ts";

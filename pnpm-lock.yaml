@@ -237,6 +237,28 @@ importers:
         specifier: workspace:*
         version: link:../testkit
 
+  packages/perf:
+    dependencies:
+      '@veritymem/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@veritymem/ledger':
+        specifier: workspace:*
+        version: link:../ledger
+      '@veritymem/retrieval':
+        specifier: workspace:*
+        version: link:../retrieval
+      pg:
+        specifier: 8.16.3
+        version: 8.16.3
+    devDependencies:
+      '@types/node':
+        specifier: 22.18.1
+        version: 22.18.1
+      '@types/pg':
+        specifier: 8.15.5
+        version: 8.15.5
+
   packages/policy:
     dependencies:
       '@veritymem/contracts':

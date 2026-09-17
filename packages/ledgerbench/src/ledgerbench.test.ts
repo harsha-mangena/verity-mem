@@ -28,10 +28,36 @@ import { loadConformanceTraces, loadFixtures, parseConformanceDocument, parseFix
 import { FixtureRunner, type FixtureRunResult } from "./run.ts";
 import { evaluateStages, reviewBurden, unknownReasonCodes } from "./stages.ts";
 import { evaluateTargets } from "./targets.ts";
+import { LexicalEntailmentBackend } from "@veritymem/gate";
+import type { GateBackendSelection } from "./backend.ts";
 import { EXPECTATION_TYPES, SUPPORTED_FIXTURE_VERSIONS, type Expectation } from "./types.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = resolve(HERE, "../../../fixtures");
+
+/**
+ * A lexical gate selection, for the tests that score stages and targets without a model.
+ *
+ * Constructed here rather than resolved through `resolveGateBackend` because the unit
+ * tests must not depend on whether the 233 MB model happens to be provisioned on the
+ * machine running them: a suite whose result changes with the developer's disk is not a
+ * test of the code.
+ */
+function lexiconSelection(): GateBackendSelection {
+  const backend = new LexicalEntailmentBackend();
+  return {
+    backend,
+    kind: "lexical",
+    name: backend.name,
+    modelSha256: null,
+    tokenizerSha256: null,
+    modelPath: null,
+    tokenizerPath: null,
+    threshold: 0.6,
+    contradictionThreshold: null,
+    reason: "unit test",
+  };
+}
 const MALICIOUS = join(FIXTURES, "ledgerbench/08_malicious_procedure.jsonl");
 
 /**
@@ -355,11 +381,14 @@ describe("running fixtures against the real database", () => {
         line.assertions.filter((assertion) => assertion.status === "not_evaluated").map((assertion) => assertion.expectation),
       ),
     );
-    // `expect_missing` requires a packet. It must be reported as blocked, never as
-    // a pass, and never as a zero.
-    assert.deepEqual([...new Set(notEvaluated)], ["expect_missing"]);
+    // Every expectation in the grammar is evaluated now: `expect_missing` waited on a
+    // packet composer that exists, and an expectation that reports `not_evaluated` is an
+    // assertion that never ran. Empty is the only acceptable answer.
+    assert.deepEqual([...new Set(notEvaluated)], []);
 
-    // Stage-level sanity: a stage whose subject exists must have been measured.
+    // Stage-level sanity: a stage whose subject exists must have been measured. All
+    // twelve are in that category now — the four read-path stages are measured over the
+    // queries the fixtures declare.
     const stages = evaluateStages({
       runs,
       gateBackend: "lexical-overlap@1",
@@ -367,14 +396,27 @@ describe("running fixtures against the real database", () => {
       policyVersion: "commit-v3",
     });
     const byId = new Map(stages.map((stage) => [stage.stage, stage]));
-    for (const id of ["admission", "extraction", "attribution", "commit", "conflict", "forgetting", "replay"]) {
+    for (const id of [
+      "admission",
+      "extraction",
+      "attribution",
+      "commit",
+      "conflict",
+      "retrieval",
+      "composition",
+      "abstention",
+      "action_gate",
+      "forgetting",
+      "replay",
+      "operations",
+    ]) {
       assert.equal(byId.get(id as never)?.status, "measured", `${id} should be measurable on this corpus`);
     }
-    for (const id of ["retrieval", "composition", "abstention", "action_gate"]) {
-      const stage = byId.get(id as never);
-      assert.equal(stage?.status, "not_implemented");
-      assert.deepEqual(stage?.metrics, {}, `${id} must report no metrics rather than a fabricated zero`);
-      assert.ok((stage?.note ?? "").length > 0, `${id} must say why it is not measured`);
+    // Every measured stage says how many observations it has. A rate over three cases is
+    // not a rate, and the count is what lets a reader decide that for themselves.
+    for (const stage of stages) {
+      if (stage.status !== "measured") continue;
+      assert.ok(stage.cases > 0, `${stage.stage} is measured but reports no case count`);
     }
 
     // The safety metrics that must be perfect on this corpus.
@@ -390,16 +432,38 @@ describe("running fixtures against the real database", () => {
     assert.ok(burden.non_adversarial_writes < burden.writes);
     assert.ok(burden.non_adversarial_needing_review <= burden.needing_review);
 
-    const targets = evaluateTargets(runs, stages);
+    const targets = evaluateTargets({
+      runs,
+      stages,
+      gate: lexiconSelection(),
+      provenance: { commit: "test", source: "environment", dirty: null, package_digest: "test" },
+    });
     const byTarget = new Map(targets.checks.map((check) => [check.id, check]));
     assert.equal(byTarget.get("unsupported_auto_commit")?.verdict, "pass");
-    assert.equal(byTarget.get("cross_tenant_retrieval")?.measurable, false);
+    // The in-house isolation measurement now runs, because fixtures declare forbidden
+    // claims and queries that resolve to a denied scope. The external red-team target is
+    // the one that stays unmeasurable, and it is a separate check for exactly that reason.
+    assert.equal(byTarget.get("cross_tenant_retrieval")?.measurable, true);
+    assert.equal(byTarget.get("cross_tenant_retrieval")?.verdict, "pass");
+    assert.equal(byTarget.get("external_isolation")?.measurable, false);
     assert.equal(byTarget.get("p95_query_latency")?.measurable, false);
     assert.equal(
       targets.all_targets_pass,
       false,
       "unmeasurable targets must keep the overall verdict from passing",
     );
+    // Every target that is not passing has to say why, or the exit code fails for a
+    // reason nobody can act on.
+    for (const check of targets.checks) {
+      if (check.verdict === "pass") continue;
+      assert.ok(
+        (check.unmet_reason ?? check.blocked_by ?? "").length > 0,
+        `${check.id} is ${check.verdict} with no recorded reason`,
+      );
+    }
+    for (const entry of targets.unmet) {
+      assert.ok(entry.reason.length > 0, `${entry.id} is unmet with an empty reason`);
+    }
   });
 
   it("produces the same decision set on an independent second run", async () => {

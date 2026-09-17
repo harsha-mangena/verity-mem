@@ -973,6 +973,7 @@ export function parseBodyLine(file: string, line: number, value: unknown): Fixtu
         reason: requiredString(file, line, source, "reason"),
         ...(redactActor !== undefined ? { redact_actor_events: redactActor } : {}),
         expect,
+        ...queryFields,
         ...(note !== undefined ? { note } : {}),
       };
     }
@@ -1070,7 +1071,9 @@ export function parseFixtureText(path: string, text: string): FixtureFile {
   // Cross-references: an expectation that names another line must name a line that
   // exists, otherwise a typo silently turns a chained assertion into a no-op.
   for (const entry of body) {
-    const queries = entry.kind === "append_event" || entry.kind === "resolve_claim" ? entry.query : undefined;
+    // Every line kind that can carry a query. Listed where the query is parsed, so adding a
+    // kind without one is a visible omission rather than a silently skipped assertion.
+    const queries = entry.kind === "create_grant" ? undefined : entry.query;
     for (const expectation of entry.expect) {
       // A read-path expectation is only meaningful where a query was declared. The
       // runner evaluates it against the packet that line produced, so an
