@@ -57,6 +57,9 @@ async function createHarness(label: string, overrides: Partial<Record<string, st
   const db = new Db({ connectionString: env.databaseUrl, max: 4 });
   const blobs = new MemoryBlobStore();
   const clock = fixedClock("2026-09-17T12:00:00.000Z");
+  // Seeded so a failure is reproducible from the label, but salted per harness: the
+  // ledger's primary keys are the generated event ids, and two harnesses sharing a
+  // seed would collide on the first append rather than on anything interesting.
   const ids = seededIds(`server-${label}-${randomUUID().slice(0, 8)}`);
   const ledger = new Ledger({ db, blobs, clock, ids });
   const tenant = probeTenant(label);
@@ -65,7 +68,11 @@ async function createHarness(label: string, overrides: Partial<Record<string, st
     DATABASE_URL: env.databaseUrl,
     GATE_ENTAILMENT_BACKEND: "lexical",
     EMBEDDING_BACKEND: "hash",
-    AGENT_TOKEN: "test-agent-token",
+    // Both credentials are bound to the tenant. The by-id routes — an event, a claim,
+    // a candidate, a trace — have no tenant in the body to bind, so an unbound
+    // credential genuinely cannot use them; the append route's body-named tenant is
+    // covered by the cross-tenant test below.
+    AGENT_TOKEN: `tenant:${tenant}:test-agent-token`,
     ADMIN_TOKEN: `tenant:${tenant}:test-admin-token`,
     ...overrides,
   });
@@ -238,25 +245,10 @@ describe("veritymem server", () => {
   });
 
   it("refuses a body that names a different tenant than the token", async () => {
-    const unbound = await h.app.inject({
-      method: "POST",
-      url: "/v1/events",
-      headers: agentJson(h),
-        payload: {
-        stream_id: "thread:cross",
-        origin: "user",
-        actor_id: "user:alice",
-        scope: { tenant: `${h.tenant}-other`, project: h.project, user: h.user, purpose: [...h.purposes] },
-        occurred_at: "2026-09-10T09:14:00Z",
-        content: "this must never be written",
-      },
-    });
-    // The agent token in this harness is not tenant-bound, so naming a tenant is
-    // allowed and becomes the write's tenant. The refusal that matters is the one
-    // below, where the credential *is* bound.
-    assert.equal(unbound.statusCode, 202, unbound.body);
-
-    // A credential bound to this tenant, presented with a body naming another one.
+    // The bound credential names one tenant and the body names another. The refusal
+    // happens before any binding: `/v1/forget` is the erase path, and it runs under
+    // `withSystemContext`, which reaches every row in its tenant. A caller that chose
+    // its own tenant there would be erasing someone else's ledger.
     const boundTenant = probeTenant("bound");
     const bound = await createHarness("bound", {
       AGENT_TOKEN: `tenant:${boundTenant}:bound-agent-token`,
@@ -267,15 +259,33 @@ describe("veritymem server", () => {
         method: "POST",
         url: "/v1/forget",
         headers: adminJson(bound),
-            payload: { subject_or_scope: { tenant: "some-other-tenant", user: "alice" }, reason: "gdpr_art17" },
+        payload: { subject_or_scope: { tenant: "some-other-tenant", user: "alice" }, reason: "gdpr_art17" },
       });
       assert.equal(
         mismatched.statusCode,
         403,
         `a tenant-bound credential must refuse a body naming another tenant, got ${mismatched.statusCode}: ${mismatched.body}`,
       );
-      const body = mismatched.json() as { error: { code: string } };
-      assert.equal(body.error.code, "tenant_mismatch");
+      const forgetError = mismatched.json() as { error: { code: string } };
+      assert.equal(forgetError.error.code, "tenant_mismatch");
+
+      // The write path refuses it too, so a caller cannot append evidence into another
+      // tenant's ledger by naming it.
+      const write = await bound.app.inject({
+        method: "POST",
+        url: "/v1/events",
+        headers: agentJson(bound),
+        payload: {
+          stream_id: "thread:cross",
+          origin: "user",
+          actor_id: "user:alice",
+          scope: { tenant: "some-other-tenant", project: "payments", user: "alice", purpose: ["release_planning"] },
+          occurred_at: "2026-09-10T09:14:00Z",
+          content: "this must never be written",
+        },
+      });
+      assert.equal(write.statusCode, 403, write.body);
+      assert.equal((write.json() as { error: { code: string } }).error.code, "tenant_mismatch");
 
       // And a query for another tenant's scope is refused the same way, before any
       // retrieval happens.
@@ -283,16 +293,33 @@ describe("veritymem server", () => {
         method: "POST",
         url: "/v1/query",
         headers: agentJson(bound),
-            payload: {
+        payload: {
           query: "deploy window",
           scope: { tenant: "some-other-tenant", project: "payments" },
           purpose: "release_planning",
         },
       });
-      // This harness's agent token is `tenant:<h.tenant>:test-agent-token`, so naming
-      // another tenant is a 403 rather than an empty packet.
       assert.equal(query.statusCode, 403, query.body);
       assert.equal((query.json() as { error: { code: string } }).error.code, "tenant_mismatch");
+
+      // An unbound credential cannot use the by-id routes at all: there is no tenant
+      // in the body to bind, and choosing one from the request would be the caller
+      // selecting its own tenant.
+      const unbound = await createHarness("unbound", {
+        AGENT_TOKEN: "unbound-agent-token",
+        ADMIN_TOKEN: `tenant:${probeTenant("unbound-admin")}:unbound-admin-token`,
+      });
+      try {
+        const read = await unbound.app.inject({
+          method: "GET",
+          url: `/v1/claims/clm_${"0".repeat(32)}/explain`,
+          headers: agentAuth(unbound),
+        });
+        assert.equal(read.statusCode, 400, read.body);
+        assert.equal((read.json() as { error: { code: string } }).error.code, "validation_failed");
+      } finally {
+        await unbound.close();
+      }
     } finally {
       await bound.close();
     }

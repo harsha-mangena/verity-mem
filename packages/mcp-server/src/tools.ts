@@ -20,17 +20,21 @@
  */
 import { z } from "zod";
 import type {
+  CandidateReadResponse,
   ClaimExplanation,
-  Decision,
   DecisionRequest,
+  DecisionResponse,
   EventAppendResponse,
+  FeedbackRequest,
+  FeedbackResponse,
   ForgetRequest,
-  Grant,
+  ForgetResponse,
   GrantCreateRequest,
+  GrantCreateResponse,
   MemoryPacket,
   OriginKind,
   QueryRequest,
-  RetentionJob,
+  QueryTraceResponse,
   TimeSpec,
 } from "@veritymem/contracts";
 import type { AuthorizedSession, ToolName } from "./auth.ts";
@@ -51,20 +55,20 @@ export interface ToolBackend {
   query(request: QueryRequest): Promise<MemoryPacket>;
   explainClaim(claimId: string): Promise<ClaimExplanation>;
   appendEvent(request: AppendEventRequest): Promise<EventAppendResponse>;
-  getCandidate(candidateId: string): Promise<unknown>;
-  decideCandidate(candidateId: string, request: DecisionRequest): Promise<Decision>;
-  feedback(request: { trace_id: string; outcome: "correct" | "incorrect" | "incomplete" | "harmful"; correction?: string }): Promise<unknown>;
-  createGrant(request: GrantCreateRequest): Promise<Grant>;
-  forget(request: ForgetRequest): Promise<RetentionJob>;
+  getCandidate(candidateId: string): Promise<CandidateReadResponse>;
+  decideCandidate(candidateId: string, request: DecisionRequest): Promise<DecisionResponse>;
+  feedback(request: FeedbackRequest): Promise<FeedbackResponse>;
+  createGrant(request: GrantCreateRequest): Promise<GrantCreateResponse>;
+  forget(request: ForgetRequest): Promise<ForgetResponse>;
   /**
    * Optional so a deployment can run the tools without it.
    *
-   * `GET /v1/query-traces/{trace_id}` exists in the specification and in
+   * `GET /v1/query-traces/{trace_id}` is in the specification and in
    * `VerityMemClient`, but a backend that does not bind it must say so through
    * `memory_explain` rather than returning an empty object that reads as "the
    * trace was empty".
    */
-  getQueryTrace?(traceId: string): Promise<unknown>;
+  getQueryTrace?(traceId: string): Promise<QueryTraceResponse>;
 }
 
 /**
@@ -82,6 +86,7 @@ export interface AppendEventRequest {
   readonly scope: { tenant: string; project?: string; user?: string; agent?: string; session?: string; purpose: string[] };
   readonly occurred_at: string;
   readonly content: string;
+  readonly media_type?: string;
   readonly idempotency_key?: string;
   readonly sensitivity?: "normal" | "private" | "high";
 }
@@ -567,26 +572,38 @@ async function handlePropose(
   args: z.infer<z.ZodObject<typeof proposeShape>>,
   context: ToolContext,
 ): Promise<ToolResult> {
+  const proposed = {
+    proposal_for: args.event_id,
+    candidate: args.candidate,
+    proposed_by: context.session.subject,
+    proposed_at: context.now().toISOString(),
+  };
   const event = await context.backend.appendEvent({
-    // A proposal is not an observation, so it is recorded on its own stream and
-    // with model_inference origin: the ledger must distinguish "a model proposed
-    // this" from "this was observed".
+    // A proposal is not an observation, so it is recorded on its own stream, with
+    // model_inference origin and a media type that says what the payload is. The
+    // ledger must distinguish "a model proposed this" from "this was observed",
+    // and it must keep proposals even when the gate rejects them: a rejected
+    // proposal is the record of what the extractor tried to assert.
     stream_id: `proposal:${args.event_id}`,
     origin: "model_inference",
     actor_id: context.session.subject,
-    scope: { ...context.session.scope, tenant: context.session.tenant, purpose: [...context.session.purposes] },
+    scope: scopeOf(context),
     occurred_at: context.now().toISOString(),
-    content: JSON.stringify({ proposal_for: args.event_id, candidate: args.candidate }),
+    content: JSON.stringify(proposed),
+    media_type: "application/vnd.veritymem.proposal+json",
   });
 
-  const candidate = await context.backend.getCandidate(event.event_id);
   return {
     ok: true,
     value: {
       proposal_event_id: event.event_id,
-      candidate,
+      proposal_for: args.event_id,
+      extraction: event.extraction,
+      deduplicated: event.deduplicated,
       instruction:
-        "Recorded as an untrusted proposal. No model call can set status = accepted; the commit gate decides, and its outcome is in the candidate's state and decision.",
+        "Recorded as an untrusted proposal. No model call can set status = accepted; the commit gate decides. " +
+        "This REST surface has no route that accepts a pre-built candidate, so the proposal is durable evidence " +
+        "and its promotion is decided by extraction of the source event, not by this call.",
     },
   };
 }
@@ -681,6 +698,17 @@ async function handleForget(
  * access even if the authorization check were bypassed. The requested dimension
  * is used only where the session is silent.
  */
+/**
+ * The session's own scope, with the tenant always bound.
+ *
+ * Used by the tools that must not accept a caller-supplied scope at all — a
+ * proposal is evidence about an event, and letting the proposer choose where that
+ * evidence lands is how a model widens its own reach.
+ */
+function scopeOf(session: AuthorizedSession): { tenant: string; project?: string; user?: string; agent?: string; session?: string } {
+  return mergeScope(session, undefined);
+}
+
 function mergeScope(
   session: AuthorizedSession,
   requested: { project?: string | undefined; user?: string | undefined; agent?: string | undefined; session?: string | undefined } | undefined,

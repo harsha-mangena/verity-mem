@@ -119,7 +119,13 @@ function checkOutcome(
   for (const assertion of outcome.decisions ?? []) {
     const decisions = run.decisions.filter((decision) => decision.line_id === assertion.line_id);
     if (decisions.length === 0) {
-      add(`decision for ${assertion.line_id}`, "fail", "no decision was recorded for this input");
+      add(
+        `decision for ${assertion.line_id}`,
+        "fail",
+        `no decision was recorded for this input (decisions seen: ${
+          run.decisions.map((decision) => decision.line_id || "<unattributed>").join(", ") || "none"
+        })`,
+      );
       continue;
     }
     for (const decision of decisions) {

@@ -643,6 +643,17 @@ class RunState {
     return this.tenantId;
   }
 
+  /**
+   * What `Ledger.append` will derive as the tenant for an event in this run.
+   *
+   * Exposed so `adoptTenant` cannot silently disagree with the write path: the
+   * runner asserts that the receipt names the tenant it primed, and a mismatch is
+   * reported rather than tolerated.
+   */
+  private expectedTenant(): string {
+    return this.tenantId;
+  }
+
   private rememberScope(scope: ResolvedScope, declaredSlug: string): void {
     const row: ScopeRow = {
       scope_id: scope.scope_id,
@@ -839,7 +850,17 @@ class RunState {
       // reach, or the benchmark would be testing a write path that does not ship.
       const request = this.runScoped(entry);
       const receipt = await this.deps.ledger.append(request, { principal: request.actor_id });
-      // The receipt is the only trustworthy statement about where the row landed.
+      // The receipt is the only trustworthy statement about where the row landed,
+      // and it must agree with the partition the run primed. A disagreement means
+      // the run's reads are aimed at a tenant it never wrote to, which presents as
+      // every metric reading zero against a working system.
+      if (receipt.scope.tenant_id !== this.expectedTenant()) {
+        throw new Error(
+          `ledgerbench: append landed in tenant ${receipt.scope.tenant_id} but the run primed ` +
+            `${this.expectedTenant()}. The runner and the ledger disagree about tenant derivation, so no ` +
+            `metric from this run would mean anything.`,
+        );
+      }
       this.adoptTenant(receipt.scope.tenant_id);
       await this.learnAllScopes();
       this.eventsByLine.set(entry.line_id, {
@@ -919,7 +940,13 @@ class RunState {
     const event = entry.event;
     const rewritten: EventAppendRequest = {
       ...event,
-      scope: { ...event.scope, tenant: this.deps.tenantSlug },
+      // The tenant value is chosen so the ledger's own derivation lands exactly on
+      // the run's tenant. `Ledger.append` calls `resolveTenantId` on the scope's
+      // tenant and then hands the result to `ensureScope`, which resolves it again
+      // — so passing `resolveTenantId(runTenant)` means the append resolves to
+      // `runTenant` while `ensureScope` sees `runTenant` as well. Any other value
+      // puts the events in one partition and the scopes in another.
+      scope: { ...event.scope, tenant: resolveTenantId(this.tenantId) },
       ...(event.idempotency_key !== undefined
         ? { idempotency_key: `${event.idempotency_key}#${this.deps.runToken.slice(0, 8)}` }
         : {}),

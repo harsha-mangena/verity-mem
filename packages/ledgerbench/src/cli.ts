@@ -175,7 +175,6 @@ async function main(): Promise<number> {
       if (traces.traces.length > 0) {
         conformance = await runConformance(traces.traces, runner);
         for (const trace of conformance.traces) {
-          paths.push(`${options.fixturesRoot}/conformance/${trace.trace_id}`);
           if (!options.quiet) printTrace(trace);
         }
       }

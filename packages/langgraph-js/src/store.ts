@@ -64,6 +64,18 @@ export type StoreClaimValue = {
   readonly conflicts: readonly unknown[];
   readonly evidence: readonly unknown[];
   readonly scope: Readonly<Record<string, unknown>>;
+  /**
+   * Rank-fusion output, kept apart from everything else and labelled as relevance.
+   *
+   * `null` for a claim read that did not come from a query. This is never a truth or
+   * confidence score: the six dimensions of a claim stay separate, and collapsing them
+   * is the mistake this field's name is chosen to avoid.
+   */
+  readonly relevance: {
+    readonly fuse_score: number;
+    readonly channels: readonly string[];
+    readonly signals: Readonly<Record<string, unknown>>;
+  } | null;
   /** Where this value came from. Never stripped: a value without provenance is a rumour. */
   readonly provenance: Readonly<Record<string, unknown>>;
 };
@@ -669,6 +681,7 @@ function itemFromClaim(claim: ClaimRecord, codec: NamespaceCodec, tenant: string
       conflicts: claim.conflicts,
       evidence: claim.evidence,
       scope: claim.scope as unknown as Readonly<Record<string, unknown>>,
+      relevance: null,
       provenance: {
         source: "GET /v1/claims/{claim_id}",
         tenant,
@@ -693,12 +706,18 @@ function itemFromClaim(claim: ClaimRecord, codec: NamespaceCodec, tenant: string
 export function storeItemFromPacketClaim(
   claim: PacketClaim,
   tenant: string,
+  provenance?: PacketProvenance,
   codec: NamespaceCodec = createNamespaceCodec(),
 ): StoreItem {
-  return itemFromPacketClaim(claim, codec, tenant);
+  return itemFromPacketClaim(claim, codec, tenant, provenance);
 }
 
-function itemFromPacketClaim(claim: PacketClaim, codec: NamespaceCodec, tenant: string): StoreItem {
+function itemFromPacketClaim(
+  claim: PacketClaim,
+  codec: NamespaceCodec,
+  tenant: string,
+  packet?: PacketProvenance,
+): StoreItem {
   const namespace = codec.toNamespace({
     tenant,
     ...(claim.scope.project === null ? {} : { project: claim.scope.project }),
@@ -723,12 +742,16 @@ function itemFromPacketClaim(claim: PacketClaim, codec: NamespaceCodec, tenant: 
       conflicts: claim.conflicts,
       evidence: claim.evidence,
       scope: claim.scope as unknown as Readonly<Record<string, unknown>>,
+      relevance: {
+        fuse_score: claim.fuse_score,
+        channels: claim.channels,
+        signals: claim.signals as unknown as Readonly<Record<string, unknown>>,
+      },
       provenance: {
         source: "POST /v1/query",
         tenant,
-        fuse_score: claim.fuse_score,
-        channels: claim.channels,
-        signals: claim.signals,
+        trace_id: traceId,
+        policy_version: policyVersion,
       },
     },
     createdAt: claim.valid_time.from,

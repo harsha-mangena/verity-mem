@@ -69,9 +69,7 @@
       "blobs",
       "claims",
       "embeddings",
-      "fts",
-      "cache"
-    ],
-    "ledger_rows_preserved": 1
+      "fts"
+    ]
   }
 }

@@ -202,6 +202,39 @@ export async function callerScopeIds(
   return (await callerScopes(executor, input)).map((scope) => scope.scope_id);
 }
 
+/** The scope ids a caller reaches, together with the purposes those scopes carry. */
+export interface CallerReach {
+  readonly scopeIds: readonly string[];
+  /**
+   * Every purpose named by a scope the caller holds.
+   *
+   * This is the set the request context must declare, and it is not optional. Since
+   * migration 0006 the authorization predicate is a single conjunction —
+   * tenant match AND `scope_reachable(scope, current_purposes())` — and
+   * `scope_reachable` denies an empty purpose set outright, because an empty purpose
+   * set is the absence of an authorization basis rather than a wildcard. A read bound
+   * with no purposes therefore sees *nothing at all*, including rows the caller
+   * plainly holds. That failure is silent: it returns 404, which is also the correct
+   * answer for an unreachable object, so a server that got this wrong would look like
+   * a server whose database was empty.
+   *
+   * The purposes are read from the scopes, never from the request. A caller cannot
+   * widen them by asking, and they are the caller's own purposes, so declaring them
+   * grants nothing that membership did not already grant.
+   */
+  readonly purposes: readonly string[];
+}
+
+export async function callerReach(
+  executor: QueryExecutor,
+  input: { readonly tenantId: string; readonly principal: string; readonly now: string },
+): Promise<CallerReach> {
+  const scopes = await callerScopes(executor, input);
+  const purposes = new Set<string>();
+  for (const scope of scopes) for (const purpose of scope.purpose) purposes.add(purpose);
+  return { scopeIds: scopes.map((scope) => scope.scope_id), purposes: [...purposes] };
+}
+
 /**
  * Read one object inside a bound request context, or report that it is not there.
  *
@@ -210,30 +243,27 @@ export async function callerScopeIds(
  * with that reach bound. Nesting them would check a second connection out of the
  * pool while the first is held, and with a pool of N, N concurrent requests would
  * deadlock: every request holding an outer connection and waiting for an inner one.
- * That failure mode is invisible in a single-request test and appears as a
+ * That failure mode is invisible in a single-request test and appears as an
  * unexplained hang under load, so the shape is avoided structurally rather than
  * documented.
  *
- * The binding carries the caller's reachable scope ids and no purposes. That is not
- * a loosening: `veritymem.row_authorized` requires the tenant to match *and*
- * `scope_reachable(scope, current_purposes())`, and it is the scope set — computed
- * from membership and grants, never from the request — that decides. Passing the
- * object's own purpose as the request purpose would let a caller name a purpose it
- * was never granted for and read the row anyway, which is the empty-purpose bug in
- * a new costume.
+ * The binding carries the caller's reachable scope ids *and* the purposes those
+ * scopes hold. Both are required: the predicate denies an empty purpose set, so a
+ * read bound without purposes returns nothing even for rows the caller holds. See
+ * `CallerReach.purposes`.
  */
 export async function withReadContext<T>(
   deps: ServerDeps,
   caller: TenantContext,
   fn: (executor: QueryExecutor) => Promise<T>,
 ): Promise<T> {
-  const scopes = await discoverReach(deps, caller);
+  const reach = await discoverReach(deps, caller);
   return deps.db.withRequest(
     {
       tenant: caller.tenantId,
       principal: caller.principal,
-      scopeIds: scopes,
-      purposes: [],
+      scopeIds: reach.scopeIds,
+      purposes: reach.purposes,
       action: "api:read",
     },
     fn,
@@ -255,13 +285,13 @@ export async function withWriteContext<T>(
   action: string,
   fn: (executor: QueryExecutor) => Promise<T>,
 ): Promise<T> {
-  const scopes = await discoverReach(deps, caller);
+  const reach = await discoverReach(deps, caller);
   return deps.db.withRequest(
     {
       tenant: caller.tenantId,
       principal: caller.principal,
-      scopeIds: scopes,
-      purposes: [],
+      scopeIds: reach.scopeIds,
+      purposes: reach.purposes,
       action,
     },
     fn,
@@ -275,8 +305,14 @@ export async function withWriteContext<T>(
  * should show that one round trip resolved authorization and did not touch claim
  * data, which is the property the whole read path depends on.
  */
-async function discoverReach(deps: ServerDeps, caller: TenantContext): Promise<string[]> {
+async function discoverReach(deps: ServerDeps, caller: TenantContext): Promise<CallerReach> {
   const now = deps.clock.now().toISOString();
+  // The discovery transaction binds no scope and no purpose, and that is safe rather
+  // than convenient: it reads `principal_scopes`, `grants` and `scopes`, none of which
+  // carries claim content, and `scopes` is deliberately readable within the tenant
+  // because resolving a scope *is* part of authorization. It cannot read an event or a
+  // claim, because those tables are guarded by the predicate whose inputs this
+  // transaction exists to compute.
   return deps.db.withRequest(
     {
       tenant: caller.tenantId,
@@ -285,7 +321,7 @@ async function discoverReach(deps: ServerDeps, caller: TenantContext): Promise<s
       purposes: [],
       action: "api:reach",
     },
-    async (executor) => callerScopeIds(executor, { tenantId: caller.tenantId, principal: caller.principal, now }),
+    async (executor) => callerReach(executor, { tenantId: caller.tenantId, principal: caller.principal, now }),
     { readOnly: true },
   );
 }

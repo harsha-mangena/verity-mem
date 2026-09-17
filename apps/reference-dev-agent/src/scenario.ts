@@ -933,6 +933,10 @@ interface QueryInput {
 }
 
 async function query(world: World, deps: RetrievalDependencies, input: QueryInput): Promise<ComposeResult> {
+  const events = await world.db.withSystemContext({ tenant: world.tenantId, actor: "x" }, (ex) => ex.query("SELECT count(*)::int AS c FROM events"));
+  const claimsN = await world.db.withSystemContext({ tenant: world.tenantId, actor: "x" }, (ex) => ex.query("SELECT count(*)::int AS c FROM claims"));
+  const embN = await world.db.withSystemContext({ tenant: world.tenantId, actor: "x" }, (ex) => ex.query("SELECT count(*)::int AS c FROM claim_embeddings"));
+  process.stderr.write(`PRECHECK events=${events.rows[0]?.c} claims=${claimsN.rows[0]?.c} emb=${embN.rows[0]?.c} text=${JSON.stringify(input.text)}\n`);
   const result = await compose(
     deps,
     {

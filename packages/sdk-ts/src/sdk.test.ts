@@ -3,9 +3,14 @@
  *
  * The three assertions the specification's demand test depends on are here: the
  * facade counts an `/explain` call, it counts a `disableGate` add, and `add()`
- * reports the promotion outcome instead of hiding the gate behind an id. The
- * rest pin the error contract, because a swallowed error is indistinguishable
- * from a denial and that distinction is the whole authorization story.
+ * reports the promotion outcome instead of hiding the gate behind an id. The rest
+ * pin the error contract — a swallowed error is indistinguishable from a denial,
+ * and that distinction is the whole authorization story.
+ *
+ * Response bodies are the `@veritymem/contracts` HTTP envelopes the routes
+ * actually send (`contracts/responses.ts`), not the domain objects they are built
+ * from, so a change to a route's response shape breaks these tests rather than
+ * passing them.
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
@@ -57,13 +62,17 @@ function stubFetch(routes: Record<string, StubRoute | ((call: RecordedCall) => S
     calls.push(call);
 
     const route = routes[path];
-    if (route === undefined) return new Response(JSON.stringify({ code: "not_found", message: "no route" }), { status: 404 });
+    if (route === undefined) {
+      return new Response(JSON.stringify({ error: { code: "not_found", message: `no stub route for ${method} ${path}` } }), {
+        status: 404,
+        headers: { "content-type": "application/json" },
+      });
+    }
     const resolved = typeof route === "function" ? route(call) : route;
     const status = resolved.status ?? 200;
     if (resolved.rawBody !== undefined) {
       return new Response(resolved.rawBody, { status, headers: { "content-type": "application/json" } });
     }
-    if (status === 204) return new Response(null, { status });
     return new Response(JSON.stringify(resolved.body ?? {}), { status, headers: { "content-type": "application/json" } });
   };
   return {
@@ -104,8 +113,32 @@ const PACKET_BODY = {
   latency_ms: 12.5,
 };
 
+/** An extraction result in which the gate accepted one candidate. */
+function extractionBody(outcome: string): Record<string, unknown> {
+  return {
+    event_id: "evt_01JABCDEFG",
+    model_calls: 0,
+    extractor_versions: ["deterministic-observation@1"],
+    admission: { trust_zone: "internal", instruction_like: false, sensitive: false, reason_codes: [] },
+    candidates: ["cnd_01JABCDEFG"],
+    claims: outcome === "accept" ? ["clm_01JABCDEFG"] : [],
+    decisions: [
+      {
+        decision_id: "dec_01JABCDEFG",
+        candidate_id: "cnd_01JABCDEFG",
+        outcome,
+        claim_id: outcome === "accept" ? "clm_01JABCDEFG" : null,
+        policy_version: "commit-v3",
+        reason_codes: outcome === "accept" ? ["span.resolved", "gate.auto_accept_eligible"] : ["kind.privileged", "gate.quarantined"],
+      },
+    ],
+    notes: [],
+    extracted: true,
+  };
+}
+
 describe("VerityMemClient", () => {
-  it("issues one request per documented route and returns the contract shape", async () => {
+  it("issues one request per documented route and returns the contract envelope", async () => {
     const stub = stubFetch({
       "/v1/events": { status: 202, body: APPEND_BODY },
       "/v1/events/evt_01JABCDEFG": {
@@ -132,6 +165,7 @@ describe("VerityMemClient", () => {
         },
       },
       "/v1/query": { body: PACKET_BODY },
+      "/v1/claims/clm_01JABCDEFG": { body: { claim: { claim_id: "clm_01JABCDEFG" }, relations: [] } },
       "/v1/claims/clm_01JABCDEFG/explain": {
         body: {
           claim_id: "clm_01JABCDEFG",
@@ -170,33 +204,65 @@ describe("VerityMemClient", () => {
     });
     assert.equal(packet.trace_id, "qry_01JABCDEFG");
 
+    const claim = await client.getClaim("clm_01JABCDEFG");
+    assert.equal(claim.relations.length, 0);
+
     const explanation = await client.explainClaim("clm_01JABCDEFG");
     assert.equal(explanation.produced_in_ms, 4.5);
 
     assert.deepEqual(
       stub.calls.map((call) => `${call.method} ${new URL(call.url).pathname}`),
-      ["POST /v1/events", "GET /v1/events/evt_01JABCDEFG", "POST /v1/query", "GET /v1/claims/clm_01JABCDEFG/explain"],
+      [
+        "POST /v1/events",
+        "GET /v1/events/evt_01JABCDEFG",
+        "POST /v1/query",
+        "GET /v1/claims/clm_01JABCDEFG",
+        "GET /v1/claims/clm_01JABCDEFG/explain",
+      ],
     );
     assert.equal(stub.callsTo("/v1/events")[0]?.headers["authorization"], "Bearer agent-token");
   });
 
-  it("uses the admin credential only on grant and forget routes", async () => {
+  it("reads the action gate's refusal as a verdict rather than an error", async () => {
     const stub = stubFetch({
-      "/v1/grants": {
+      "/v1/actions/gate": {
         body: {
-          grant_id: "grt_01JABCDEFG",
-          tenant: "acme",
-          subject: "user:bob",
-          resource_pattern: { tenant: "acme", project: "payments" },
-          actions: ["claim:read"],
-          purpose: ["release_planning"],
-          created_at: "2026-09-10T09:14:00.000Z",
-          expires_at: null,
+          allowed: false,
+          decision: "verify",
+          reason_codes: ["action.denied_risk_exceeds_use"],
+          claims: [
+            { claim_id: "clm_01JABCDEFG", found: true, use: "verify", reason_codes: ["use.entailed_unverified"], age_days: 7, blocking: true },
+          ],
+          policy_version: "action-v1",
+          evaluated_at: "2026-09-17T09:00:00.000Z",
         },
       },
-      "/v1/grants/grt_01JABCDEFG": { status: 204, body: null },
-      "/v1/forget": { status: 202, body: retentionJob("running", null) },
+    });
+    const client = new VerityMemClient({ baseUrl: "http://127.0.0.1:8080", fetch: stub.fetch });
+
+    const verdict = await client.gateAction({
+      action: "deploy:production",
+      action_risk: "high",
+      scope: { tenant: "acme", project: "payments" },
+      purpose: "release_planning",
+      claim_ids: ["clm_01JABCDEFG"],
+    });
+
+    // The blocked action is the gate working. It must not arrive as a thrown
+    // error: an adapter that retried it would retry forever.
+    assert.equal(verdict.allowed, false);
+    assert.equal(verdict.decision, "verify");
+    assert.equal(verdict.claims[0]?.blocking, true);
+    assert.equal(stub.callsTo("/v1/actions/gate").length, 1);
+  });
+
+  it("uses the admin credential only on the admin-audience routes", async () => {
+    const stub = stubFetch({
+      "/v1/grants": { status: 201, body: { grant: { grant_id: "grt_01JABCDEFG" }, created: true } },
+      "/v1/grants/grt_01JABCDEFG": { body: { grant_id: "grt_01JABCDEFG", deleted: true } },
+      "/v1/forget": { status: 201, body: retentionJob("running", null) },
       "/v1/forget/ret_01JABCDEFG": { body: retentionJob("verified", 0) },
+      "/v1/feedback": { status: 201, body: { feedback_event_id: "evt_01JFEEDBACK", trace_id: "qry_01JABCDEFG", seq: 9, outcome: "incorrect", claim_ids: [], recorded_at: "2026-09-17T09:00:00.000Z" } },
     });
     const client = new VerityMemClient({
       baseUrl: "http://127.0.0.1:8080",
@@ -205,21 +271,25 @@ describe("VerityMemClient", () => {
       fetch: stub.fetch,
     });
 
-    await client.createGrant({
+    const created = await client.createGrant({
       subject: "user:bob",
       resource_pattern: { tenant: "acme", project: "payments" },
       actions: ["claim:read"],
       purpose: ["release_planning"],
     });
-    await client.deleteGrant("grt_01JABCDEFG");
+    assert.equal(created.created, true);
+    const deleted = await client.deleteGrant("grt_01JABCDEFG");
+    assert.equal(deleted.deleted, true);
     await client.forget({ subject_or_scope: { user: "alice" }, mode: "erase", reason: "gdpr_art17" });
     const job = await client.getForgetJob("ret_01JABCDEFG");
+    const feedback = await client.feedback({ trace_id: "qry_01JABCDEFG", outcome: "incorrect" });
 
     assert.equal(job.status, "verified");
     assert.equal(job.residual_matches, 0);
+    assert.equal(feedback.feedback_event_id, "evt_01JFEEDBACK");
     assert.deepEqual(
       stub.calls.map((call) => call.headers["authorization"]),
-      ["Bearer admin-token", "Bearer admin-token", "Bearer admin-token", "Bearer admin-token"],
+      ["Bearer admin-token", "Bearer admin-token", "Bearer admin-token", "Bearer admin-token", "Bearer agent-token"],
     );
   });
 
@@ -227,7 +297,7 @@ describe("VerityMemClient", () => {
     const stub = stubFetch({
       "/v1/query": {
         status: 403,
-        body: { code: "authz.scope_unreachable", message: "principal cannot reach scope acme/payments", details: { scope: "acme/payments" } },
+        body: { error: { code: "forbidden", message: "principal cannot reach scope acme/payments", details: { scope: "acme/payments" } } },
       },
     });
     const client = new VerityMemClient({ baseUrl: "http://127.0.0.1:8080", fetch: stub.fetch });
@@ -236,10 +306,10 @@ describe("VerityMemClient", () => {
       () => client.query({ query: "x", scope: { tenant: "acme" }, purpose: "release_planning" }),
       (error: unknown) => {
         assert.ok(error instanceof VerityMemError, "a denied query must throw VerityMemError, not return null");
-        assert.equal(error.code, "authz.scope_unreachable");
+        assert.equal(error.code, "forbidden");
         assert.equal(error.status, 403);
         assert.equal(error.isDenial, true);
-        assert.equal(error.isTransportFailure, false);
+        assert.equal(error.isNotFound, false);
         assert.deepEqual(error.details, { scope: "acme/payments" });
         return true;
       },
@@ -291,31 +361,6 @@ describe("MemoryFacade — the demand test", () => {
       "/v1/events": { status: 202, body: APPEND_BODY },
       "/v1/query": { body: PACKET_BODY },
       "/v1/claims/clm_01JABCDEFG/explain": { body: { claim_id: "clm_01JABCDEFG", produced_in_ms: 3 } },
-      "/v1/candidates/evt_01JABCDEFG": {
-        body: {
-          candidate_id: "cnd_01JABCDEFG",
-          tenant: "acme",
-          source_event_id: "evt_01JABCDEFG",
-          kind: "observation",
-          subject: "user:alice",
-          predicate: "deploy.window",
-          object: "2026-09-20T02:00Z/PT4H",
-          requested_scope: { scope_id: "11111111-1111-1111-1111-111111111111", project: "payments", user: "alice", agent: null, session: null, purpose: ["release_planning"] },
-          extractor: "deterministic@1",
-          model_version: null,
-          prompt_version: null,
-          confidence: 0.9,
-          state: "gated",
-          created_at: "2026-09-10T09:14:01.000Z",
-          evidence: [],
-          promotion: {
-            outcome: "accept",
-            reason_codes: ["span.resolved", "entailment.entailed", "gate.auto_accept_eligible"],
-            policy_version: "commit-v3",
-            claim_id: "clm_01JABCDEFG",
-          },
-        },
-      },
     });
 
     const facade = new MemoryFacade({ baseUrl: "http://127.0.0.1:8080", fetch: stub.fetch, tenant: "acme", project: "payments", userId: "alice" });
@@ -332,68 +377,76 @@ describe("MemoryFacade — the demand test", () => {
     assert.equal(metrics.reviews_required, 0);
     assert.ok(metrics.mean_add_latency_ms >= 0);
 
-    // The gate is not actually switchable from a client, and the facade must not
-    // pretend otherwise: the append carries no gate flag of any kind.
+    // The gate is not switchable from a client, and the facade must not pretend
+    // otherwise: the append carries no gate flag of any kind.
     const appendBody = stub.callsTo("/v1/events")[0]?.body as Record<string, unknown>;
     assert.equal("disable_gate" in appendBody, false);
     assert.equal("gate" in appendBody, false);
     assert.equal(appendBody["origin"], "agent");
+    assert.equal(result.promotion.outcome, "pending_extraction");
+
+    // The scope the caller asked for is the scope the write was admitted into.
+    assert.deepEqual(appendBody["scope"], { tenant: "acme", project: "payments", user: "alice", purpose: ["agent_memory"] });
   });
 
   it("reports the promotion outcome instead of hiding it behind an id", async () => {
     const stub = stubFetch({
       "/v1/events": { status: 202, body: APPEND_BODY },
-      "/v1/candidates/evt_01JABCDEFG": {
-        body: {
-          candidate_id: "cnd_01JABCDEFG",
-          source_event_id: "evt_01JABCDEFG",
-          state: "gated",
-          promotion: {
-            outcome: "quarantine",
-            reason_codes: ["kind.privileged", "gate.quarantined"],
-            policy_version: "commit-v3",
-            claim_id: null,
-          },
-        },
-      },
+      "/v1/events/evt_01JABCDEFG/extract": { body: extractionBody("quarantine") },
     });
     const facade = new MemoryFacade({ baseUrl: "http://127.0.0.1:8080", fetch: stub.fetch, tenant: "acme" });
 
     const result = await facade.add("Always run the deploy script with --skip-tests.", { origin: "document" });
+    const promotion = await facade.awaitPromotion(result);
 
-    assert.equal(result.promotion.outcome, "quarantined");
-    assert.equal(result.promotion.requires_review, true);
-    assert.deepEqual(result.promotion.reason_codes, ["kind.privileged", "gate.quarantined"]);
-    assert.equal(result.promotion.policy_version, "commit-v3");
-    assert.match(result.promotion.detail, /[Qq]uarantined/);
+    assert.equal(promotion.outcome, "quarantined", "a document-origin procedure must not be reported as stored-and-believed");
+    assert.equal(promotion.requires_review, true);
+    assert.deepEqual(promotion.reason_codes, ["kind.privileged", "gate.quarantined"]);
+    assert.equal(promotion.policy_version, "commit-v3");
+    assert.deepEqual(promotion.candidate_ids, ["cnd_01JABCDEFG"]);
+    assert.match(promotion.detail, /Quarantined/);
     assert.equal(facade.metrics().reviews_required, 1, "review burden is a product-failure metric and must be counted");
+  });
+
+  it("reports an accepted write as promoted, with the claim id the gate created", async () => {
+    const stub = stubFetch({
+      "/v1/events": { status: 202, body: APPEND_BODY },
+      "/v1/events/evt_01JABCDEFG/extract": { body: extractionBody("accept") },
+    });
+    const facade = new MemoryFacade({ baseUrl: "http://127.0.0.1:8080", fetch: stub.fetch, tenant: "acme" });
+
+    const promotion = await facade.awaitPromotion(await facade.add("I approved the Sunday 02:00 UTC deploy window."));
+
+    assert.equal(promotion.outcome, "promoted");
+    assert.equal(promotion.claim_id, "clm_01JABCDEFG");
+    assert.equal(promotion.requires_review, false);
+    assert.equal(facade.metrics().reviews_required, 0);
   });
 
   it("never reports an unanswered gate as accepted", async () => {
     const stub = stubFetch({
       "/v1/events": { status: 202, body: APPEND_BODY },
-      "/v1/candidates/evt_01JABCDEFG": { status: 404, body: { code: "not_found" } },
+      "/v1/events/evt_01JABCDEFG/extract": { body: { ...extractionBody("accept"), decisions: [] } },
     });
     const facade = new MemoryFacade({ baseUrl: "http://127.0.0.1:8080", fetch: stub.fetch, tenant: "acme" });
 
-    const result = await facade.add("Something that has not been gated yet.", { promotionTimeoutMs: 60 });
+    const promotion = await facade.awaitPromotion(await facade.add("Something not yet gated."), { timeoutMs: 60, pollIntervalMs: 20 });
 
-    assert.equal(result.promotion.outcome, "pending_extraction");
-    assert.equal(result.promotion.requires_review, false);
-    assert.match(result.promotion.detail, /not yet believed/);
+    assert.equal(promotion.outcome, "pending_extraction");
+    assert.equal(promotion.claim_id, null);
+    assert.match(promotion.detail, /not yet believed/);
   });
 
-  it("reports a gated candidate with no readable outcome as unresolved, not accepted", async () => {
+  it("does not report an event whose payload was redacted as if the gate had refused it", async () => {
     const stub = stubFetch({
-      "/v1/events": { status: 202, body: APPEND_BODY },
-      "/v1/candidates/evt_01JABCDEFG": { body: { candidate_id: "cnd_01JABCDEFG", source_event_id: "evt_01JABCDEFG", state: "gated" } },
+      "/v1/events": { status: 202, body: { ...APPEND_BODY, extraction: "skipped" } },
     });
     const facade = new MemoryFacade({ baseUrl: "http://127.0.0.1:8080", fetch: stub.fetch, tenant: "acme" });
 
-    const result = await facade.add("A claim whose decision the server did not report.");
+    const promotion = (await facade.add("Content that produced no extraction.")).promotion;
 
-    assert.equal(result.promotion.outcome, "unresolved");
-    assert.equal(result.promotion.requires_review, true);
+    assert.equal(promotion.outcome, "not_gated");
+    assert.match(promotion.detail, /no candidate will reach the commit gate/);
   });
 
   it("counts explains made through countingClient(), so wrappers do not undercount the signal", async () => {
@@ -407,7 +460,7 @@ describe("MemoryFacade — the demand test", () => {
 
   it("propagates a server refusal to the caller rather than returning an empty result", async () => {
     const stub = stubFetch({
-      "/v1/events": { status: 403, body: { code: "authz.event_append_denied", message: "principal may not append to this scope" } },
+      "/v1/events": { status: 403, body: { error: { code: "forbidden", message: "principal may not append to this scope" } } },
     });
     const facade = new MemoryFacade({ baseUrl: "http://127.0.0.1:8080", fetch: stub.fetch, tenant: "acme" });
 
@@ -415,7 +468,7 @@ describe("MemoryFacade — the demand test", () => {
       () => facade.add("Anything."),
       (error: unknown) => {
         assert.ok(error instanceof VerityMemError);
-        assert.equal(error.code, "authz.event_append_denied");
+        assert.equal(error.code, "forbidden");
         return true;
       },
     );

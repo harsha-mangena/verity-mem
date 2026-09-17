@@ -178,7 +178,7 @@ describe("claim promotion invariant", () => {
     await h.ctx.db.withSystemContext({ tenant: h.tenantId, actor: "operator:test" }, async (executor) => {
       await applyStatus(
         executor,
-        { claimId, status: "superseded", reasonCodes: [REASON_CODES.CONFLICT_SUPERSEDES_ACCEPTED] },
+        { claimId, status: "superseded", reasonCodes: [REASON_CODES.CONFLICT_SUPERSEDES] },
         { decisionId: h.ctx.ids.next("dec"), policyVersion: "review-v1", approver: "operator:test" },
       );
     });

@@ -436,10 +436,11 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
       const startedAt = deps.clock.now().toISOString();
       const runId = deps.ids.next("evr");
       const fixturesDir = body.fixtures_dir ?? `${deps.config.env.repoRoot}/fixtures`;
+      const suite = body.suite ?? "ledgerbench";
 
       await reply.code(202).send({
         run_id: runId,
-        suite: body.suite,
+        suite,
         gate: body.gate ?? "on",
         seed: body.seed ?? 1,
         policy_version: deps.policy.version,
@@ -450,7 +451,7 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
         started_at: startedAt,
         notes: [
           `no evaluation runner is wired into this deployment, so no stage ran and no metric is reported`,
-          `suite '${body.suite}' is executed by the offline LedgerBench harness, which owns the fixtures and publishes the raw traces`,
+          `suite '${suite}' is executed by the offline LedgerBench harness, which owns the fixtures and publishes the raw traces`,
           `expected fixtures directory: ${fixturesDir}`,
           `gate backend in force: ${deps.entailment.name}; a run reported without this value would be unattributable`,
         ],

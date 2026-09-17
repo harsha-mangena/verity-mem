@@ -30,18 +30,18 @@
           ]
         },
         "occurred_at": "2026-09-20T09:40:00Z",
-        "content": "The vendor API key was rotated this morning."
+        "content": "The vendor API key rotation completed this morning."
       },
       "candidate": {
         "kind": "observation",
         "subject": "vendor:payments-sdk",
-        "predicate": "api_key.rotated",
-        "object": "2026-09-20",
+        "predicate": "api_key",
+        "object": "rotation completed",
         "authority": "observation",
         "spans": [
           {
             "start": 0,
-            "end": 44
+            "end": 51
           }
         ]
       }
@@ -52,7 +52,7 @@
       "action": "resolve_claim",
       "target": {
         "subject": "vendor:payments-sdk",
-        "predicate": "api_key.rotated"
+        "predicate": "api_key"
       },
       "outcome": "revoke",
       "reason": "rotation was rolled back",
@@ -69,7 +69,10 @@
       },
       {
         "line_id": "r1",
-        "outcome": "revoke"
+        "outcome": "revoke",
+        "must_include_reason_codes": [
+          "use.revoked"
+        ]
       }
     ],
     "accepted_claims": 0,

@@ -30,18 +30,18 @@
           ]
         },
         "occurred_at": "2026-09-20T08:40:00Z",
-        "content": "Release config: the payments build target is java-21."
+        "content": "Release config: the payments build is java-21."
       },
       "candidate": {
         "kind": "observation",
         "subject": "service:payments",
-        "predicate": "build.target",
+        "predicate": "build",
         "object": "java-21",
         "authority": "observation",
         "spans": [
           {
             "start": 16,
-            "end": 52
+            "end": 45
           }
         ]
       }
@@ -52,7 +52,7 @@
       "action": "resolve_claim",
       "target": {
         "subject": "service:payments",
-        "predicate": "build.target",
+        "predicate": "build",
         "object": "java-21"
       },
       "outcome": "supersede",
@@ -77,18 +77,18 @@
           ]
         },
         "occurred_at": "2026-09-20T09:10:00Z",
-        "content": "Release config: the payments build target is java-23."
+        "content": "Release config: the payments build is java-23."
       },
       "candidate": {
         "kind": "observation",
         "subject": "service:payments",
-        "predicate": "build.target",
+        "predicate": "build",
         "object": "java-23",
         "authority": "observation",
         "spans": [
           {
             "start": 16,
-            "end": 52
+            "end": 45
           }
         ]
       }
@@ -109,8 +109,8 @@
     "superseded_claims": 1,
     "relations": [
       {
-        "from": "service:payments|build.target|java-23",
-        "to": "service:payments|build.target|java-21",
+        "from": "service:payments|build|java-23",
+        "to": "service:payments|build|java-21",
         "rel": "supersedes"
       }
     ]

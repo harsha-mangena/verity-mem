@@ -1,19 +1,15 @@
 /**
- * `@veritymem/sdk-ts` — the typed client over the REST API, plus the
- * deliberately Mem0-shaped facade used as the specification's demand test.
+ * `@veritymem/sdk-ts` — the typed client over the REST API.
  *
- * The two entry points are separate on purpose: `@veritymem/sdk-ts` is the real
- * client and `@veritymem/sdk-ts/facade` is an instrumented adoption experiment.
- * Making a caller import the facade explicitly keeps the experiment visible in
- * their import list, which is the point.
+ * The deliberately Mem0-shaped facade used for the specification's demand test
+ * lives behind its own entry point, `@veritymem/sdk-ts/facade`. The split is on
+ * purpose: `add()`/`search()` are an instrumented adoption experiment, and making
+ * a caller import that path explicitly keeps the experiment visible in their
+ * import list rather than letting it become the default way in.
  */
 export {
   VerityMemClient,
-  type ExtractionRunResponse,
-  type FeedbackReceipt,
   type FetchLike,
-  type QueryTrace,
-  type ReverificationRequest,
   type VerityMemClientOptions,
 } from "./client.ts";
 export {
