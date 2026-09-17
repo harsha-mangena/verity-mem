@@ -157,3 +157,54 @@ def test_a_real_run_file_renders_when_one_is_available() -> None:
     assert report["stages"], "a real run must produce stage rows"
     measured = [row for row in report["stages"] if row["status"] == "measured"]  # type: ignore[union-attr]
     assert measured, "a real run must have measured at least one stage"
+
+
+def test_real_artifact_from_the_benchmark_renders_every_target(tmp_path: Path) -> None:
+    """A report the benchmark actually wrote must survive this adapter.
+
+    The synthetic payloads above are checked against the adapter's expectations; this
+    one is checked against the producer. It is skipped rather than failed when no
+    artifact exists, because the Python harness must stay runnable on a checkout that
+    has not run LedgerBench — but when a report is present it is the artifact the
+    release cites, and a rename on the TypeScript side shows up here as a stage or
+    target that rendered as missing.
+    """
+    candidates = sorted(Path("../../reports").glob("ledgerbench*.json"))
+    candidates += sorted(Path("reports").glob("ledgerbench*.json"))
+    if not candidates:
+        import pytest
+
+        pytest.skip("no LedgerBench artifact has been written under reports/")
+
+    payload = json.loads(candidates[0].read_text())
+    run = load_run(payload)
+    report = summarise(run)
+    text = render_text(report)
+
+    stages = report["stages"]
+    assert isinstance(stages, list)
+    missing = [row["stage"] for row in stages if row["status"] == "missing"]
+    assert missing == [], f"the artifact does not report stage(s) {missing}"
+
+    targets = report["targets"]
+    assert isinstance(targets, list)
+    assert len(targets) == len(V01_TARGETS)
+    # Every target the specification names has to be represented in the generated
+    # report. `passes: False` with a reason is a result; absence is not.
+    unrepresented = [row["name"] for row in targets if not row["measured"] and row["note"] == ""]
+    assert unrepresented == [], f"target(s) with no stated reason: {unrepresented}"
+    assert "VerityMem evaluation" in text
+
+    # The two lists have to agree in both directions. A name the runner publishes and this
+    # module does not know is a target nobody reads; a name this module expects and the
+    # runner stopped publishing is a target that silently renders as "not measured" forever.
+    # Neither is visible without comparing the lists, which is what this does.
+    published = {str(entry["name"]) for entry in payload["published_targets"]}  # type: ignore[union-attr]
+    declared = {name for name, _ in V01_TARGETS}
+    assert declared - published == set(), f"declared but unpublished: {sorted(declared - published)}"
+    assert published - declared == set(), f"published but undeclared: {sorted(published - declared)}"
+
+    # Every target names the report field it is measured through, so a reader can go from
+    # a published number to the metric that produced it.
+    unnamed = [entry["id"] for entry in payload["targets"]["checks"] if not entry.get("report_field")]
+    assert unnamed == [], f"target(s) with no report field: {unnamed}" 

@@ -46,6 +46,15 @@ export interface GateBackendSelection {
   readonly contradictionThreshold: number | null;
   /** Why this backend and not the other one. Travels into the report. */
   readonly reason: string;
+  /**
+   * Whether pinned model assets are present on this machine.
+   *
+   * Recorded separately from `kind` because the two disagree exactly when the production
+   * verifier is provisioned but the deployment is configured for the stand-in. That is a
+   * state a reader has to be told about: the run is honest, and it is honest about a
+   * weaker gate than the machine could run.
+   */
+  readonly production_verifier_available: boolean;
 }
 
 export interface GateBackendRequest {
@@ -92,11 +101,21 @@ export async function resolveGateBackend(request: GateBackendRequest): Promise<G
   const choice = request.choice === "auto" ? configuredChoice() : request.choice;
 
   if (choice === "lexical") {
-    return lexicalSelection(
+    const reason =
       request.choice === "lexical"
         ? "the lexical stand-in was requested explicitly"
-        : "the lexical stand-in is the configured verifier (GATE_ENTAILMENT_BACKEND unset or 'lexical')",
-    );
+        : "the lexical stand-in is the configured verifier (GATE_ENTAILMENT_BACKEND unset or 'lexical')";
+    if (assets !== null && request.choice !== "lexical") {
+      // Provisioned but not configured. The run proceeds — it must score the gate the
+      // deployment runs — and the discrepancy is recorded rather than resolved silently in
+      // either direction.
+      return lexicalSelection(
+        `${reason}, but pinned model assets are present at ${assets.modelPath}. The production ` +
+          `verifier is available and unused; set GATE_ENTAILMENT_BACKEND=onnx to score it.`,
+        true,
+      );
+    }
+    return lexicalSelection(reason, assets !== null);
   }
 
   if (assets === null) {
@@ -132,10 +151,11 @@ export async function resolveGateBackend(request: GateBackendRequest): Promise<G
       threshold: ONNX_ENTAILMENT_THRESHOLD,
       contradictionThreshold: ONNX_CONTRADICTION_THRESHOLD,
       reason: `production verifier loaded from ${assets.modelPath}`,
+      production_verifier_available: true,
     };
   } catch (error) {
     if (request.required || wantOnnx()) throw error;
-    return lexicalSelection(`the production verifier could not be loaded: ${(error as Error).message}`);
+    return lexicalSelection(`the production verifier could not be loaded: ${(error as Error).message}`, true);
   }
 }
 
@@ -169,7 +189,7 @@ function configuredChoice(): "onnx" | "lexical" {
   return process.env["GATE_ENTAILMENT_BACKEND"] === "onnx" ? "onnx" : "lexical";
 }
 
-function lexicalSelection(reason: string): GateBackendSelection {
+function lexicalSelection(reason: string, productionVerifierAvailable = false): GateBackendSelection {
   const backend = new LexicalEntailmentBackend({ floor: GATE_THRESHOLDS.lexicalEntailmentFloor });
   return {
     backend,
@@ -182,6 +202,7 @@ function lexicalSelection(reason: string): GateBackendSelection {
     threshold: GATE_THRESHOLDS.lexicalEntailmentFloor,
     contradictionThreshold: null,
     reason,
+    production_verifier_available: productionVerifierAvailable,
   };
 }
 

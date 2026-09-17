@@ -447,6 +447,26 @@ function mean(values: readonly number[]): number {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
+/**
+ * How many observations a rate needs before it is a rate rather than an anecdote.
+ *
+ * Twenty is not a statistical threshold and is not presented as one: it is the point below
+ * which a single case moves the number by five points or more, so the figure is dominated
+ * by individual fixture decisions. Stages below it still publish their numbers — withholding
+ * them would be its own dishonesty — and say in the report that the sample is too small to
+ * carry the weight of a target.
+ */
+const RATE_BEARING_MINIMUM = 20;
+
+function sampleNote(label: string, observed: number, detail: string): string {
+  return observed >= RATE_BEARING_MINIMUM
+    ? `${label} over ${observed} observation(s). ${detail}`
+    : `${label} over only ${observed} observation(s), which is below the ${RATE_BEARING_MINIMUM} this ` +
+        `harness treats as rate-bearing: one case moves this number by ` +
+        `${(100 / Math.max(observed, 1)).toFixed(0)} points, so it describes these fixtures rather than a rate. ` +
+        `${detail}`;
+}
+
 function reciprocalRank(hits: readonly { readonly claim_ids: readonly string[] }[], returned: readonly ReturnedClaimRecord[]): number {
   for (let rank = 0; rank < returned.length; rank += 1) {
     const claim = returned[rank];
@@ -558,7 +578,28 @@ function retrievalStage(runs: readonly FixtureRunResult[], failures: readonly st
       queries_with_execution_defect: queries.filter((query) => query.defects.length > 0).length,
     },
     cases: cases.length,
-    ...(defects.length > 0 ? { note: `query execution defects: ${defects.join(" | ")}` } : {}),
+    note: [
+      sampleNote(
+        "relevance judgements",
+        goldTotal,
+        `${withRelevance.length} of ${queries.length} queries declare one; recall is micro-averaged over the ` +
+          `declared gold claims and strict per-query recall is reported beside it.`,
+      ),
+      sampleNote(
+        "stale-current judgements",
+        staleDeclared,
+        `${staleCases.length} query/queries declare a superseded or revoked version that must not be returned.`,
+      ),
+      sampleNote(
+        "forbidden-claim judgements",
+        absentDeclared,
+        `${absentCases.length} query/queries declare claims the caller may not reach; ` +
+          `${absentReturned} were returned, and any number above zero is an authorization failure.`,
+      ),
+      defects.length > 0 ? `query execution defects: ${defects.join(" | ")}` : "",
+    ]
+      .filter((entry) => entry.length > 0)
+      .join(" "),
     failures,
   };
 }
@@ -645,6 +686,12 @@ function compositionStage(runs: readonly FixtureRunResult[], failures: readonly 
       unusable_claim_disclosure_rate: rate(packetsFlaggingUnusable, packetsReturningUnusable),
     },
     cases: queries.length,
+    note: sampleNote(
+      "returned claims",
+      returned.length,
+      `${queries.length} packet(s); a packet that returned nothing contributes no citation to score, which is ` +
+        `why the abstention stage exists beside this one.`,
+    ),
     failures,
   };
 }
@@ -752,9 +799,16 @@ function abstentionStage(runs: readonly FixtureRunResult[], failures: readonly s
       packets_with_usable_claim: queries.filter((query) => query.returned.some((claim) => claim.use === "use")).length,
     },
     cases: judged.length,
-    ...(judged.length === 0 && queries.length > 0
-      ? { note: "no query in this run declares `has_answer`, so precision, recall and calibration have no ground truth" }
-      : {}),
+    note:
+      judged.length === 0
+        ? "no query in this run declares `has_answer`, so precision, recall and calibration have no ground truth"
+        : sampleNote(
+            "ground-truthed queries",
+            judged.length,
+            `${negatives.length} declared unanswerable and ${positives.length} declared answerable. Calibration ` +
+              `is the Brier score of a coarse three-level confidence derived from the packet's own decision ` +
+              `field (use=1, verify=0.5, clarify/deny=0), not of a probability the system emits.`,
+          ),
     failures,
   };
 }
@@ -844,6 +898,12 @@ function actionGateStage(runs: readonly FixtureRunResult[], failures: readonly s
       evaluations_with_defect: records.filter((record) => record.defects.length > 0).length,
     },
     cases: records.length,
+    note: sampleNote(
+      "action-gate verdicts",
+      withRequired.length,
+      `${evaluated.length} of ${records.length} declared action(s) resolved every claim they named; a verdict ` +
+        `over an unresolved claim set is an unknown-claim refusal and is not scored as a safety result.`,
+    ),
     failures,
   };
 }

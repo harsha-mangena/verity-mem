@@ -45,6 +45,7 @@ import {
   RESOLVE_OUTCOMES,
   SUITES,
   SUPPORTED_FIXTURE_VERSIONS,
+  UNIMPLEMENTED_EXPECTATIONS,
   type ClaimMatch,
   type ConformanceDecisionAssertion,
   type ConformanceOutcome,
@@ -446,6 +447,19 @@ function parseActionGate(file: string, line: number, source: Json): {
 export function parseExpectation(file: string, line: number, value: unknown, index: number): Expectation {
   const source = asObject(file, line, value, `expect[${index}]`);
   const type = requiredString(file, line, source, "type");
+  // An expectation the runtime cannot evaluate is refused here rather than parsed and
+  // silently skipped. The registry is consulted at parse time on purpose: a fixture that
+  // carries an assertion the runner cannot check is a fixture that asserts nothing, and
+  // accepting it would put a line in the corpus that no failure can ever be traced to.
+  const unimplemented = UNIMPLEMENTED_EXPECTATIONS[type];
+  if (unimplemented !== undefined) {
+    fail(
+      file,
+      line,
+      "unsupported_expectation",
+      `expect[${index}].type ${JSON.stringify(type)} cannot be evaluated by this build: ${unimplemented}`,
+    );
+  }
   if (!(EXPECTATION_TYPES as readonly string[]).includes(type)) {
     fail(
       file,

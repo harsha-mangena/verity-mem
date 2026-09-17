@@ -64,6 +64,14 @@ class RunManifest:
     started_at: str
     duration_ms: float
     gate: str = "on"
+    # True when pinned production model assets are present on the machine that produced
+    # the artifact. Recorded beside the backend name because "there is no production
+    # verifier here" and "there is one and this run did not use it" are different claims,
+    # and only the second is a configuration mistake worth escalating.
+    gate_production_verifier_available: bool = False
+    code_commit: str | None = None
+    code_worktree_dirty: bool | None = None
+    gate_backend_kind: str = "lexical"
 
     def missing_fields(self) -> list[str]:
         """Fields a reader needs and cannot infer. Empty means the manifest is citable."""
@@ -99,4 +107,9 @@ class BenchmarkRun:
             problems.append(f"run manifest is missing: {', '.join(missing)}")
         if self.manifest.gate_model_sha256 is None and self.manifest.gate_backend.startswith("onnx"):
             problems.append("an ONNX gate backend must record the model hash it ran")
+        if self.manifest.gate_production_verifier_available and self.manifest.gate_backend_kind == "lexical":
+            problems.append(
+                "this run scored the lexical stand-in while production model assets are present: "
+                "the numbers describe the stand-in, not the intended verifier"
+            )
         return problems

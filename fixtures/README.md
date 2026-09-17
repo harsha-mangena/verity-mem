@@ -70,6 +70,10 @@ server would reject at the edge.
 `CandidateProposal` and takes `kind`, `subject`, `predicate`, `object`, `spans`,
 optional `authority`, `confidence` and `requested_scope`.
 
+`query` is optional, and is the read path. It is an array of queries the runner issues
+through the real `compose()` **after** the line's write has been evaluated, and the packet
+each one produced is scored by the Retrieval, Composition and Abstention stages. See §2a.
+
 **Spans.** A span is either an exact `{"start":73,"end":121}` byte pair or a
 `{"quote":"…"}` that the runner locates in the content. A quote that does not occur
 is a fixture error, not an empty span. Offsets are **UTF-8 bytes**, not characters.
@@ -145,7 +149,9 @@ earlier assertion against a later world would report correct behaviour as a fail
 | `expect_relation_persisted` | a `claim_relations` row exists | today only `duplicates` and `supersedes` reach that table; a `contradicts` assertion here is expected to fail and is what the report publishes |
 | `expect_revoked` | a claim's status is `revoked` | deliberately **not** satisfied by `superseded` or `expired`: a system that never revokes must not pass a revocation fixture |
 | `expect_superseded` | a claim's status is `superseded` | ditto |
-| `expect_missing` | the packet reports a gap | **not implemented**: no packet composer exists, so the runner reports `not_evaluated`, never a pass |
+| `expect_missing` | the packet reports a gap, and the gap contains `contains` when given | needs a `query` on the same line. Evaluated against the real packet now that the composer exists |
+| `expect_abstain` | the packet declined to give a usable answer | needs a `query` on the same line. See §2a for what counts as an abstention |
+| `expect_action_gate` | the action gate returns the required `verdict` for `action`/`action_risk`, over `claims` resolved by proposition | `claims` must be non-empty: an action gate evaluated over no claims allows everything, so a forgotten list would assert "the gate says yes" and pass against a gate that never ran |
 | `expect_reason` | the decision's `reason_codes` include / exclude the listed codes | codes must be in the closed set from `reason-codes.ts`; an invented code is a parse error |
 | `expect_grant` | a grant exists with the given expiry and expired-ness | |
 | `expect_deleted` | the residual scan totals the expected count across the named stores | |
@@ -177,6 +183,87 @@ indistinguishable from a fixture that gave up, and the parser rejects it.
 Two fixtures currently declare gaps: `ledgerbench/03` and `ledgerbench/05`, both on
 `expect_relation_persisted` for a `contradicts` relation. The gate detects and records
 the contradiction; it does not persist the relation row the data model promises.
+
+---
+
+## 2a. Queries and the read path
+
+A query lives in the fixture rather than in the runner, for the same reason an event does:
+recall is a number about a judgement, and a query the runner invented is a query whose gold
+set the runner also invented. Two fixtures that need the same query declare it twice, which
+is cheap; a runner that makes one up produces a number nobody can reproduce from the
+repository.
+
+```json
+{"line_id":"e3","action":"append_event", "event":{…}, "candidate":{…},
+ "expect":[{"type":"expect_claim","subject":"service:payments","predicate":"deploy.window","object":"03:00 UTC"}],
+ "query":[{"query":"deploy.window payments",
+           "principal":"agent:release-bot",
+           "purpose":"release_planning",
+           "project":"payments",
+           "limit":20,
+           "has_answer":true,
+           "relevance":[{"subject":"service:payments","predicate":"deploy.window","object":"03:00 UTC",
+                         "reason":"the current window; the only answer this query has"}],
+           "stale":[{"subject":"service:payments","predicate":"deploy.window","object":"02:00 UTC",
+                     "kind":"observation",
+                     "reason":"superseded, so returning it as current answers with the replaced window"}],
+           "absent":[{"subject":"user:bob","predicate":"seat.preference","object":"window",
+                      "reason":"bob's user-scoped claim; a caller bound to user:alice must not reach it"}]}]}
+```
+
+| field | required | meaning |
+| --- | --- | --- |
+| `query` | yes | the query text, verbatim |
+| `principal` | yes | the caller the query is issued as. Its reach comes from `create_grant` lines and nothing else — the benchmark never invents a principal with blanket access |
+| `purpose` | yes | the purpose the query runs under. Purpose is a hard boundary, so this is what decides which scopes are reachable |
+| `tenant` | no | the fixture's own tenant label. A label no scope in the run was created under is reported as a defect rather than as an empty result |
+| `project`/`user`/`agent`/`session` | no | selector dimensions. They **narrow** the caller's reach and can never widen it |
+| `limit` | no | retrieval budget, 1–100. Defaults to the contract's default |
+| `has_answer` | no | whether the memory holds an answer. **Declared, never inferred**: "returned nothing" is not evidence of a correct abstention, and treating it as one would score an empty read path as perfectly calibrated |
+| `relevance` | no | claims a correct read path must return. The denominator of recall@10 |
+| `stale` | no | claims that must not come back as current: superseded, revoked, expired versions |
+| `absent` | no | claims the caller may not reach. Any hit is an authorization failure, counted separately from stale leakage because it is a different bug |
+
+Every entry in `relevance`, `stale` and `absent` needs a `reason`. That is enforced by the
+parser, not by convention: these three arrays are human judgements, and a judgement whose
+basis is not recorded cannot be reviewed.
+
+**Query text.** The full-text projection keys a claim on its subject, predicate and object,
+so a multi-word predicate is **one token**: `deploy.window` is a single lexeme, and a query
+that says only `deploy window` matches no claim at all. Write the predicate as it is written
+in the claim. A query with no lexical overlap is a legitimate fixture — that is what "the
+memory cannot answer this" looks like — but it should say so in its `notes`, because an
+empty packet from a tokenisation mismatch and an empty packet from an absent fact are
+indistinguishable in the metrics.
+
+A query with no `relevance` array is still executed and still contributes its stale,
+forbidden and authorization counts; it just cannot contribute to recall. The stage reports
+`queries_with_relevance_judgement` next to `queries`, so the difference is visible.
+
+### What the read-path assertions mean
+
+| type | asserts | notes |
+| --- | --- | --- |
+| `expect_missing` | the packet's `missing` array is populated, and contains `contains` when given | an empty `missing` array fails: a packet that accounts for nothing it did not find is the provenance failure this assertion exists to catch |
+| `expect_abstain` | the packet declined to give the caller a usable answer | `signal` selects the reading. `no_usable_claim` (default) means no returned claim carries `use: "use"` — the empty packet, and the packet that returns claims only so the caller can see they were refused. `clarify` is stricter and means the packet-level decision is `clarify` |
+
+`expect_abstain` and `expect_missing` must sit on a line that declares a `query`; the parser
+refuses them otherwise, because an assertion about a packet that was never produced would
+otherwise report success without running.
+
+### What an abstention is
+
+The packet declined to hand the caller a usable answer: **no returned claim carries
+`use: "use"`**. That covers the empty packet that says why, and the packet that returns
+claims only so the caller can see they were refused — redacted evidence, a revoked claim.
+The signal comes from the packet's own per-claim `use` decision rather than from the
+runner's opinion about relevance, because "the packet told the caller not to act on any of
+this" is a property of the artifact and is what a caller experiences as an abstention.
+
+The stricter reading — the packet-level decision is `clarify` — is published beside it as
+`clarify_abstentions`, and the counts of both appear in the run's query outcomes, so a
+fixture cannot pass under one reading while the report shows the other.
 
 ---
 
@@ -294,10 +381,43 @@ MIGRATION_DATABASE_URL=postgres://verity:verity@127.0.0.1:55432/veritymem \
   node --experimental-strip-types packages/ledgerbench/src/cli.ts --suite deletion
 ```
 
-The CLI exits non-zero when a fixture assertion fails or a required conformance check
-fails. It does **not** exit non-zero merely because a stage is unimplemented: that is
-reported at the top of the output, and a gate that fails for a known and recorded
-reason gets disabled, which is worse than a gate that reports.
+### Exit codes
+
+| code | meaning |
+| --- | --- |
+| 0 | every v0.1 exit target passed, every fixture assertion passed, every required conformance check passed |
+| 1 | the run completed with something unmet: a target failed, a target **could not be measured**, an assertion failed, or a required conformance check failed. Every reason is printed and travels in the report's `unmet_targets` |
+| 2 | the run could not be completed: a fixture parse error, or a verifier the run was told to require |
+
+A target that could not be measured is **not** a passing target. That is the whole point of
+the `not_measured` verdict: the specification's own posture is that an unmeasured target is
+not a passing one, so an instrument that cannot measure a target has to say the release gate
+is unmet rather than report on the part it could see.
+
+Declaring a gap (`"gap": true`) still changes only what the report *says*: the assertion
+fails, it appears in the output, it counts in the metrics, and it fails the run. It no longer
+buys a zero exit code, because a "known limitation" list that only grows is indistinguishable
+from a gate that never fires.
+
+### Choosing the entailment verifier
+
+`auto` (the default) selects the verifier the deployment is configured with, reading the same
+`GATE_ENTAILMENT_BACKEND` the server and worker read: `onnx` selects the production
+DeBERTa-v3 MNLI verifier, anything else — including unset — selects the documented lexical
+stand-in. A benchmark must score the gate that ships, so the two cannot be configured
+separately by accident.
+
+```bash
+# the production verifier, refusing to fall back if the assets are missing
+GATE_ENTAILMENT_BACKEND=onnx pnpm eval:ledgerbench --seed 1 --gate-required
+
+# or explicitly
+pnpm eval:ledgerbench --seed 1 --gate-backend onnx
+```
+
+The manifest records which one ran, its name, the model digest, the tokenizer digest and the
+entailment threshold that was in force. A verifier named without the hash of the model that
+produced its verdicts is not pinned, and the same name can mean two different gates.
 
 ---
 
@@ -311,6 +431,15 @@ reason gets disabled, which is worse than a gate that reports.
    cannot, say so in `notes` and leave the expectation in only if you also accept it
    failing — the runner will report it, and a `not_evaluated` is never rendered as a
    pass.
+3a. If you declare a `query`, the read path is scored from it: give it a `relevance`
+   array with a reason per claim, or the recall denominator stays empty and the run says
+   so. Evidence should be written so the claim is entailed by its span under the
+   **production** verifier as well as the lexical stand-in — a hedged sentence such as
+   "I might prefer the aisle seat" does not entail "the preference is aisle", and the ONNX
+   backend will correctly refuse it.
+3b. Fixtures are counted, not just discovered. `ledgerbench.test.ts` asserts how many run,
+   so adding a file means updating that number — deliberately, because a silently dropped
+   fixture would shrink every rate computed over the corpus with nothing failing.
 4. Run the parser test. It parses **every** fixture, so a malformed file anywhere
    fails immediately with a file and line number.
 5. Never invent a reason code. `REASON_CODES` in

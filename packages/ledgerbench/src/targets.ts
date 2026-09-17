@@ -263,9 +263,12 @@ export function evaluateTargets(input: TargetInput): TargetsReport {
       : {}),
     note:
       `${metric("retrieval", "gold_claims_declared") ?? 0} gold claim judgement(s) over ` +
-      `${metric("retrieval", "queries_with_relevance_judgement") ?? 0} query/queries. Recall is ` +
-      `micro-averaged over declared gold claims; strict per-query recall is published as ` +
-      `stages[retrieval].strict_recall_at_10 and is lower whenever a query has several gold claims.`,
+      `${metric("retrieval", "queries_with_relevance_judgement") ?? 0} query/queries, ` +
+      `${metric("retrieval", "queries_with_stale_judgement") ?? 0} of which declare a stale-current version. ` +
+      `Recall is micro-averaged over declared gold claims; strict per-query recall is published as ` +
+      `stages[retrieval].strict_recall_at_10 and is lower whenever a query has several gold claims. ` +
+      `The sample is small — the reading is "these frozen fixtures were answered", not "the read path ` +
+      `recalls 90% in general" — and the stage note states the count the rate is over.`,
   });
 
   // ---- At least 95% selective repair ----

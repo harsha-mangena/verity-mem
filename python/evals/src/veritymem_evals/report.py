@@ -161,9 +161,13 @@ def summarise(run: BenchmarkRun) -> dict[str, object]:
             "dataset_version": run.manifest.dataset_version,
             "fixture_version": run.manifest.fixture_version,
             "code_version": run.manifest.code_version,
+            "code_commit": run.manifest.code_commit,
+            "code_worktree_dirty": run.manifest.code_worktree_dirty,
             "policy_version": run.manifest.policy_version,
             "gate_backend": run.manifest.gate_backend,
+            "gate_backend_kind": run.manifest.gate_backend_kind,
             "gate_model_sha256": run.manifest.gate_model_sha256,
+            "gate_production_verifier_available": run.manifest.gate_production_verifier_available,
             "embedding_backend": run.manifest.embedding_backend,
             "embedding_model_id": run.manifest.embedding_model_id,
         },
@@ -271,6 +275,18 @@ def load_run(payload: dict[str, object]) -> BenchmarkRun:
         started_at=str(manifest_raw.get("started_at", "")),
         duration_ms=float(manifest_raw.get("duration_ms", 0)),
         gate=str(manifest_raw.get("gate", "on")),
+        gate_production_verifier_available=bool(
+            manifest_raw.get("gate_production_verifier_available", False)
+        ),
+        code_commit=(
+            str(manifest_raw["code_commit"]) if manifest_raw.get("code_commit") is not None else None
+        ),
+        code_worktree_dirty=(
+            bool(manifest_raw["code_worktree_dirty"])
+            if manifest_raw.get("code_worktree_dirty") is not None
+            else None
+        ),
+        gate_backend_kind=str(manifest_raw.get("gate_backend_kind", "lexical")),
     )
 
     stages: list[StageResult] = []

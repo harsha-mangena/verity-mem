@@ -56,6 +56,7 @@ function lexiconSelection(): GateBackendSelection {
     threshold: 0.6,
     contradictionThreshold: null,
     reason: "unit test",
+    production_verifier_available: false,
   };
 }
 const MALICIOUS = join(FIXTURES, "ledgerbench/08_malicious_procedure.jsonl");
@@ -234,24 +235,12 @@ describe("fixture parsing", () => {
     for (const trace of traces) {
       for (const line of trace.inputs) for (const expectation of line.expect) used.add(expectation.type);
     }
-    // Every type except the ones that can only appear in a conformance outcome.
-    const required: Expectation["type"][] = [
-      "expect_claim",
-      "expect_no_claim",
-      "expect_quarantined",
-      "expect_needs_review",
-      "expect_scope_narrowed",
-      "expect_conflict",
-      "expect_relation_persisted",
-      "expect_revoked",
-      "expect_superseded",
-      "expect_missing",
-      "expect_reason",
-      "expect_grant",
-      "expect_deleted",
-      "expect_residual_scan",
-      "expect_unverifiable_claim",
-    ];
+    // Every type the grammar declares, which is the point of the list: deriving it from
+    // `EXPECTATION_TYPES` rather than repeating a subset means a new expectation cannot be
+    // added without a fixture that exercises it. `expect_missing` and `expect_abstain` are
+    // read-path assertions and are covered by the abstention and deletion fixtures, which
+    // declare a query and then assert what the resulting packet says.
+    const required: Expectation["type"][] = [...EXPECTATION_TYPES];
     for (const type of required) {
       assert.ok(used.has(type), `no fixture exercises ${type}; the corpus would not notice it breaking`);
       assert.ok(EXPECTATION_TYPES.includes(type));
@@ -354,7 +343,16 @@ describe("running fixtures against the real database", () => {
     } finally {
       await suiteRunner.close();
     }
-    assert.equal(runs.length, 18, `expected 18 fixture files, ran ${runs.length}`);
+    // The count is asserted rather than derived from the directory listing, because a
+    // fixture that silently stops being discovered would otherwise shrink the corpus and
+    // every rate computed over it without anything failing. The message names what ran so
+    // an intentional addition is distinguishable from a lost file.
+    const expectedFixtureCount = 22;
+    assert.equal(
+      runs.length,
+      expectedFixtureCount,
+      `expected ${expectedFixtureCount} fixture files, ran ${runs.length}: ${runs.map((run) => run.fixture_id).sort().join(", ")}`,
+    );
 
     const failures = runs.flatMap((run) =>
       run.lines.flatMap((line) =>

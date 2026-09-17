@@ -184,10 +184,15 @@ async function main(): Promise<number> {
     required: options.gateRequired,
     modelsRoot: options.modelsRoot,
   });
-  if (!options.quiet) {
-    process.stdout.write(
-      `gate      ${gate.name} (${gate.kind})${gate.modelSha256 === null ? "" : ` model ${gate.modelSha256.slice(0, 12)}…`}\n` +
-        `          ${gate.reason}\n`,
+  process.stdout.write(
+    `gate      ${gate.name} (${gate.kind})${gate.modelSha256 === null ? "" : ` model ${gate.modelSha256.slice(0, 12)}…`}\n` +
+      `          ${gate.reason}\n`,
+  );
+  if (gate.kind === "lexical" && gate.production_verifier_available) {
+    process.stderr.write(
+      `\n  WARNING: the production entailment verifier is provisioned on this machine and this run did ` +
+        `not use it.\n  The published numbers describe the lexical stand-in. Re-run with ` +
+        `GATE_ENTAILMENT_BACKEND=onnx or --gate-backend onnx to score the production gate.\n\n`,
     );
   }
 

@@ -76,6 +76,13 @@ export interface RunManifest {
   readonly gate_backend: string;
   readonly gate_backend_kind: "onnx" | "lexical";
   readonly gate_backend_reason: string;
+  /**
+   * True when model assets are present on the machine that produced this artifact.
+   *
+   * Beside `gate_backend_kind` so a reader can see the difference between "there is no
+   * production verifier here" and "there is one and this run did not use it".
+   */
+  readonly gate_production_verifier_available: boolean;
   readonly gate_model_sha256: string | null;
   readonly gate_tokenizer_sha256: string | null;
   readonly gate_model_path: string | null;
@@ -97,6 +104,13 @@ export interface RunManifest {
 
 export interface EvaluationReport {
   readonly manifest: RunManifest;
+  /**
+   * A sentence about which verifier this run scored, or empty.
+   *
+   * Top-level rather than buried in the manifest because a reader who takes one number out
+   * of this artifact has to take the verifier with it.
+   */
+  readonly verifier_caveat: string;
   readonly stages: readonly StageResult[];
   readonly review_burden: ReviewBurden;
   readonly targets: TargetsReport;
@@ -189,6 +203,17 @@ export function buildReport(input: BuildReportInput): EvaluationReport {
   const conformanceFailed = input.conformance?.traces_failed ?? 0;
   const benchmarkPassed = targets.all_targets_pass && conformanceFailed === 0 && notEvaluated === 0;
 
+  // Stated before any number, because the difference between the two verifiers is the
+  // single largest determinant of what every other number means.
+  const verifierCaveat =
+    input.gate.kind === "lexical" && input.gate.production_verifier_available
+      ? "This run scored the LEXICAL STAND-IN while pinned production model assets are present on " +
+        "this machine. The numbers describe the stand-in, not the DeBERTa-v3 verifier. " +
+        "Re-run with GATE_ENTAILMENT_BACKEND=onnx (or --gate-backend onnx) to score the production gate."
+      : input.gate.kind === "lexical"
+        ? "This run scored the lexical stand-in; no production model assets were found on this machine."
+        : "";
+
   const manifest: RunManifest = {
     run_id: input.runId,
     suite: "ledgerbench",
@@ -211,6 +236,7 @@ export function buildReport(input: BuildReportInput): EvaluationReport {
     gate_backend: input.gate.name,
     gate_backend_kind: input.gate.kind,
     gate_backend_reason: input.gate.reason,
+    gate_production_verifier_available: input.gate.production_verifier_available,
     gate_model_sha256: input.gate.modelSha256,
     gate_tokenizer_sha256: input.gate.tokenizerSha256,
     gate_model_path: input.gate.modelPath,
@@ -227,6 +253,7 @@ export function buildReport(input: BuildReportInput): EvaluationReport {
 
   return {
     manifest,
+    verifier_caveat: verifierCaveat,
     stages,
     review_burden: burden,
     targets,
@@ -259,7 +286,8 @@ export function buildReport(input: BuildReportInput): EvaluationReport {
           `${input.gate.modelSha256 === null ? " (no model digest: the lexical stand-in)" : ` (model ${input.gate.modelSha256.slice(0, 12)}…)`}, ` +
           `and all ${conformancePassed} conformance traces met their required outcomes. ` +
           `${unimplementedStages.length} stage(s) remain unimplemented (${unimplementedStages.join(", ") || "none"}).`
-        : `Not passing: ${targets.checks.filter((check) => check.verdict === "fail").length} target(s) failed, ` +
+        : `${verifierCaveat} ` +
+          `Not passing: ${targets.checks.filter((check) => check.verdict === "fail").length} target(s) failed, ` +
           `${targets.checks.filter((check) => check.verdict === "not_measured").length} could not be measured, ` +
           `${conformanceFailed} conformance trace(s) failed a required check, and ${notEvaluated} ` +
           `expectation(s) were not evaluated.`,
