@@ -101,13 +101,41 @@ its scope does not.
 **Failure signal:** the tool executes; or the refusal differs between "your token cannot do
 this" and "this tool does not exist" in a way that maps the deployment.
 
-### 5. Every REST read surface — *not covered*
+### 5. Every REST read surface — *the agent-audience by-id routes covered; admin routes not*
 
-The corpus exercises the query path. The assessment must enumerate every route that returns
-tenant data and attempt it for a foreign scope: `GET /v1/events/{id}`, `GET /v1/claims/{id}`,
-`GET /v1/claims/{id}/explain`, `GET /v1/candidates/{id}`, `GET /v1/query-traces/{trace_id}`,
-and the admin routes on the agent audience. `/explain` deserves particular attention: it is
-designed to be the most complete read in the system, which makes it the most valuable target.
+`apps/server/src/rest-isolation.test.ts` now covers the five agent-audience by-id reads
+against a second real tenant: `GET /v1/events/{id}`, `GET /v1/claims/{id}`,
+`GET /v1/claims/{id}/explain`, `GET /v1/candidates/{id}` and `GET /v1/query-traces/{trace_id}`,
+plus `POST /v1/query` on both the own-tenant and foreign-tenant-body paths.
+
+Two properties are asserted per route rather than one, because only asserting "did not return
+the row" passes for a route that is broken for everybody:
+
+- a foreign credential gets a non-200, and the refusal echoes neither the identifier nor the
+  event content; and
+- the status *and* the error code are identical for an identifier that exists in another
+  tenant and one that exists nowhere, so the refusal is not an existence oracle. Both are
+  404 on this build, which is the right answer.
+
+Each case carries its positive control: the owner's own read must return 200, and the owner's
+own query must return the seeded claim, or the foreign assertions prove nothing. A separate
+case drops to a raw connection as the *application role* with no request context and asserts
+that `events` and `claims` read as zero rows, then binds a real context through
+`veritymem.set_request_context` and asserts the same connection sees its own rows. That
+distinguishes "the handler refused" from "the database never showed it the row", and it is
+the second that survives a handler forgetting to check.
+
+The mechanism is worth naming, because it was not obvious and cost time: a bodyless `POST`
+sent with `content-type: application/json` is rejected by Fastify with a 400 **before any
+handler runs**, and that 400 is shaped like an authorisation refusal. It is not one, and a
+test that read it as one would have reported a boundary it never crossed.
+
+**Still not covered here:** the admin routes on the agent audience (`/v1/grants`,
+`/v1/grants/{id}`, `/v1/forget`, `/v1/forget/{job_id}`, `/v1/replay`, `/v1/evaluations/runs`),
+and the deletion/revocation surface in §6. Both belong to the external assessment; the
+admin routes need the `admin` audience and their own cross-tenant attempt, and pretending
+otherwise because the agent-audience half is green would be exactly the substitution this
+document warns about.
 
 **Failure signal:** any 200 with foreign data; and separately, any response whose *status*
 distinguishes an existing-but-unreachable identifier from a nonexistent one.
