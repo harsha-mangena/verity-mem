@@ -77,6 +77,7 @@ export const REASON_CODES = {
   ACTION_DENIED_STALE_EVIDENCE: "action.denied_stale_evidence",
   ACTION_DENIED_SCOPE_UNREACHABLE: "action.denied_scope_unreachable",
   ACTION_DENIED_UNKNOWN_CLAIM: "action.denied_unknown_claim",
+  ACTION_DENIED_MISSING_PARTICIPATION: "action.denied_missing_participation",
   ACTION_DENIED_RISK_EXCEEDS_USE: "action.denied_risk_exceeds_use",
 
   // ---- retention ---------------------------------------------------------
@@ -164,7 +165,9 @@ export const REASON_CODE_HELP: Record<ReasonCode, string> = {
   [REASON_CODES.ACTION_DENIED_CLAIM_NOT_USABLE]: "At least one referenced claim does not carry an allowed use decision.",
   [REASON_CODES.ACTION_DENIED_STALE_EVIDENCE]: "At least one referenced claim's evidence is no longer current for the action's risk level.",
   [REASON_CODES.ACTION_DENIED_SCOPE_UNREACHABLE]: "The acting principal cannot reach at least one referenced claim.",
-  [REASON_CODES.ACTION_DENIED_UNKNOWN_CLAIM]: "At least one referenced claim id does not exist or is not visible.",
+  [REASON_CODES.ACTION_DENIED_UNKNOWN_CLAIM]: "At least one referenced claim id does not exist.",
+  [REASON_CODES.ACTION_DENIED_MISSING_PARTICIPATION]:
+    "The claim exists, but the acting principal holds no scope that reaches it. Distinct from an unknown claim so an operator can tell a configuration problem from a typo.",
   [REASON_CODES.ACTION_DENIED_RISK_EXCEEDS_USE]: "The action's risk level is higher than the use decision permits.",
   [REASON_CODES.RETENTION_MANIFEST_BUILT]: "The deletion manifest was built and every touched store recorded.",
   [REASON_CODES.RETENTION_RESIDUAL_MATCHES]: "A residual-match scan found surviving copies.",

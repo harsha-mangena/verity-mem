@@ -250,6 +250,39 @@ export async function denseChannel(
     };
   }
 
+  // Check the projection's model before querying it, and report a mismatch as a skipped
+  // channel with a reason rather than as an empty result.
+  //
+  // This is the difference between a configuration fault and a memory-quality complaint.
+  // The filter below is `e.model_id = $n`, so a reader whose backend reports a different id
+  // than the writer's matches zero rows — with no error, because from the database's point
+  // of view nothing is wrong: it is being asked for rows that do not exist. The caller sees
+  // an empty dense channel, which looks exactly like an authorization denial or like a
+  // corpus that has nothing relevant in it.
+  //
+  // `HashEmbeddingBackend` appends its dimension count to the default id, so this is one
+  // constructor argument away from happening silently. `packages/ledger`'s
+  // `projection_versions` table records the model that wrote the projection; if it
+  // disagrees with the configured reader, the channel says so and does not run.
+  const projection = await executor.query<{ model_version: string | null; ledger_watermark: number }>(
+    `SELECT model_version, ledger_watermark FROM projection_versions WHERE projection = 'dense'`,
+  );
+  const projectedModel = projection.rows[0]?.model_version ?? null;
+  if (projectedModel !== null && projectedModel !== embeddings.model_id) {
+    return {
+      channel: "dense",
+      hits: [],
+      ran: false,
+      note:
+        `the dense projection was written by embedding model '${projectedModel}' but this ` +
+        `reader is configured with '${embeddings.model_id}'. The channel did not run, because ` +
+        `querying it would return zero rows and look like an authorization denial. Rebuild the ` +
+        `projection with the configured model (POST /v1/replay), or configure the reader with ` +
+        `the model that wrote it.`,
+      duration_ms: round(performance.now() - started),
+    };
+  }
+
   const { where, params } = channelWhere(query);
   params.push(toVectorLiteral(vector));
   const vectorIndex = params.length;

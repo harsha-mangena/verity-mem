@@ -223,7 +223,13 @@ describe("action gate", () => {
       { principal: "user:mallory" },
     );
     assert.equal(verdict.allowed, false, "a principal with no membership must not be able to act on this claim");
-    assert.ok(verdict.reason_codes.includes(REASON_CODES.ACTION_DENIED_UNKNOWN_CLAIM));
+    // The claim exists; mallory simply does not participate in its scope. That is a
+    // different fault from a claim id that was never real, with a different remedy, so it
+    // carries a different code — see the distinguishability test in model-mismatch.test.ts.
+    assert.ok(
+      verdict.reason_codes.includes(REASON_CODES.ACTION_DENIED_MISSING_PARTICIPATION),
+      `expected a participation refusal, saw ${verdict.reason_codes.join(", ")}`,
+    );
   });
 
   it("denies when the purpose does not match the admission purpose", async () => {

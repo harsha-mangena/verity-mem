@@ -116,15 +116,37 @@ export async function evaluateAction(
       for (const claimId of request.claim_ids) {
         const claim = claimMap.get(claimId);
         if (!claim) {
-          // Not visible and not existing are the same answer here, deliberately:
-          // distinguishing them would turn the action gate into an existence
-          // oracle for claims the caller cannot reach.
-          blocking.push(REASON_CODES.ACTION_DENIED_UNKNOWN_CLAIM);
+          // Two different faults, and they need different answers. A claim that does not
+          // exist is a caller's typo or a stale id; a claim that exists but sits outside
+          // every scope the principal holds is an authorization or onboarding problem, and
+          // its remedy is a grant rather than a correction.
+          //
+          // Resolving which one it is requires reading the claim outside the caller's
+          // reach, which is deliberately *not* done for reads — there, the ambiguity is
+          // load-bearing, because distinguishing them would make the query API an
+          // existence oracle. At the action gate the caller is authenticated, is about to
+          // take a side effect, and cannot debug a refusal that will not say whether the
+          // claim was ever real. The trade is made in favour of the operator, and it
+          // discloses only whether an id the caller already possesses exists.
+          const exists = await dependencies.db.withSystemContext(
+            { tenant: tenantId, actor: "action:probe" },
+            async (probe) => {
+              const row = await probe.query<{ n: number }>(
+                `SELECT count(*)::int AS n FROM claims WHERE claim_id = $1::uuid`,
+                [stripPrefix(claimId)],
+              );
+              return (row.rows[0]?.n ?? 0) > 0;
+            },
+          );
+          const code = exists
+            ? REASON_CODES.ACTION_DENIED_MISSING_PARTICIPATION
+            : REASON_CODES.ACTION_DENIED_UNKNOWN_CLAIM;
+          blocking.push(code);
           perClaim.push({
             claim_id: claimId,
             found: false,
             use: null,
-            reason_codes: [REASON_CODES.ACTION_DENIED_UNKNOWN_CLAIM],
+            reason_codes: [code],
             age_days: null,
             blocking: true,
           });

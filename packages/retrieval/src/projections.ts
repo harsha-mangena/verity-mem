@@ -84,15 +84,20 @@ export async function projectClaim(
 
   const entities = await projectEntities(executor, claim);
 
+  // Keyed by (projection, tenant), so one tenant's rebuild cannot overwrite another's
+  // recorded model. The earlier table was keyed on `projection` alone, which made it a
+  // single global row: asking which model wrote *this* tenant's projection answered with
+  // whichever tenant rebuilt most recently, and the health check for a model mismatch would
+  // report `ok` on the strength of another deployment's state.
   await executor.query(
-    `INSERT INTO projection_versions (projection, code_version, model_version, ledger_watermark, updated_at)
-     VALUES ($1, $2, $3, COALESCE((SELECT COALESCE(max(seq), 0) FROM events WHERE tenant_id = $4::uuid), 0), now())
-     ON CONFLICT (projection) DO UPDATE
+    `INSERT INTO projection_versions (projection, tenant_id, code_version, model_version, ledger_watermark, updated_at)
+     VALUES ($1, $2::uuid, $3, $4, COALESCE((SELECT COALESCE(max(seq), 0) FROM events WHERE tenant_id = $2::uuid), 0), now())
+     ON CONFLICT (projection, COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid)) DO UPDATE
        SET code_version = EXCLUDED.code_version,
            model_version = EXCLUDED.model_version,
            ledger_watermark = GREATEST(projection_versions.ledger_watermark, EXCLUDED.ledger_watermark),
            updated_at = now()`,
-    ["dense", PROJECTION_CODE_VERSION, dependencies.embeddings.model_id, claim.tenant_id],
+    ["dense", claim.tenant_id, PROJECTION_CODE_VERSION, dependencies.embeddings.model_id],
   );
 
   return { projected: true, reason: "projected", entities };

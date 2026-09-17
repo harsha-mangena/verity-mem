@@ -14,7 +14,13 @@
  *     mechanically checkable assertion and a judgement call is the difference
  *     between evidence and opinion, and a benchmark that blurs them is marketing.
  */
-import type { ClaimKind, ClaimStatus, EventAppendRequest, RelationKind } from "@veritymem/contracts";
+import type {
+  ActionRisk,
+  ClaimKind,
+  ClaimStatus,
+  EventAppendRequest,
+  RelationKind,
+} from "@veritymem/contracts";
 
 /** Bumped when the line grammar changes in a way older readers cannot parse. */
 export const SUPPORTED_FIXTURE_VERSIONS: readonly string[] = ["1.0.0"];
@@ -165,6 +171,138 @@ export interface ExpectMissing extends ExpectationBase {
   readonly contains?: string;
 }
 
+/**
+ * The packet must report that it has no usable answer.
+ *
+ * This is the abstention assertion, and it is separate from `expect_missing`
+ * because the two ask different questions. `expect_missing` asks whether the packet
+ * accounts for what it did not find; `expect_abstain` asks whether the packet
+ * declined to answer, which is a property of the decision and the claim set rather
+ * than of the gap strings. A system that returns a confident answer *and* a gap
+ * string has told the truth about a detail and still answered a question it could
+ * not support, and only the second assertion catches that.
+ */
+export interface ExpectAbstain extends ExpectationBase {
+  readonly type: "expect_abstain";
+  /** Substring the packet's `missing` entry must contain, case-insensitive. */
+  readonly contains?: string;
+  /** Which packets count as abstaining. Defaults to `no_usable_claim`. */
+  readonly signal?: AbstentionSignal;
+}
+
+/**
+ * What counts as an abstention.
+ *
+ * Two signals are recognised, and the choice is the fixture's rather than the
+ * runner's, because "I do not know" and "I know, and it is not safe to act on" are
+ * different answers that a caller must be able to tell apart:
+ *
+ *   * `no_usable_claim` — the packet returned no claim the caller may act on. The
+ *     evidence for this is the packet's own per-claim `use` decision, not the
+ *     runner's opinion: zero claims, or every returned claim at `deny`/`verify`.
+ *     This is the default because it is the property that matters to a caller.
+ *   * `clarify` — the packet-level decision is `clarify`, which is stricter: it
+ *     excludes a packet that returned claims at `verify`/`deny` so the caller could
+ *     see why it was refused.
+ *
+ * The metric that consumes this reports both counts, so a fixture that declares one
+ * signal never hides the other's rate.
+ */
+export const ABSTENTION_SIGNALS = ["no_usable_claim", "clarify"] as const;
+export type AbstentionSignal = (typeof ABSTENTION_SIGNALS)[number];
+
+/**
+ * A claim the fixture declares relevant, stale or forbidden for a query.
+ *
+ * Carrying the reason is not decoration. Recall@10 is a number about a judgement,
+ * and a judgement with no recorded basis is indistinguishable from a number invented
+ * to look good; a reader has to be able to disagree with the call without
+ * reverse-engineering the fixture author's intent.
+ */
+export interface FixtureRelevance {
+  readonly subject?: string;
+  readonly predicate?: string;
+  readonly object?: unknown;
+  readonly kind?: ClaimKind;
+  readonly status?: ClaimStatus;
+  /** Why this claim is relevant (or stale, or forbidden) to the query. */
+  readonly reason: string;
+}
+
+/**
+ * A query the fixture declares, executed through the real `compose()`.
+ *
+ * Queries live in fixtures rather than in the runner for the same reason events do:
+ * recall is measured against a judgement about *this* query, and a query the runner
+ * wrote is a query whose relevance judgement the runner also wrote. Two fixtures that
+ * need the same query declare it twice, which is cheap; a runner that invents a query
+ * produces a number nobody can reproduce from the fixtures.
+ *
+ * A query with no `relevance` is still executed and still contributes its stale,
+ * forbidden and authorization counts — it just cannot contribute to recall, and the
+ * stage reports how many queries had a relevance judgement rather than silently
+ * averaging over the ones that did.
+ */
+export interface FixtureQuery {
+  /** The query text, verbatim. */
+  readonly query: string;
+  /** The principal the query is issued as. Its reach comes from `create_grant` lines. */
+  readonly principal: string;
+  readonly purpose: string;
+  /**
+   * The declared tenant label, or omitted for the fixture's own.
+   *
+   * The value has to agree with the tenant the fixture's events were written under,
+   * or the query authorizes against scopes that do not hold the claims; the runner
+   * reports that disagreement as an error rather than as a zero.
+   */
+  readonly tenant?: string;
+  readonly project?: string;
+  readonly user?: string;
+  readonly agent?: string;
+  readonly session?: string;
+  /** Retrieval budget. Defaults to the contract's own default of 12. */
+  readonly limit?: number;
+  /** Claims a correct read path must return for this query. Recall@10's denominator. */
+  readonly relevance?: readonly FixtureRelevance[];
+  /** Claims that must not be returned: revoked, superseded or expired versions. */
+  readonly stale?: readonly FixtureRelevance[];
+  /** Claims the caller may not reach. Any hit here is an authorization failure. */
+  readonly absent?: readonly FixtureRelevance[];
+  /**
+   * Whether the memory holds an answer this query could be answered from.
+   *
+   * Declared, not inferred: a query with no matching claim is not the same thing as a
+   * query the memory cannot answer, and treating "returned nothing" as
+   * "correctly abstained" would score an empty read path as perfectly calibrated.
+   */
+  readonly has_answer?: boolean;
+}
+
+/**
+ * A gate verdict the fixture requires for one action.
+ *
+ * Mirrors `ActionGateRequest` plus the expected outcome. The claims are named by
+ * proposition rather than by id because a fixture cannot know an id it did not
+ * write; the runner resolves them and fails the expectation if a named claim does not
+ * exist, rather than passing an action with an empty claim set.
+ */
+export interface ExpectActionGate extends ExpectationBase {
+  readonly type: "expect_action_gate";
+  /** The action's name, as the caller would describe it. */
+  readonly action: string;
+  readonly action_risk: ActionRisk;
+  readonly purpose: string;
+  /** Claims the action depends on. At least one. */
+  readonly claims: readonly FixtureRelevance[];
+  /** The verdict a correct gate returns. */
+  readonly verdict: "allow" | "block";
+  /** Reason codes that must appear in the verdict. */
+  readonly must_include?: readonly string[];
+  /** Reason codes that must not appear. */
+  readonly must_exclude?: readonly string[];
+}
+
 export interface ExpectReason extends ExpectationBase {
   readonly type: "expect_reason";
   readonly must_include?: readonly string[];
@@ -227,6 +365,8 @@ export type Expectation =
   | ExpectRevoked
   | ExpectSuperseded
   | ExpectMissing
+  | ExpectAbstain
+  | ExpectActionGate
   | ExpectReason
   | ExpectGrant
   | ExpectDeleted
@@ -244,6 +384,8 @@ export const EXPECTATION_TYPES: readonly Expectation["type"][] = [
   "expect_revoked",
   "expect_superseded",
   "expect_missing",
+  "expect_abstain",
+  "expect_action_gate",
   "expect_reason",
   "expect_grant",
   "expect_deleted",
@@ -254,14 +396,13 @@ export const EXPECTATION_TYPES: readonly Expectation["type"][] = [
 /**
  * Expectations the current build cannot evaluate at all.
  *
- * Listed explicitly so `parse.ts` accepts them and `run.ts` refuses to pass them:
- * a parsed expectation that silently reports success is exactly the failure mode
- * this benchmark exists to prevent. Each entry names the stage that must exist
- * before the expectation can become a real assertion.
+ * Empty, and kept as an explicit empty map rather than deleted: the parser and the
+ * runner both consult it, and the moment a future expectation type cannot be
+ * evaluated it belongs here rather than in a `not_evaluated` branch somebody has to
+ * remember to write. `expect_missing` was the only member — the packet composer it
+ * was blocked on now exists.
  */
-export const UNIMPLEMENTED_EXPECTATIONS: Readonly<Record<string, string>> = {
-  expect_missing: "retrieval.packet — no MemoryPacket composer exists in v0.1, so 'missing' cannot be produced",
-};
+export const UNIMPLEMENTED_EXPECTATIONS: Readonly<Record<string, string>> = {};
 
 // ---------------------------------------------------------------------------
 // Candidate proposals
@@ -328,6 +469,14 @@ export interface FixtureAppendEvent {
   readonly event: EventAppendRequest;
   readonly candidate?: FixtureCandidate;
   readonly expect: readonly Expectation[];
+  /**
+   * Queries to issue after this line's write has been evaluated.
+   *
+   * On the line rather than in a separate section because a query is about the state
+   * this line produced, and a fixture whose reads were declared somewhere else would
+   * have to say which write they follow — which is the same information, written twice.
+   */
+  readonly query?: readonly FixtureQuery[];
   readonly note?: string;
 }
 
@@ -361,6 +510,8 @@ export interface FixtureResolveClaim {
   readonly reason: string;
   readonly reason_codes: readonly string[];
   readonly expect: readonly Expectation[];
+  /** See `FixtureAppendEvent.query`: a revocation is the state a stale-leak test reads after. */
+  readonly query?: readonly FixtureQuery[];
   readonly note?: string;
 }
 

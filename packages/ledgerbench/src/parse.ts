@@ -23,7 +23,9 @@ import { FormatRegistry } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import {
   AUTHORITY_CLASSES,
+  type ActionRisk,
   type EventAppendRequest,
+  ACTION_RISKS,
   CLAIM_KINDS,
   CLAIM_STATUSES,
   DECISION_OUTCOMES,
@@ -35,6 +37,7 @@ import {
 } from "@veritymem/contracts";
 import { FixtureParseError, type FixtureErrorCode } from "./errors.ts";
 import {
+  ABSTENTION_SIGNALS,
   ACTIONS,
   ERASE_MODES,
   EXPECTATION_TYPES,
@@ -53,9 +56,14 @@ import {
   type FixtureFile,
   type FixtureHeader,
   type FixtureLoadReport,
+  type FixtureQuery,
+  type FixtureRelevance,
   type FixtureSpan,
   type Suite,
 } from "./types.ts";
+
+/** The two verdicts an action-gate assertion may require. */
+const ACTION_VERDICTS = ["allow", "block"] as const;
 
 // ---------------------------------------------------------------------------
 // Primitive readers. Each names the field it wanted, so the message is actionable.
@@ -295,6 +303,146 @@ function parseClaimMatch(file: string, line: number, source: Json): ClaimMatch {
   };
 }
 
+/**
+ * Read one declared relevance judgement.
+ *
+ * `reason` is required rather than optional because every number this feeds —
+ * recall@10, stale leakage, the unauthorized count — is a claim about a human
+ * judgement, and a judgement whose basis is not recorded cannot be reviewed. The
+ * same reader serves `relevance`, `stale` and `absent`: they differ in what the
+ * runner does with the match, not in how a claim is identified.
+ */
+function parseRelevance(file: string, line: number, value: unknown, what: string): FixtureRelevance {
+  const source = asObject(file, line, value, what);
+  const match = parseClaimMatch(file, line, source);
+  const reason = optionalString(file, line, source, "reason");
+  if (reason === undefined || reason.trim().length === 0) {
+    fail(
+      file,
+      line,
+      "missing_field",
+      `${what}.reason is required: a relevance judgement with no stated basis cannot be reviewed, ` +
+        `and recall computed from it would be a number nobody can check`,
+    );
+  }
+  return { ...match, reason };
+}
+
+function parseRelevanceList(
+  file: string,
+  line: number,
+  source: Json,
+  key: string,
+): readonly FixtureRelevance[] | undefined {
+  const raw = source[key];
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) {
+    fail(file, line, "wrong_type", `${key} must be an array of claim matches`);
+  }
+  if (raw.length === 0) {
+    fail(
+      file,
+      line,
+      "empty_value",
+      `${key} is present but empty; omit it instead, so "no judgement declared" and "nothing is ` +
+        `relevant" cannot be confused`,
+    );
+  }
+  return raw.map((entry, position) => parseRelevance(file, line, entry, `${key}[${position}]`));
+}
+
+/**
+ * Read one declared query.
+ *
+ * The scope dimensions are read flat (`project`, `user`, …) rather than nested under
+ * a `scope` key, matching how `create_grant.resource_pattern` is written: both
+ * describe where a principal may reach, and two spellings of the same selector is how
+ * a fixture ends up authorizing one scope and querying another.
+ */
+function parseQuery(file: string, line: number, value: unknown, index: number): FixtureQuery {
+  const source = asObject(file, line, value, `query[${index}]`);
+  const limit = optionalNumber(file, line, source, "limit");
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 100)) {
+    fail(file, line, "wrong_type", `query[${index}].limit must be an integer between 1 and 100`);
+  }
+  const hasAnswer = optionalBoolean(file, line, source, "has_answer");
+  const relevance = parseRelevanceList(file, line, source, "relevance");
+  const stale = parseRelevanceList(file, line, source, "stale");
+  const absent = parseRelevanceList(file, line, source, "absent");
+  return {
+    query: requiredString(file, line, source, "query"),
+    principal: requiredString(file, line, source, "principal"),
+    purpose: requiredString(file, line, source, "purpose"),
+    ...(optionalString(file, line, source, "tenant") !== undefined
+      ? { tenant: optionalString(file, line, source, "tenant") as string }
+      : {}),
+    ...(optionalString(file, line, source, "project") !== undefined
+      ? { project: optionalString(file, line, source, "project") as string }
+      : {}),
+    ...(optionalString(file, line, source, "user") !== undefined
+      ? { user: optionalString(file, line, source, "user") as string }
+      : {}),
+    ...(optionalString(file, line, source, "agent") !== undefined
+      ? { agent: optionalString(file, line, source, "agent") as string }
+      : {}),
+    ...(optionalString(file, line, source, "session") !== undefined
+      ? { session: optionalString(file, line, source, "session") as string }
+      : {}),
+    ...(limit !== undefined ? { limit } : {}),
+    ...(relevance !== undefined ? { relevance } : {}),
+    ...(stale !== undefined ? { stale } : {}),
+    ...(absent !== undefined ? { absent } : {}),
+    ...(hasAnswer !== undefined ? { has_answer: hasAnswer } : {}),
+  };
+}
+
+function parseQueryList(file: string, line: number, source: Json): readonly FixtureQuery[] | undefined {
+  const raw = source["query"];
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) {
+    fail(file, line, "wrong_type", "`query` must be an array of query declarations");
+  }
+  if (raw.length === 0) {
+    fail(file, line, "empty_value", "`query` is present but empty; omit the field instead");
+  }
+  return raw.map((entry, index) => parseQuery(file, line, entry, index));
+}
+
+/**
+ * Read an action-gate assertion.
+ *
+ * The claim list is required and non-empty. An action gate evaluated over no claims
+ * allows everything, so a fixture that forgot the list would assert "the gate says
+ * yes" and pass against a gate that was never consulted.
+ */
+function parseActionGate(file: string, line: number, source: Json): {
+  action: string;
+  action_risk: ActionRisk;
+  purpose: string;
+  claims: readonly FixtureRelevance[];
+  verdict: "allow" | "block";
+  must_include?: readonly string[];
+  must_exclude?: readonly string[];
+} {
+  const claims = parseRelevanceList(file, line, source, "claims");
+  if (claims === undefined) {
+    fail(file, line, "missing_field", "expect_action_gate needs a non-empty `claims` list");
+  }
+  const mustInclude = optionalStringArray(file, line, source, "must_include");
+  const mustExclude = optionalStringArray(file, line, source, "must_exclude");
+  if (mustInclude) checkReasonCodes(file, line, mustInclude, "expect_action_gate.must_include");
+  if (mustExclude) checkReasonCodes(file, line, mustExclude, "expect_action_gate.must_exclude");
+  return {
+    action: requiredString(file, line, source, "action"),
+    action_risk: oneOf(file, line, requiredString(file, line, source, "action_risk"), ACTION_RISKS, "`action_risk`"),
+    purpose: requiredString(file, line, source, "purpose"),
+    claims,
+    verdict: oneOf(file, line, requiredString(file, line, source, "verdict"), ACTION_VERDICTS, "`verdict`"),
+    ...(mustInclude !== undefined ? { must_include: mustInclude } : {}),
+    ...(mustExclude !== undefined ? { must_exclude: mustExclude } : {}),
+  };
+}
+
 export function parseExpectation(file: string, line: number, value: unknown, index: number): Expectation {
   const source = asObject(file, line, value, `expect[${index}]`);
   const type = requiredString(file, line, source, "type");
@@ -318,7 +466,12 @@ export function parseExpectation(file: string, line: number, value: unknown, ind
     type !== "expect_conflict" &&
     type !== "expect_relation_persisted" &&
     type !== "expect_deleted" &&
-    type !== "expect_grant";
+    type !== "expect_grant" &&
+    // An action gate's `claims` is a nested list of matches, not the expectation's own
+    // fields, and an abstention has no claim match at all: reading them through the
+    // shared reader would fail the fixture on a grammar collision rather than a defect.
+    type !== "expect_action_gate" &&
+    type !== "expect_abstain";
   const match = usesClaimMatch ? parseClaimMatch(file, line, source) : {};
 
   // `gap` declares a known unmet requirement. The reason is mandatory: a gap with
@@ -443,6 +596,20 @@ export function parseExpectation(file: string, line: number, value: unknown, ind
           ? { contains: optionalString(file, line, source, "contains") as string }
           : {}),
       };
+    case "expect_abstain": {
+      const contains = optionalString(file, line, source, "contains");
+      const signal = optionalString(file, line, source, "signal");
+      return {
+        ...gapFields,
+        type: "expect_abstain",
+        ...(contains !== undefined ? { contains } : {}),
+        ...(signal !== undefined
+          ? { signal: oneOf(file, line, signal, ABSTENTION_SIGNALS, "`signal`") }
+          : {}),
+      };
+    }
+    case "expect_action_gate":
+      return { ...gapFields, type: "expect_action_gate", ...parseActionGate(file, line, source) };
     case "expect_reason": {
       const mustInclude = optionalStringArray(file, line, source, "must_include");
       const mustExclude = optionalStringArray(file, line, source, "must_exclude");
@@ -687,6 +854,8 @@ export function parseBodyLine(file: string, line: number, value: unknown): Fixtu
   const lineId = parseLineId(file, line, source);
   const expect = parseExpectations(file, line, source);
   const note = optionalString(file, line, source, "note");
+  const query = parseQueryList(file, line, source);
+  const queryFields = query !== undefined ? { query } : {};
 
   switch (action) {
     case "append_event": {
@@ -713,6 +882,7 @@ export function parseBodyLine(file: string, line: number, value: unknown): Fixtu
         event,
         ...(candidateRaw !== undefined ? { candidate: parseCandidate(file, line, candidateRaw) } : {}),
         expect,
+        ...queryFields,
         ...(note !== undefined ? { note } : {}),
       };
     }
@@ -764,6 +934,7 @@ export function parseBodyLine(file: string, line: number, value: unknown): Fixtu
         reason: requiredString(file, line, source, "reason"),
         reason_codes: codes,
         expect,
+        ...queryFields,
         ...(note !== undefined ? { note } : {}),
       };
     }
@@ -899,7 +1070,24 @@ export function parseFixtureText(path: string, text: string): FixtureFile {
   // Cross-references: an expectation that names another line must name a line that
   // exists, otherwise a typo silently turns a chained assertion into a no-op.
   for (const entry of body) {
+    const queries = entry.kind === "append_event" || entry.kind === "resolve_claim" ? entry.query : undefined;
     for (const expectation of entry.expect) {
+      // A read-path expectation is only meaningful where a query was declared. The
+      // runner evaluates it against the packet that line produced, so an
+      // `expect_missing` on a line with no query has no packet to inspect; refusing it
+      // at parse time turns "this assertion never ran" into a fixture error rather than
+      // a silent pass.
+      if (expectation.type === "expect_missing" || expectation.type === "expect_abstain") {
+        if (queries === undefined || queries.length === 0) {
+          fail(
+            path,
+            entry.line,
+            "missing_field",
+            `${expectation.type} needs a \`query\` on the same line: the assertion is about the packet ` +
+              `that query produced, and with no query there is nothing to assert about`,
+          );
+        }
+      }
       if (expectation.type === "expect_reason" && expectation.line_id !== undefined) {
         if (!seenLineIds.has(expectation.line_id)) {
           fail(

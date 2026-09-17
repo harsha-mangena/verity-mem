@@ -7,3 +7,4 @@ export * from "./retention.ts";
 export * from "./action-gate.ts";
 export * from "./replay.ts";
 export * from "./explain.ts";
+export * from "./health.ts";
