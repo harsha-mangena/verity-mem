@@ -1185,6 +1185,22 @@ export interface ReviewBurden {
    * reported separately, so reducing review volume by weakening the gate is visible.
    */
   readonly by_class: readonly ClassBurden[];
+  /**
+   * Which reason codes are actually driving review, across every reviewed decision.
+   *
+   * This is the calibration input. A review rate on its own says the gate is routing
+   * writes to a human; it does not say *which control* is doing the routing, so it cannot
+   * distinguish a threshold that is too tight from a control that is working. A decision
+   * carries several codes, so the counts sum to more than `needing_review` and each share
+   * is over reviewed decisions, not over codes.
+   */
+  readonly by_reason_code: readonly {
+    readonly reason_code: string;
+    readonly reviews: number;
+    /** How many of those reviews the code appeared on a decision of each class. */
+    readonly by_class: Readonly<Record<WriteClass, number>>;
+    readonly share_of_reviews: number;
+  }[];
   readonly by_fixture: readonly {
     readonly fixture_id: string;
     readonly writes: number;
@@ -1317,6 +1333,34 @@ export function reviewBurden(runs: readonly FixtureRunResult[]): ReviewBurden {
           writeClass === "ordinary" ? classBurden <= GATE_THRESHOLDS.reviewBurdenCeiling : null,
       };
     }),
+    by_reason_code: (() => {
+      const codes = new Map<string, { reviews: number; by_class: Record<WriteClass, number> }>();
+      for (const run of runs) {
+        for (const decision of run.decisions) {
+          if (!decision.requires_review) continue;
+          const writeClass = classifyDecision(decision);
+          // A decision can repeat a code only by a bug; count each code once per decision
+          // so the shares cannot exceed 100% through double counting.
+          for (const code of new Set(decision.reason_codes)) {
+            const entry = codes.get(code) ?? {
+              reviews: 0,
+              by_class: { ordinary: 0, contradicting: 0, high_sensitivity: 0, adversarial: 0 },
+            };
+            entry.reviews += 1;
+            entry.by_class[writeClass] += 1;
+            codes.set(code, entry);
+          }
+        }
+      }
+      return [...codes.entries()]
+        .sort((a, b) => b[1].reviews - a[1].reviews || a[0].localeCompare(b[0]))
+        .map(([reasonCode, entry]) => ({
+          reason_code: reasonCode,
+          reviews: entry.reviews,
+          by_class: entry.by_class,
+          share_of_reviews: needing === 0 ? 0 : entry.reviews / needing,
+        }));
+    })(),
     by_fixture: runs.map((run) => {
       const runWrites = run.decisions.length;
       const runReviews = run.decisions.filter((decision) => decision.requires_review).length;

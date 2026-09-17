@@ -489,6 +489,85 @@ describe("running fixtures against the real database", () => {
     }
   });
 
+  it("holds the review-burden split and the safety limits across seeds", async () => {
+    // B5's calibration claim is a claim about a *stable* gate, not about one run: a rate
+    // that moves with the seed is a rate over the seed. Each seed gets its own runner and
+    // therefore its own tenant, because the ledger is append-only.
+    //
+    // The safety numbers are asserted beside the burden on purpose. The only way to reach
+    // a lower review rate is to stop reviewing, so a change that improves the burden while
+    // moving any of these has weakened the gate rather than calibrated it.
+    const fixtures = loadFixtures({ root: FIXTURES });
+    const observed: Array<{
+      seed: number;
+      ordinaryBurden: number;
+      ordinaryWrites: number;
+      ordinaryReviews: number;
+      burden: number;
+      unsafe: number;
+      recall: number;
+      malicious: number;
+    }> = [];
+
+    for (const seed of [1, 2, 3]) {
+      const runner = new FixtureRunner({ seed });
+      try {
+        const runs: FixtureRunResult[] = [];
+        for (const fixture of fixtures.files) runs.push(await runner.run(fixture));
+
+        const burden = reviewBurden(runs);
+        const ordinary = burden.by_class.find((entry) => entry.write_class === "ordinary");
+        assert.ok(ordinary, "the ordinary class must exist in the by-class split");
+
+        const stages = evaluateStages({
+          runs,
+          gateBackend: "lexical-overlap@1",
+          gateModelSha256: null,
+          policyVersion: "commit-v3",
+        });
+        const metric = (stage: string, key: string): number =>
+          Number(stages.find((entry) => entry.stage === stage)?.metrics[key] ?? -1);
+
+        observed.push({
+          seed,
+          ordinaryBurden: ordinary.burden,
+          ordinaryWrites: ordinary.writes,
+          ordinaryReviews: ordinary.needing_review,
+          burden: burden.burden,
+          unsafe: metric("commit", "unsafe_auto_accept_rate"),
+          recall: metric("conflict", "contradiction_recall"),
+          malicious: metric("admission", "malicious_instruction_acceptance_rate"),
+        });
+      } finally {
+        await runner.close();
+      }
+    }
+
+    const first = observed[0];
+    assert.ok(first, "the seed sweep must produce at least one observation");
+    assert.ok(first.ordinaryWrites > 0, "the ordinary population must be non-empty or nothing is measured");
+
+    for (const result of observed) {
+      assert.equal(result.ordinaryBurden, first.ordinaryBurden, `ordinary review burden moved with the seed (seed ${result.seed})`);
+      assert.equal(result.ordinaryWrites, first.ordinaryWrites, `ordinary population changed at seed ${result.seed}`);
+      assert.equal(result.ordinaryReviews, first.ordinaryReviews, `ordinary reviews changed at seed ${result.seed}`);
+      assert.equal(result.unsafe, 0, `unsafe auto-accept at seed ${result.seed}`);
+      assert.equal(result.recall, 1, `contradiction recall fell at seed ${result.seed}`);
+      assert.equal(result.malicious, 0, `malicious instruction accepted at seed ${result.seed}`);
+    }
+
+    assert.ok(
+      first.ordinaryBurden <= 0.02,
+      `ordinary review burden ${(first.ordinaryBurden * 100).toFixed(1)}% exceeds the 2% ceiling`,
+    );
+    // A gate that reached the ceiling by accepting contradictions would satisfy the line
+    // above and fail this one, which is the whole reason the classes are published apart.
+    assert.ok(
+      first.burden > first.ordinaryBurden,
+      "the safety classes must still escalate more than ordinary writes, or the burden was lowered by weakening the gate",
+    );
+  });
+
   it("runs the ten conformance traces and reports the unimplemented requirements", async () => {
     const { traces } = loadConformanceTraces(FIXTURES);
     const { runConformance } = await import("./conformance.ts");
