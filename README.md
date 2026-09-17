@@ -125,7 +125,11 @@ extra steps.
   will be falsified by the first adversarial user, and deservedly.
 
 `docs/threat-model.md` lists what is still open, including several things that are
-deliberately not solved in v0.1. `SECURITY.md` covers disclosure.
+deliberately not solved in v0.1. `docs/limitations.md` collects every known gap in one
+place, including the ones that make this a **preview rather than a finished v0.1**: the
+production entailment verifier is wired correctly but not yet calibrated against the
+corpus, the p95 target has no reference machine, and the acceptance workflow has never
+run on GitHub. `SECURITY.md` covers disclosure.
 
 ## What is verified, and how
 
