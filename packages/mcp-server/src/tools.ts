@@ -587,7 +587,7 @@ async function handlePropose(
     stream_id: `proposal:${args.event_id}`,
     origin: "model_inference",
     actor_id: context.session.subject,
-    scope: scopeOf(context),
+    scope: { ...scopeOf(context.session), purpose: [...context.session.purposes] },
     occurred_at: context.now().toISOString(),
     content: JSON.stringify(proposed),
     media_type: "application/vnd.veritymem.proposal+json",

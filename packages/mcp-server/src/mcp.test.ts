@@ -15,16 +15,19 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type {
+  CandidateReadResponse,
   ClaimExplanation,
-  Decision,
   DecisionRequest,
+  DecisionResponse,
   EventAppendResponse,
+  FeedbackRequest,
+  FeedbackResponse,
   ForgetRequest,
-  Grant,
+  ForgetResponse,
   GrantCreateRequest,
+  GrantCreateResponse,
   MemoryPacket,
   PacketClaim,
-  RetentionJob,
   ToolProfile,
 } from "@veritymem/contracts";
 import type { AppendEventRequest } from "./tools.ts";
@@ -38,7 +41,9 @@ import {
   toolsForProfile,
   type AuthorizedSession,
   type CapabilityToken,
+  type ToolName,
 } from "./auth.ts";
+import { PROFILE_TOOLS as SERVER_PROFILE_TOOLS, TOOL_PROFILES, type ToolName as ContractToolName } from "@veritymem/contracts";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { findRenderViolations, renderPacketForModel } from "./render.ts";
@@ -78,27 +83,27 @@ class StubBackend implements ToolBackend {
     throw new Error("appendEvent must be stubbed per test");
   }
 
-  async getCandidate(candidateId: string): Promise<unknown> {
+  async getCandidate(candidateId: string): Promise<CandidateReadResponse> {
     this.calls.push({ method: "getCandidate", args: candidateId });
     throw new Error("getCandidate must be stubbed per test");
   }
 
-  async decideCandidate(candidateId: string, request: DecisionRequest): Promise<Decision> {
+  async decideCandidate(candidateId: string, request: DecisionRequest): Promise<DecisionResponse> {
     this.calls.push({ method: "decideCandidate", args: { candidateId, request } });
     throw new Error("decideCandidate must be stubbed per test");
   }
 
-  async feedback(request: { trace_id: string; outcome: "correct" | "incorrect" | "incomplete" | "harmful"; correction?: string }): Promise<unknown> {
+  async feedback(request: FeedbackRequest): Promise<FeedbackResponse> {
     this.calls.push({ method: "feedback", args: request });
     throw new Error("feedback must be stubbed per test");
   }
 
-  async createGrant(request: GrantCreateRequest): Promise<Grant> {
+  async createGrant(request: GrantCreateRequest): Promise<GrantCreateResponse> {
     this.calls.push({ method: "createGrant", args: request });
     throw new Error("createGrant must be stubbed per test");
   }
 
-  async forget(request: ForgetRequest): Promise<RetentionJob> {
+  async forget(request: ForgetRequest): Promise<ForgetResponse> {
     this.calls.push({ method: "forget", args: request });
     throw new Error("forget must be stubbed per test");
   }
@@ -257,6 +262,69 @@ describe("tool profiles", () => {
     });
     const decision = authorizeToolCall(session, { tool: "memory_forget" });
     assert.equal(decision.allowed === false ? decision.code : "", "authz.token_expired");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Agreement with the server's own allowlists
+// ---------------------------------------------------------------------------
+
+/**
+ * The MCP tool names the specification fixes, mapped to the server's own
+ * operation names.
+ *
+ * The specification names the MCP tools `memory_query`/`memory_forget`; the
+ * server names its operations `memory.query`/`memory.forget`. Both vocabularies
+ * are frozen, so the mapping lives here as data and the test below asserts the
+ * two allowlists agree on every tool this server exposes.
+ */
+const SERVER_TOOL_FOR: Readonly<Record<ToolName, ContractToolName>> = {
+  memory_query: "memory.query",
+  memory_explain: "memory.explain",
+  memory_record_event: "memory.record",
+  memory_propose: "memory.propose",
+  memory_feedback: "memory.feedback",
+  memory_decide: "memory.decide",
+  memory_share: "memory.share",
+  memory_forget: "memory.forget",
+};
+
+describe("agreement with the server's allowlists", () => {
+  it("grants no MCP tool that the server's profile does not grant", () => {
+    const drift: string[] = [];
+    for (const profile of TOOL_PROFILES) {
+      const serverTools = new Set<string>(SERVER_PROFILE_TOOLS[profile]);
+      for (const tool of toolsForProfile(profile)) {
+        const serverTool = SERVER_TOOL_FOR[tool];
+        if (!serverTools.has(serverTool)) drift.push(`${profile}: MCP exposes ${tool} but the server does not grant ${serverTool}`);
+      }
+    }
+    assert.deepEqual(
+      drift,
+      [],
+      "an MCP tool the server's profile does not grant is a client that advertises a capability the API will refuse",
+    );
+  });
+
+  it("keeps the MCP surface a strict subset of the server's, so hiding a tool is never the only control", () => {
+    const mcpTools = new Set<ContractToolName>(Object.values(SERVER_TOOL_FOR));
+    const serverOnly = SERVER_PROFILE_TOOLS["privacy-admin"].filter((tool) => !mcpTools.has(tool));
+    // The server exposes compose, trace, relate, reverify, gate, replay and
+    // evaluate over REST; MCP deliberately does not, because a model-facing
+    // surface stays narrow. Recording the difference here means a new MCP tool
+    // has to be a deliberate addition rather than drift.
+    assert.deepEqual(serverOnly, [
+      "memory.compose",
+      "memory.trace",
+      "memory.claim.read",
+      "memory.candidate.read",
+      "memory.event.read",
+      "action.gate",
+      "memory.relate",
+      "memory.reverify",
+      "memory.replay",
+      "memory.evaluate",
+    ]);
   });
 });
 
@@ -505,13 +573,13 @@ describe("renderPacketForModel", () => {
 describe("write-path tools", () => {
   it("reports the promotion state of a recorded event instead of implying belief", async () => {
     const backend = new StubBackend();
-    backend.appendEvent = async (request: unknown) => {
+    backend.appendEvent = async (request: AppendEventRequest) => {
       backend.calls.push({ method: "appendEvent", args: request });
       return {
         event_id: "evt_01JABCDEFG",
         seq: 4187,
         recorded_at: "2026-09-17T09:00:00.000Z",
-        extraction: "queued",
+        extraction: "queued" as const,
         deduplicated: false,
         content_hash: "dd".repeat(32),
         prev_hash: null,
@@ -547,7 +615,7 @@ describe("write-path tools", () => {
 
   it("records a decision with the session subject as approver", async () => {
     const backend = new StubBackend();
-    backend.decideCandidate = async (candidateId: string, request: unknown) => {
+    backend.decideCandidate = async (candidateId: string, request: DecisionRequest) => {
       backend.calls.push({ method: "decideCandidate", args: { candidateId, request } });
       return {
         decision_id: "dec_01JABCDEFG",
@@ -557,8 +625,8 @@ describe("write-path tools", () => {
         outcome: "accept",
         reason_codes: ["gate.auto_accept_eligible"],
         approver: "operator:sam",
-        detail: null,
         decided_at: "2026-09-17T09:00:00.000Z",
+        claim_created: true,
       };
     };
 

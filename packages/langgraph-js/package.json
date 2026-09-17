@@ -7,6 +7,7 @@
   "license": "Apache-2.0",
   "exports": {
     ".": "./src/index.ts",
+    "./langgraph": "./src/langgraph-store.ts",
     "./langchain-core": "./src/langchain-store.ts",
     "./peer": "./src/peer.ts"
   },

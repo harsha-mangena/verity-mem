@@ -313,14 +313,16 @@ export class FixtureRunner {
     const db = await this.dbHandle();
     const seed = this.seed;
     const tenantSlug = tenantFor(seed, fixture.header.fixture_id, this.runScope);
-    // A generated uuid, not a hash of the slug.
+    // The tenant seed, and the tenant uuid it derives.
     //
-    // Deriving the tenant from the slug made every run of the same fixture under
-    // the same seed land in one tenant, and `Ledger` derives its own tenant from
-    // the request scope — so the two derivations disagreed and the run read rows it
-    // had not written. A fixture tenant is a physical partition, not a name; the
-    // name is only used for scope resolution inside the run.
-    const tenantId = randomUUID();
+    // The two exist because the ledger hashes the scope's tenant on the append path
+    // and the runner does not on the prime path: writing `appendTenant` on an event
+    // and `tenantId = resolveTenantId(appendTenant)` into the scope row makes both
+    // paths land on the same partition. The seed is random per run because the
+    // ledger is append-only — a fixture that reused a fixed partition across runs
+    // would find its idempotency keys already spent.
+    const appendTenant = randomUUID();
+    const tenantId = resolveTenantId(appendTenant);
     const clock = fixedClock(this.options.clockStart ?? "2026-09-17T12:00:00.000Z");
     // Ids are seeded from the run instance, not from the run scope. See `runToken`:
     // pinning the ids to a reusable scope is what makes a rerun collide with its
@@ -346,6 +348,7 @@ export class FixtureRunner {
         fixture,
         tenantSlug,
         tenantId,
+        appendTenant,
         seed,
         ledger,
         gate,
@@ -442,6 +445,14 @@ interface RunStateDeps {
   readonly runScope: string;
   /** The run's per-instance token; part of the id seed and the idempotency keys. */
   readonly runToken: string;
+  /**
+   * The tenant value written on every event scope.
+   *
+   * `Ledger.append` hashes it once, so the physical tenant is `resolveTenantId` of
+   * this value — which is exactly `tenantId`, the value the run creates its scopes
+   * with. Writing `tenantId` directly would double-hash and split the run in two.
+   */
+  readonly appendTenant: string;
   readonly fixture: FixtureFile;
   readonly tenantSlug: string;
   readonly tenantId: string;
@@ -592,6 +603,9 @@ class RunState {
         }),
       );
       this.rememberScope(scope, parsed.tenant);
+      if (process.env["LB_DIAG"] === "1") {
+        console.error(`[diag-prime] tenant=${this.tenantId} scope=${scope.scope_id} scopeTenant=${scope.tenant_id}`);
+      }
     }
     // Scopes that already existed from an earlier run of the same fixture (a rerun
     // under the same seed) also have to be reachable.
@@ -854,6 +868,12 @@ class RunState {
       // and it must agree with the partition the run primed. A disagreement means
       // the run's reads are aimed at a tenant it never wrote to, which presents as
       // every metric reading zero against a working system.
+      if (process.env["LB_DIAG"] === "1") {
+        console.error(
+          `[diag] passedTenant=${resolveTenantId(this.tenantId)} resolvedByAppend=${resolveTenantId(resolveTenantId(resolveTenantId(this.tenantId)))} ` +
+            `receipt=${receipt.scope.tenant_id} primed=${this.expectedTenant()} scope=${receipt.scope.scope_id}`,
+        );
+      }
       if (receipt.scope.tenant_id !== this.expectedTenant()) {
         throw new Error(
           `ledgerbench: append landed in tenant ${receipt.scope.tenant_id} but the run primed ` +
@@ -941,12 +961,13 @@ class RunState {
     const rewritten: EventAppendRequest = {
       ...event,
       // The tenant value is chosen so the ledger's own derivation lands exactly on
-      // the run's tenant. `Ledger.append` calls `resolveTenantId` on the scope's
-      // tenant and then hands the result to `ensureScope`, which resolves it again
-      // — so passing `resolveTenantId(runTenant)` means the append resolves to
-      // `runTenant` while `ensureScope` sees `runTenant` as well. Any other value
-      // puts the events in one partition and the scopes in another.
-      scope: { ...event.scope, tenant: resolveTenantId(this.tenantId) },
+      // the tenant the run primed its scopes in. `Ledger.append` hashes the scope's
+      // tenant once (`resolveTenantId`) and hands the result to `ensureScope`; the
+      // prime path passes the tenant uuid through unchanged. So the value that
+      // survives both paths is the pre-image of the run's tenant under one hash.
+      // Anything else puts the events in one partition and the scopes in another,
+      // which presents as every metric reading zero against a working system.
+      scope: { ...event.scope, tenant: this.deps.appendTenant },
       ...(event.idempotency_key !== undefined
         ? { idempotency_key: `${event.idempotency_key}#${this.deps.runToken.slice(0, 8)}` }
         : {}),

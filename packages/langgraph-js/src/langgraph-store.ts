@@ -175,7 +175,7 @@ export class VerityMemStore extends BaseStore {
       ...(typeof limit === "number" ? { limit } : {}),
       ...(typeof offset === "number" ? { offset } : {}),
     });
-    return items.map(toPeerItem);
+    return items.map(toSearchItem);
   }
 }
 
@@ -196,5 +196,23 @@ function toPeerItem(item: StoreItem | undefined): Item | null {
     value: item.value as unknown as Record<string, unknown>,
     createdAt: created,
     updatedAt: updated,
+  };
+}
+
+/**
+ * Core item → peer search item.
+ *
+ * `score` is set from the packet's rank-fusion value and nothing else. The peer calls
+ * it a relevance score, which is what it is; it is never a truth or confidence score,
+ * and the six dimensions that are not relevance stay in `value` where a caller can
+ * still see them separately.
+ */
+function toSearchItem(item: StoreItem): SearchItem {
+  const base = toPeerItem(item);
+  if (base === null) throw new TypeError("search produced no item; a search result is never absent");
+  const relevance = item.value.relevance;
+  return {
+    ...base,
+    ...(relevance === null ? {} : { score: relevance.fuse_score }),
   };
 }

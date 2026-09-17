@@ -315,7 +315,12 @@ export class ClaimBackedStore {
    */
   async search(namespacePrefix: readonly string[], options: SearchOptions = {}): Promise<StoreItem[]> {
     const { packet, scope } = await this.searchPacket(namespacePrefix, options);
-    return packet.claims.map((claim) => itemFromPacketClaim(claim, this.codec, scope.tenant));
+    const provenance: PacketProvenance = {
+      trace_id: packet.trace_id,
+      policy_version: packet.policy_version,
+      projection_watermark: packet.projection_watermark,
+    };
+    return packet.claims.map((claim) => itemFromPacketClaim(claim, this.codec, scope.tenant, provenance));
   }
 
   /**
@@ -503,17 +508,37 @@ export function normalizeOperation(operation: unknown): StoreOperation {
   }
   const namespacePrefix = record["namespacePrefix"] ?? record["namespace_prefix"];
   if (Array.isArray(namespacePrefix)) {
-    return { type: "search", namespacePrefix: namespacePrefix as string[] };
+    // LangGraph's SearchOperation keeps the natural-language query at the top level
+    // while its filters live in `filter`; both are folded into the filter this store
+    // resolves its query from, so a peer-shaped search is not read as query-less.
+    const filter = record["filter"];
+    const query = record["query"];
+    const merged: Record<string, unknown> = {
+      ...(typeof filter === "object" && filter !== null ? (filter as Record<string, unknown>) : {}),
+      ...(typeof query === "string" ? { query } : {}),
+    };
+    return {
+      type: "search",
+      namespacePrefix: namespacePrefix as string[],
+      ...(Object.keys(merged).length === 0 ? {} : { filter: merged }),
+      ...(typeof record["limit"] === "number" ? { limit: record["limit"] } : {}),
+      ...(typeof record["offset"] === "number" ? { offset: record["offset"] } : {}),
+    };
   }
   const namespace = record["namespace"];
   const key = record["key"];
   if (Array.isArray(namespace) && typeof key === "string") {
     if ("value" in record) {
+      // The peer signals deletion with `value: null`, which is a refusal here, not an
+      // empty write.
+      if (record["value"] === null || record["value"] === undefined) {
+        return { type: "delete", namespace: namespace as string[], key };
+      }
       return {
         type: "put",
         namespace: namespace as string[],
         key,
-        value: (record["value"] ?? {}) as Record<string, unknown>,
+        value: record["value"] as Record<string, unknown>,
       };
     }
     return { type: "get", namespace: namespace as string[], key };
@@ -696,6 +721,19 @@ function itemFromClaim(claim: ClaimRecord, codec: NamespaceCodec, tenant: string
 }
 
 /**
+ * Where a query result came from, carried onto every item it produced.
+ *
+ * Passed explicitly rather than inferred: an item that cannot name the trace that
+ * produced it cannot be explained later, and "the packet is in scope somewhere" is not
+ * a property a value can rely on.
+ */
+export interface PacketProvenance {
+  readonly trace_id: string;
+  readonly policy_version: string;
+  readonly projection_watermark: number;
+}
+
+/**
  * Map a packet claim to a store item.
  *
  * Exported because the recall node already holds a packet and must not issue a second
@@ -750,8 +788,13 @@ function itemFromPacketClaim(
       provenance: {
         source: "POST /v1/query",
         tenant,
-        trace_id: traceId,
-        policy_version: policyVersion,
+        ...(packet === undefined
+          ? {}
+          : {
+              trace_id: packet.trace_id,
+              policy_version: packet.policy_version,
+              projection_watermark: packet.projection_watermark,
+            }),
       },
     },
     createdAt: claim.valid_time.from,

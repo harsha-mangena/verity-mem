@@ -50,6 +50,13 @@ import { VerityMemError, type VerityMemErrorBody } from "./errors.ts";
 /** Accepted by `globalThis.fetch`; injectable so tests never need a socket. */
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
+/**
+ * Client configuration.
+ *
+ * Two credentials rather than one because the server keeps a separate audience
+ * for the admin routes: reusing an agent token for `/v1/grants` would be the
+ * "agent token that can reach /v1/forget" design failure the specification names.
+ */
 export interface VerityMemClientOptions {
   /** Origin of the API, e.g. `http://127.0.0.1:8080`. No trailing slash required. */
   readonly baseUrl: string;
@@ -74,6 +81,13 @@ export interface VerityMemClientOptions {
   readonly actionGatePath?: string;
 }
 
+/**
+ * Typed client over the VerityMem REST API.
+ *
+ * Constructed with an injectable `fetch` so a test can exercise every route
+ * without a socket, and so a deployment can supply instrumentation around the
+ * transport without forking this class.
+ */
 export class VerityMemClient {
   private readonly baseUrl: string;
   private readonly token: string | undefined;

@@ -23,6 +23,12 @@ import { type ToolBackend } from "./tools.ts";
 /** Path the transport is mounted at. The specification names no path; `/mcp` is the convention. */
 export const DEFAULT_HTTP_PATH = "/mcp";
 
+/**
+ * Configuration for the Streamable HTTP transport.
+ *
+ * Every field has a safe default; `backend` is required because a transport with
+ * no API behind it would answer every call with a refusal.
+ */
 export interface HttpServerOptions {
   readonly backend: ToolBackend;
   /** Host to bind. Defaults to `127.0.0.1`: a memory layer should not be on the network by accident. */
@@ -36,6 +42,7 @@ export interface HttpServerOptions {
   readonly now?: () => Date;
 }
 
+/** A started server and the exact URL it is listening on. */
 export interface RunningHttpServer {
   readonly server: Server;
   readonly url: string;

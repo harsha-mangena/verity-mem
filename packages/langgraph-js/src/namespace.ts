@@ -46,13 +46,17 @@ export const DIMENSION_SEPARATOR = ":";
 /**
  * Characters a dimension value may not contain.
  *
- * They are the separators an opaque concatenated namespace would use, and no
+ * `/` and `|` are the separators an opaque concatenated namespace would use, and no
  * VerityMem scope value legitimately needs them: tenant slugs, project slugs,
- * principal ids, session ids and purpose names are all identifier-like. Rejecting
- * them is what stops `["acme/payments/alice"]` from being read as three dimensions
- * or as one.
+ * principal ids, session ids and purpose names are all identifier-like. Rejecting them
+ * is what stops `["acme/payments/alice"]` from being read as three dimensions or as one.
+ *
+ * `.` is here because LangGraph's own store refuses a namespace label containing a
+ * period (`InvalidNamespaceError` in `@langchain/langgraph-checkpoint`). Accepting one
+ * would mean the codec builds a namespace the peer rejects later, with an error that
+ * names neither the dimension nor the scope.
  */
-export const FORBIDDEN_VALUE_CHARACTERS = ["/", "|"] as const;
+export const FORBIDDEN_VALUE_CHARACTERS = ["/", "|", "."] as const;
 
 /** A resolved scope: explicit dimensions, at least one purpose. */
 export interface StoreScope {
@@ -376,10 +380,14 @@ function assertValue(value: string, dimension: string, namespace: readonly strin
   for (const forbidden of FORBIDDEN_VALUE_CHARACTERS) {
     if (value.includes(forbidden)) {
       throw new NamespaceMappingError(
-        "concatenated_value",
+        forbidden === "." ? "peer_label_invalid" : "concatenated_value",
         namespace,
-        `${dimension} value ${JSON.stringify(value)} contains ${JSON.stringify(forbidden)}; scope values are ` +
-          "identifier-like and a separator inside a value is how two dimensions become one opaque string",
+        `${dimension} value ${JSON.stringify(value)} contains ${JSON.stringify(forbidden)}. ` +
+          (forbidden === "."
+            ? "LangGraph's store rejects a namespace label containing a period, so a scope value that is used as a " +
+              "namespace label must not contain one; use a hyphen instead, e.g. thread-9 rather than thread.9"
+            : "Scope values are identifier-like, and a separator inside a value is how two dimensions become one " +
+              "opaque string"),
       );
     }
   }

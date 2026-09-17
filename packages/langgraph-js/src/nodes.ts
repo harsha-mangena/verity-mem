@@ -141,7 +141,13 @@ export async function recallMemory(
       packet: result.packet,
       context: result.context,
       namespace: result.namespace,
-      items: result.packet.claims.map((claim) => storeItemFromPacketClaim(claim, dependencies.scope.tenant)),
+      items: result.packet.claims.map((claim) =>
+        storeItemFromPacketClaim(claim, dependencies.scope.tenant, {
+          trace_id: result.packet.trace_id,
+          policy_version: result.packet.policy_version,
+          projection_watermark: result.packet.projection_watermark,
+        }),
+      ),
     },
   };
 }

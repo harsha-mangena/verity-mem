@@ -444,11 +444,15 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
 
   // ---- Step 6: supersede the first claim, keep the history readable --------
   nextDay();
+  // No `subjects` filter here, deliberately. A subject filter is an exact-match
+  // predicate over the extractor's own subject vocabulary (`user:user:alice` for an
+  // actor id of `user:alice`), and a caller that guesses the vocabulary gets an empty
+  // packet that looks like an authorization failure. The `contradiction` step is
+  // where the claim's real subject comes from, and it comes from the database.
   const currentBefore = await query(world, deps, {
     text: "deploy window approved Sunday 02:00 UTC",
     principal: `user:${alice}`,
     user: alice,
-    subjects: [`user:${alice}`],
   });
   await correctClaim(
     { db: world.db, ledger: world.ledger, ids: world.ids, clock: world.clock },
@@ -472,7 +476,6 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     text: "deploy window approved Sunday 02:00 UTC",
     principal: `user:${alice}`,
     user: alice,
-    subjects: [`user:${alice}`],
   });
   record({
     step: 6,
@@ -933,10 +936,6 @@ interface QueryInput {
 }
 
 async function query(world: World, deps: RetrievalDependencies, input: QueryInput): Promise<ComposeResult> {
-  const events = await world.db.withSystemContext({ tenant: world.tenantId, actor: "x" }, (ex) => ex.query("SELECT count(*)::int AS c FROM events"));
-  const claimsN = await world.db.withSystemContext({ tenant: world.tenantId, actor: "x" }, (ex) => ex.query("SELECT count(*)::int AS c FROM claims"));
-  const embN = await world.db.withSystemContext({ tenant: world.tenantId, actor: "x" }, (ex) => ex.query("SELECT count(*)::int AS c FROM claim_embeddings"));
-  process.stderr.write(`PRECHECK events=${events.rows[0]?.c} claims=${claimsN.rows[0]?.c} emb=${embN.rows[0]?.c} text=${JSON.stringify(input.text)}\n`);
   const result = await compose(
     deps,
     {
@@ -955,9 +954,6 @@ async function query(world: World, deps: RetrievalDependencies, input: QueryInpu
     },
     { principal: input.principal },
   );
-  if (process.env["VM_DEBUG_SCOPES"] === "1") {
-    process.stderr.write(`DEBUG query=${JSON.stringify(input.text)} principal=${input.principal} scopes=${JSON.stringify(result.plan.authorized_scope_ids)} denied=${JSON.stringify(result.plan.denied_dimensions)} channels=${JSON.stringify(result.channels.map((c) => [c.channel, c.hits.length]))} fused=${result.fused.length} claims=${result.packet.claims.length}\n`);
-  }
   return result;
 }
 

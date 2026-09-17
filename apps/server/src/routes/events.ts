@@ -28,7 +28,7 @@ import { CommitGate } from "@veritymem/gate";
 import { DETERMINISTIC_EXTRACTORS, IngestPipeline } from "@veritymem/model-adapters";
 import { projectClaim } from "@veritymem/retrieval";
 import { requireTool } from "../auth.ts";
-import { resolveCallerTenant, tenantFromCredential, withBoundContext } from "../context.ts";
+import { resolveCallerTenant, tenantFromCredential, withBoundContext, withReadContext } from "../context.ts";
 import type { ServerDeps } from "../config.ts";
 import { notFound } from "../errors.ts";
 import { formatUuid } from "../views.ts";
@@ -136,17 +136,8 @@ export function registerEventRoutes(app: FastifyInstance, options: EventRouteOpt
       const params = request.params as { event_id: string };
       const context = tenantFromCredential({ identity: caller, what: "GET /v1/events" });
 
-      const event = await withBoundContext(
-        deps,
-        {
-          tenantId: context.tenantId,
-          principal: context.principal,
-          scopeIds: [],
-          purposes: [],
-          action: "event:read",
-          readOnly: true,
-        },
-        async (executor) => deps.ledger.readEvent(executor, params.event_id),
+      const event = await withReadContext(deps, context, async (executor) =>
+        deps.ledger.readEvent(executor, params.event_id),
       );
 
       if (!event) throw notFound("event");
@@ -171,21 +162,13 @@ export function registerEventRoutes(app: FastifyInstance, options: EventRouteOpt
       const params = request.params as { event_id: string };
       const context = tenantFromCredential({ identity: caller, what: "POST /v1/events/{id}/extract" });
 
-      // Read the event first, unbound by scope but bound by tenant, to learn which
-      // scope and purposes the extraction belongs to. Binding the caller's own reach
-      // instead would let a caller with a broad grant extract an event into a scope it
-      // does not participate in, which would change the evidence's ownership.
-      const event = await withBoundContext(
-        deps,
-        {
-          tenantId: context.tenantId,
-          principal: context.principal,
-          scopeIds: [],
-          purposes: [],
-          action: "event:extract:read",
-          readOnly: true,
-        },
-        async (executor) => deps.ledger.readEvent(executor, params.event_id),
+      // Read the event inside the caller's own reach first, to learn which scope and
+      // purposes the extraction belongs to and to prove the caller can reach it at
+      // all. The extraction itself then runs bound to the *event's* scope rather than
+      // to the caller's reach, because ingest writes candidates and spans that belong
+      // to that event and to nothing else.
+      const event = await withReadContext(deps, context, async (executor) =>
+        deps.ledger.readEvent(executor, params.event_id),
       );
       if (!event) throw notFound("event");
 

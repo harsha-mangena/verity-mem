@@ -632,6 +632,7 @@ describe("veritymem server", () => {
       headers: agentAuth(h),
     });
     const candidateId = (explained.json() as { candidate: { candidate_id: string } }).candidate.candidate_id;
+    console.log("DIAG explained:", explained.statusCode, "candidateId:", candidateId, JSON.stringify(explained.json()).slice(0, 200));
 
     const contributor = await h.app.inject({
       method: "POST",

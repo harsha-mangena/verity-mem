@@ -60,6 +60,13 @@ const PROVENANCE_LABEL = "provenance";
  */
 export const MAX_RENDER_CHARS = 120_000;
 
+/**
+ * A rendering and the facts a caller needs to reason about it.
+ *
+ * `sanitized` and `truncated` are reported rather than logged because both change
+ * what the text means: a sanitized rendering is not the stored bytes, and a
+ * truncated one is not the whole packet.
+ */
 export interface RenderResult {
   /** The fenced, delimited text. Place it in a user-role region, never the system channel. */
   readonly text: string;
@@ -75,6 +82,7 @@ export interface RenderResult {
   readonly truncated: boolean;
 }
 
+/** Options for {@link renderPacketForModel}. Both exist so tests are deterministic. */
 export interface RenderOptions {
   /** Injectable for deterministic tests. Must return at least 16 bytes of entropy. */
   readonly nonce?: string;

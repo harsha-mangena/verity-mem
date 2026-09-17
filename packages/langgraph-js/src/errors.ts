@@ -22,7 +22,8 @@ export type NamespaceMappingCode =
   | "missing_dimension"
   | "unbound_scope"
   | "empty_value"
-  | "concatenated_value";
+  | "concatenated_value"
+  | "peer_label_invalid";
 
 /**
  * A namespace is not a string; it is a tuple of named scope dimensions.
@@ -130,7 +131,7 @@ export class ScopeViolationError extends Error {
  * implementation would quietly lie.
  */
 export class StoreOperationRefusedError extends Error {
-  readonly code: "delete" | "enumerate" | "resolve_proposal_key" | "search_without_query";
+  readonly code: "delete" | "enumerate" | "resolve_proposal_key" | "search_without_query" | "index_config";
   readonly detail: Readonly<Record<string, unknown>>;
 
   constructor(

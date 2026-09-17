@@ -36,8 +36,13 @@ export const AGENT_TOOLS = [
  */
 export const PRIVILEGED_TOOLS = ["memory_decide", "memory_share", "memory_forget"] as const;
 
+/** One of the five default agent tools. */
 export type AgentToolName = (typeof AGENT_TOOLS)[number];
+
+/** One of the three supervisor tools, which an ordinary session never sees registered. */
 export type PrivilegedToolName = (typeof PRIVILEGED_TOOLS)[number];
+
+/** Any tool this server can be asked for, privileged or not. */
 export type ToolName = AgentToolName | PrivilegedToolName;
 
 /**
@@ -124,6 +129,12 @@ export interface CallRequest {
   readonly purpose?: string;
 }
 
+/**
+ * The result of an authorization check.
+ *
+ * A decision rather than a thrown error: a refusal has to reach the model as a
+ * tool result it can read and report, not as a protocol failure it will retry.
+ */
 export type AuthorizationDecision =
   | { readonly allowed: true }
   | { readonly allowed: false; readonly code: string; readonly message: string };

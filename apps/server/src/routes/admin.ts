@@ -43,7 +43,7 @@ import {
   type ForgetManifest,
 } from "@veritymem/retrieval";
 import { requireAdminTool } from "../auth.ts";
-import { resolveCallerTenant, tenantFromCredential, withAdminContext } from "../context.ts";
+import { resolveCallerTenant, tenantFromCredential } from "../context.ts";
 import type { ServerDeps } from "../config.ts";
 import { ApiError, notFound } from "../errors.ts";
 import { stripPrefix } from "../views.ts";

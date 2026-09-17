@@ -57,6 +57,13 @@ export interface VerityMemServerHandle {
   readonly authorizationChecks: { count: number };
 }
 
+/**
+ * Everything the factory needs to build one session's server.
+ *
+ * `now` is injectable because a tool handler that reads wall time is a test that
+ * fails at midnight, and because `occurred_at` is a value the ledger treats as
+ * load-bearing.
+ */
 export interface CreateServerOptions {
   readonly backend: ToolBackend;
   readonly session: AuthorizedSession;

@@ -101,6 +101,12 @@ export type FacadePromotionOutcome =
   | "not_gated"
   | "unresolved";
 
+/**
+ * The gate's answer about one write.
+ *
+ * `detail` is prose for a human reading a log; every other field is the machine
+ * record. A caller that branches on `outcome` never has to parse `detail`.
+ */
 export interface FacadePromotion {
   readonly outcome: FacadePromotionOutcome;
   /** True when a human still has to answer before this becomes believable. */
@@ -114,6 +120,7 @@ export interface FacadePromotion {
   readonly detail: string;
 }
 
+/** What `add()` returns: the append's receipt plus where the write stands. */
 export interface FacadeAddResult {
   readonly event_id: string;
   readonly seq: number;
@@ -175,6 +182,7 @@ export interface FacadeSearchResult {
   readonly packet: MemoryPacket;
 }
 
+/** Configuration for {@link MemoryFacade}. */
 export interface VerityMemFacadeOptions {
   /** Injected client, for tests. Ignored when `baseUrl`, `token` or `fetch` are given. */
   readonly client?: VerityMemClient;

@@ -46,6 +46,7 @@ export const HTTP_STATUS = {
   UNAVAILABLE: 503,
 } as const;
 
+/** Everything a {@link VerityMemError} carries, named at the construction site. */
 export interface VerityMemErrorInit {
   /** HTTP status, or 0 when the request never reached the server. */
   readonly status: number;

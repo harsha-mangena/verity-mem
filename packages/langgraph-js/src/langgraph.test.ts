@@ -48,6 +48,7 @@ import {
   sha256Hex,
   type FetchLike,
   type StoreClaimValue,
+  type StoreOperation,
   type StoreScope,
   type VerityApiClient,
   type VerityMemoryState,
@@ -733,14 +734,33 @@ describe("ClaimBackedStore over the REST surface", () => {
     );
   });
 
-  it("accepts a peer-shaped operation without a discriminant", async () => {
+  it("accepts a peer-shaped search operation, whose query sits outside its filter", async () => {
     const harness = createHarness();
     const store = new ClaimBackedStore({ client: harness.client });
-    const results = await store.batch([
-      { namespacePrefix: ["tenant:acme", "user:alice", "purpose:release_planning"], filter: { query: "deploy" } },
-    ] as never);
+    const operations = [
+      { namespacePrefix: ["tenant:acme", "user:alice", "purpose:release_planning"], filter: undefined, limit: 10, offset: 0, query: "deploy" },
+    ] as unknown as readonly StoreOperation[];
+    const results = await store.batch(operations);
     assert.equal(results.length, 1);
     assert.equal(harness.requests[0]?.path, "/v1/query");
+    assert.equal(harness.requests[0]?.body["query"], "deploy");
+  });
+
+  it("treats a peer `put` with a null value as the deletion it is", async () => {
+    const harness = createHarness();
+    const store = new ClaimBackedStore({ client: harness.client });
+    await assert.rejects(
+      () =>
+        store.batch([
+          { namespace: ["tenant:acme", "user:alice", "purpose:release_planning"], key: CLAIM_ID, value: null },
+        ] as unknown as readonly StoreOperation[]),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError);
+        assert.ok(error.errors[0] instanceof StoreOperationRefusedError);
+        return true;
+      },
+    );
+    assert.deepEqual(harness.requests, [], "a deletion signal must not become an event");
   });
 });
 
@@ -854,7 +874,22 @@ describe("gate_action raises on a denied action", () => {
   });
 
   it("works standalone: no graph, no store, no nodes", async () => {
-    const harness = createHarness({ verdict: allowedVerdict() });
+    const harness = createHarness({
+      verdict: {
+        ...allowedVerdict(),
+        claims: [
+          ...allowedVerdict().claims,
+          {
+            claim_id: OTHER_CLAIM_ID,
+            found: true,
+            use: "use",
+            reason_codes: ["use.fresh_authoritative"],
+            age_days: 3,
+            blocking: false,
+          },
+        ],
+      },
+    });
     const check = await beforeAction(
       { client: harness.client },
       {
@@ -1069,14 +1104,81 @@ describe("the optional LangChain peer", () => {
     const report = await probeLangGraphPeer();
     assert.ok(report.probes.length >= 2);
     const checkpoint = report.probes.find((probe) => probe.specifier === "@langchain/langgraph-checkpoint");
-    assert.equal(checkpoint?.found, false, "langgraph-checkpoint is not installed in this workspace");
-    assert.equal(report.base_store, null, "no namespaced BaseStore is available, so the structural store is used");
+    assert.equal(checkpoint?.found, true, "langgraph-checkpoint is installed in this workspace");
+    assert.equal(checkpoint?.namespaced, true, "its BaseStore is the namespaced one (batch + search)");
+    assert.equal(report.base_store, "@langchain/langgraph-checkpoint");
+
+    const core = report.probes.find((probe) => probe.specifier === "@langchain/core");
+    assert.equal(core?.found, true);
+    // @langchain/core's root export has no BaseStore; the string-keyed one is at a
+    // subpath, which is why there is a second entry point for it.
+    assert.equal(core?.namespaced, false);
+
     const store = await createLangGraphStore({ client: createHarness().client });
     assert.equal(typeof store.batch, "function");
+    // require_peer is satisfied here; the failure path is covered by the refusal in
+    // `probeLangGraphPeer` being data rather than an assumption.
+    const strict = await createLangGraphStore({ client: createHarness().client, require_peer: true });
+    assert.equal(typeof strict.search, "function");
+  });
+
+  it("extends LangGraph's own namespaced BaseStore, and keeps its semantics", async (context) => {
+    // Variable specifier on purpose: this file must typecheck in a workspace with no
+    // peer installed, so TypeScript is not allowed to resolve the peer-only module.
+    const specifier = "./langgraph-store.ts";
+    const loaded = await loadOptional(async () => (await import(specifier)) as LangGraphStoreModule);
+    if (loaded === null) {
+      context.skip("@langchain/langgraph-checkpoint is not installed");
+      return;
+    }
+    const harness = createHarness();
+    const { VerityMemStore } = loaded;
+    const { BaseStore } = await import("@langchain/langgraph-checkpoint");
+    const store = new VerityMemStore({ client: harness.client });
+
+    assert.ok(store instanceof BaseStore, "the peer-only module must extend the peer's BaseStore");
+
+    const namespace = ["tenant:acme", "project:payments", "user:alice", "purpose:release_planning"];
+
+    // A search without a query is refused: VerityMem search is an authorized
+    // retrieval, not a scan, and the peer's default options carry no query.
+    await assert.rejects(() => store.search(namespace), StoreOperationRefusedError);
+    assert.deepEqual(harness.requests, [], "a refused search must not reach the network");
+
+    const items = await store.search(namespace, { query: "deploy window", limit: 5 });
+    assert.equal(harness.requests[0]?.path, "/v1/query");
+    assert.equal(items.length, 1);
+    assert.equal(items[0]?.key, CLAIM_ID);
+    assert.ok(items[0]?.createdAt instanceof Date, "the peer's Item carries Date timestamps");
+    assert.equal(items[0]?.score, 0.82, "the peer's relevance score is the rank-fusion value");
+
+    // The peer's `put` is a proposal: it appends an event and returns void.
+    await store.put(namespace, "deploy-window", { window: "2026-09-20T02:00Z/PT4H" });
+    assert.equal(harness.requests[1]?.path, "/v1/events");
+    assert.equal(harness.requests[1]?.body["origin"], "agent");
+
+    // The peer expresses deletion as a put with a null value; that is the same refusal.
+    await assert.rejects(() => store.delete(namespace, CLAIM_ID), StoreOperationRefusedError);
+    assert.equal(harness.requests.length, 2, "a refusal must not become a request");
+
+    // Per-item index configuration would be lost at the next projection rebuild.
     await assert.rejects(
-      () => createLangGraphStore({ client: createHarness().client, require_peer: true }),
-      /no namespaced LangGraph BaseStore is installed/,
+      () => store.put(namespace, "k", { v: 1 }, ["value"]),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError);
+        assert.ok(error.errors[0] instanceof StoreOperationRefusedError);
+        return true;
+      },
     );
+
+    // A namespace that does not name its dimensions never reaches the peer.
+    await assert.rejects(
+      () => store.search(["acme", "payments", "alice", "release_planning"], { query: "q" }),
+      NamespaceMappingError,
+    );
+
+    const receipt = await store.putWithReceipt(namespace, "k", { v: 1 });
+    assert.equal(receipt.event_id, EVENT_ID);
   });
 
   it("extends @langchain/core's BaseStore when that peer is present", async (context) => {
@@ -1100,11 +1202,19 @@ describe("the optional LangChain peer", () => {
     await store.mset([[encoded, { window: "2026-09-20T02:00Z/PT4H" } as unknown as StoreClaimValue]]);
     assert.equal(harness.requests[0]?.path, "/v1/events");
 
-    const values = await store.mget([encoded]);
     // The claim id is not the key that was written: a put is a proposal, so a get by
     // the written key finds no belief. That asymmetry is the design, not a bug.
+    await assert.rejects(
+      () => store.mget([encoded]),
+      (error: unknown) => error instanceof StoreOperationRefusedError && error.code === "resolve_proposal_key",
+    );
+
+    // Reading a belief works, by claim id.
+    const claimKey = store.encodeKey(namespace, CLAIM_ID);
+    const values = await store.mget([claimKey]);
     assert.equal(values.length, 1);
-    assert.equal(values[0], undefined);
+    assert.equal(values[0]?.claim_id, CLAIM_ID);
+    assert.equal(values[0]?.use, null, "a bare claim read carries no use decision, and says so");
 
     await assert.rejects(() => store.mdelete([encoded]), StoreOperationRefusedError);
     await assert.rejects(
@@ -1172,5 +1282,21 @@ interface PeerStoreModule {
     mget(keys: string[]): Promise<(StoreClaimValue | undefined)[]>;
     mdelete(keys: string[]): Promise<void>;
     yieldKeys(prefix?: string): AsyncGenerator<string>;
+  };
+}
+
+/** The shape of the namespaced peer module, declared rather than imported. See above. */
+interface LangGraphStoreModule {
+  readonly VerityMemStore: new (options: { readonly client: VerityApiClient }) => {
+    search(namespacePrefix: string[], options?: { query?: string; limit?: number }): Promise<
+      { key: string; createdAt: unknown; score?: number; value: StoreClaimValue }[]
+    >;
+    put(namespace: string[], key: string, value: Record<string, unknown>, index?: false | string[]): Promise<void>;
+    delete(namespace: string[], key: string): Promise<void>;
+    putWithReceipt(
+      namespace: string[],
+      key: string,
+      value: Readonly<Record<string, unknown>>,
+    ): Promise<{ event_id: string }>;
   };
 }
