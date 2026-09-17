@@ -39,13 +39,13 @@ traceable to one of them:
 │   ├── worker/                 # extraction, gate, projections    (in progress)
 │   └── reference-dev-agent/    # software-delivery demo           (not started)
 ├── packages/
-│   ├── contracts/  DONE  frozen TypeBox/JSON schemas, reason codes, policy constants
-│   ├── ledger/     DONE  append, hash chain, idempotency, spans, blobs, outbox, migrate
+│   ├── contracts/  DONE  frozen schemas, reason codes, policy, vocabulary drift test
+│   ├── ledger/     DONE  append, hash chain, idempotency, spans, blobs, outbox, system context
 │   ├── gate/       DONE  entailment backends, span validation, commit gate
 │   ├── policy/     DONE  re-exports the versioned policy documents
-│   ├── claims/     TODO  lifecycle, bi-temporal queries
-│   ├── retrieval/  TODO  planner, hybrid channels, packet composer
-│   ├── model-adapters/ TODO OpenAI-compatible, Ollama, deterministic
+│   ├── claims/     DONE  reads, bi-temporal time predicates, use policy
+│   ├── retrieval/  DONE  planner, channels, composer, projections, retention, action gate
+│   ├── model-adapters/ DONE deterministic + model extractors, ingest pipeline
 │   ├── mcp-server/ TODO  stdio + Streamable HTTP
 │   ├── sdk-ts/     TODO
 │   └── langgraph-js/ TODO BaseStore + four hooks incl. the action gate
@@ -59,6 +59,100 @@ traceable to one of them:
 ├── CONTRIBUTING.md TODO
 └── LICENSE         TODO (Apache-2.0)
 ```
+
+## The API surface that exists today
+
+These are real, typechecked, and covered by 70 passing tests. Build on them; do not
+reimplement them.
+
+```ts
+// packages/ledger — the canonical store
+import { Db, Ledger, FilesystemBlobStore, systemClock, systemIds, loadEnv,
+         resolveTenantId, OutboxWorker, runMigrations } from "@veritymem/ledger";
+
+const env = loadEnv();
+const db = new Db({ connectionString: env.databaseUrl });
+const ledger = new Ledger({ db, blobs: new FilesystemBlobStore(".veritymem/blobs"),
+                            clock: systemClock, ids: systemIds });
+
+await ledger.append({ stream_id, idempotency_key?, origin, actor_id, scope, occurred_at, content })
+  // -> { event_id, seq, recorded_at, scope, content_hash, prev_hash, deduplicated, extraction_queued }
+
+// EVERY tenant read/write must be bound. There is no unbound overload.
+await db.withRequest({ tenant, principal, scopeIds, purposes, action? }, async (executor) => { ... });
+// Tenant-wide maintenance only:
+await db.withSystemContext({ tenant, actor }, async (executor) => { ... });
+```
+
+```ts
+// packages/model-adapters — the write path
+import { IngestPipeline, DETERMINISTIC_EXTRACTORS, ModelExtractor,
+         OpenAiCompatibleAdapter, OllamaAdapter, DeterministicStandInAdapter } from "@veritymem/model-adapters";
+
+const pipeline = new IngestPipeline({ db, ledger, gate, ids, clock,
+  deterministicExtractors: DETERMINISTIC_EXTRACTORS, modelExtractor /* | null */ });
+await db.withRequest(binding, (ex) => pipeline.ingest(ex, event));
+// -> { event_id, admission, candidates, decisions, model_calls, extractor_versions, notes }
+```
+
+```ts
+// packages/gate — the commit gate
+import { CommitGate, LexicalEntailmentBackend, createOnnxEntailmentBackend } from "@veritymem/gate";
+
+const gate = new CommitGate({ db, ledger, ids, clock, entailment, policy });
+await gate.evaluate(executor, candidateForGate);
+// -> { decision_id, outcome, reason_codes, claim_id, policy_version, evidence, detail }
+```
+
+```ts
+// packages/retrieval — the read path, projections, retention, the action gate
+import { compose, evaluateAction, forget, rebuildProjections, projectClaim,
+         digestLexicalProjection, HashEmbeddingBackend, createProjectionProcessor,
+         planQuery, resolveScopes, RBAC_EXAMPLE } from "@veritymem/retrieval";
+
+const deps = { db, ledger, embeddings, ids, clock, gateBackend };
+
+// The read path. Zero model calls unless the embedder is hosted.
+await compose(deps, { tenant_id, query, scope, purpose, time?, action_risk?, limit? },
+              { principal });
+// -> { packet: MemoryPacket, plan, channels, fused, candidates_denied_by_authz }
+
+// The enforcement point. Call before every medium- or high-risk side effect.
+await evaluateAction(deps, { action, action_risk, scope, purpose, claim_ids, trace_id? },
+                     { principal });
+// -> { allowed, decision, reason_codes, claims[], policy_version, evaluated_at }
+
+// Retention, with a verified manifest and a residual scan.
+await forget({ db, ledger, ids, clock }, { tenant_id, tenant_slug, subject_or_scope, mode, reason });
+```
+
+```ts
+// packages/claims — claim reads and the use policy
+import { listClaims, readClaim, readClaims, readRelations, evaluateUse,
+         timePredicate, ageInDays, render } from "@veritymem/claims";
+```
+
+```ts
+// packages/contracts — frozen schemas, reason codes, policy documents
+import { MemoryPacketSchema, EventAppendRequestSchema, QueryRequestSchema,
+         ActionGateRequestSchema, REASON_CODES, DEFAULT_COMMIT_POLICY,
+         DEFAULT_USE_POLICY_VERSION, DEFAULT_ACTION_POLICY_VERSION,
+         RISK_TO_ALLOWED_USE, RISK_TO_MAX_EVIDENCE_AGE_DAYS } from "@veritymem/contracts";
+```
+
+### Behaviour you must not accidentally change
+
+- `compose()` returns `decision: "clarify"` with an empty claim list when the
+  caller reaches no scope. It never discloses whether the scope exists.
+- `evaluateAction()` re-reads claims and re-verifies evidence digests on every
+  call. It does not accept a packet, and it must not be given one.
+- `forget()` only reports `verified` when its residual scan returns zero, and the
+  scan runs inside `withSystemContext`. If you change that binding, the scan
+  silently proves nothing while still reporting success.
+- `OutboxWorker` throws on a message that carries no `scope_ids` or no `purposes`.
+  That is deliberate: the previous behaviour was a silent no-op.
+- The high-risk action threshold is `verified_record`. A `user_self_report` or a
+  `tool` observation yields `verify` at high risk and the action is refused.
 
 ## How to run things
 

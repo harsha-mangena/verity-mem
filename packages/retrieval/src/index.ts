@@ -4,3 +4,4 @@ export * from "./planner.ts";
 export * from "./channels.ts";
 export * from "./compose.ts";
 export * from "./retention.ts";
+export * from "./action-gate.ts";

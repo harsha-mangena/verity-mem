@@ -20,7 +20,7 @@
  *    gate throw is a result, not a crashed test, because the fixture's expectation
  *    ("no claim may exist") still has to be checked in the resulting state.
  */
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { Client } from "pg";
 import {
   GATE_THRESHOLDS,
@@ -327,7 +327,7 @@ export class FixtureRunner {
     });
 
     const state = new RunState(
-      { options: this.options, fixture, tenantSlug, tenantId, seed, ledger, gate, db, clock, ids },
+      { options: this.options, runScope: this.runScope, fixture, tenantSlug, tenantId, seed, ledger, gate, db, clock, ids },
       blobs,
     );
 
@@ -413,6 +413,8 @@ function defaultEntailment(): EntailmentBackend {
 
 interface RunStateDeps {
   readonly options: FixtureRunnerOptions;
+  /** The run's scope token; part of every derived partition and id seed. */
+  readonly runScope: string;
   readonly fixture: FixtureFile;
   readonly tenantSlug: string;
   readonly tenantId: string;
@@ -429,14 +431,14 @@ class RunState {
   private readonly scopesById = new Map<string, ScopeRow>();
   private readonly scopesByKey = new Map<string, string>();
   /**
-   * Declared tenant slug -> the tenant uuid its scopes were actually created in.
+   * Declared fixture tenant -> the tenant uuid its scopes live in.
    *
-   * A fixture names tenants ("bench-p02"); the system stores uuids, and `Ledger`
-   * resolves them itself. Recording the mapping at prime time is what lets a
-   * candidate request a scope in a tenant the run writes to — the cross-tenant
-   * contamination fixture depends on exactly that, and guessing the uuid instead
-   * put the scope in a tenant the events were not in, which made a correct refusal
-   * look like a runner bug.
+   * `Ledger.append` derives the physical tenant from whatever the event's scope
+   * declares, so the run's own slug and a fixture's declared tenant are different
+   * physical partitions. Every declared tenant gets its own uuid here, which is
+   * what makes the cross-tenant contamination fixture meaningful: requested and
+   * event scopes really are in different tenants, and the gate's tenant guard has
+   * something to refuse.
    */
   private readonly tenantIdsBySlug = new Map<string, string>();
   private readonly eventsByLine = new Map<string, { event_id: string; seq: number; scope_id: string }>();
@@ -551,9 +553,13 @@ class RunState {
       // prefixes with `bench-` and a declared fixture tenant are different
       // namespaces, and the run only ever writes to the former. The declared slug
       // is still recorded so the fixture can name the scope it means.
+      // A declared fixture tenant is its own partition; the run's own slug is
+      // another. Anything the fixture names that is not the run's tenant gets a
+      // deterministic uuid derived from (run scope, declared tenant).
+      const tenantId = this.tenantIdFor(parsed.tenant);
       const scope = await this.withoutRequest((executor) =>
         ensureScope(executor, {
-          tenant: this.tenantId,
+          tenant: tenantId,
           ...(parsed.project !== null ? { project: parsed.project } : {}),
           ...(parsed.user !== null ? { user: parsed.user } : {}),
           ...(parsed.agent !== null ? { agent: parsed.agent } : {}),
@@ -562,8 +568,6 @@ class RunState {
         }),
       );
       this.rememberScope(scope, parsed.tenant);
-      this.tenantIdsBySlug.set(parsed.tenant, this.tenantId);
-      this.tenantIdsBySlug.set(slugifyTenant(parsed.tenant), this.tenantId);
     }
     // Scopes that already existed from an earlier run of the same fixture (a rerun
     // under the same seed) also have to be reachable.
@@ -592,6 +596,24 @@ class RunState {
         purpose: row.purpose,
       });
     }
+  }
+
+  /**
+   * The tenant uuid a declared fixture tenant resolves to.
+   *
+   * The run's own slug keeps the instance's random uuid so the run's rows are
+   * isolated per run; any other declared tenant is derived so a fixture's rival
+   * tenant is stable across runs of that fixture.
+   */
+  private tenantIdFor(declaredTenant: string): string {
+    const known = this.tenantIdsBySlug.get(declaredTenant);
+    if (known) return known;
+    const tenantId =
+      declaredTenant === this.deps.tenantSlug
+        ? this.tenantId
+        : uuidFromHash(`ledgerbench:tenant:${this.deps.runScope}:${declaredTenant}`);
+    this.tenantIdsBySlug.set(declaredTenant, tenantId);
+    return tenantId;
   }
 
   private rememberScope(scope: ResolvedScope, declaredSlug: string): void {
@@ -695,7 +717,7 @@ class RunState {
     if (found) return found;
     const scope = await this.withoutRequest((executor) =>
       ensureScope(executor, {
-        tenant: this.tenantId,
+        tenant: this.tenantIdFor(declaredTenant),
         ...(key.project !== null ? { project: key.project } : {}),
         ...(key.user !== null ? { user: key.user } : {}),
         ...(key.agent !== null ? { agent: key.agent } : {}),
@@ -775,10 +797,15 @@ class RunState {
       // tenant-wide binding: an ingress request must not inherit the analyzer's
       // reach, or the benchmark would be testing a write path that does not ship.
       const receipt = await this.deps.ledger.append(entry.event, { principal: entry.event.actor_id });
+      if (process.env["LEDGERBENCH_TRACE"] === "1") {
+        console.error(
+          `[append] declared=${JSON.stringify(entry.event.scope.tenant)} receiptTenant=${receipt.scope.tenant_id} ` +
+            `stateTenant=${this.tenantId} scope=${receipt.scope.scope_id}`,
+        );
+      }
       // The receipt is the only trustworthy statement about where the row landed.
       this.adoptTenant(receipt.scope.tenant_id);
       await this.learnScopes(this.tenantId);
-      this.tenantIdsBySlug.set(this.deps.tenantSlug, this.tenantId);
       this.eventsByLine.set(entry.line_id, {
         event_id: receipt.event_id,
         seq: receipt.seq,
@@ -787,7 +814,7 @@ class RunState {
       this.rememberScope(receipt.scope, entry.event.scope.tenant);
 
       if (entry.candidate) {
-        const requestedScopeId = this.requestedScopeFor(entry, entry.candidate);
+        const requestedScopeId = await this.requestedScopeFor(entry, entry.candidate);
         candidateId = await this.persistCandidate(receipt.event_id, entry, requestedScopeId);
         this.candidateByLine.set(entry.line_id, candidateId);
         const written = (this.spanCache.get(entry.line_id) ?? []) as (SpanRecord & {
@@ -846,17 +873,17 @@ class RunState {
    * event's purposes: purpose is a hard boundary and an empty set means
    * unreachable, so "unspecified" must never silently become "unrestricted".
    */
-  private requestedScopeFor(
+  private async requestedScopeFor(
     entry: Extract<FixtureBodyLine, { kind: "append_event" }>,
     candidate: FixtureCandidate,
-  ): string {
+  ): Promise<string> {
     if (!candidate.requested_scope) {
       const scopeId = this.eventsByLine.get(entry.line_id)?.scope_id;
       if (!scopeId) throw new Error("requested scope defaulted before the event scope was known");
       return scopeId;
     }
     const requested = candidate.requested_scope;
-    return this.scopeFor({
+    return await this.scopeFor({
       ...(requested.tenant !== undefined ? { tenant: requested.tenant } : {}),
       ...(requested.project !== undefined ? { project: requested.project } : {}),
       ...(requested.user !== undefined ? { user: requested.user } : {}),
@@ -2286,11 +2313,6 @@ export function resolveSpanRange(
   return { start: found, end: found + needle.byteLength };
 }
 
-/** The canonical form a tenant slug is stored under: lower case, punctuation collapsed. */
-function slugifyTenant(value: string): string {
-  return value.replace(/[^a-z0-9]+/gi, "-").toLowerCase();
-}
-
 /**
  * Tenant slug for a fixture run.
  *
@@ -2302,23 +2324,15 @@ export function tenantFor(seed: number, fixtureId: string, runScope = "default")
   return `bench-${fixtureId.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-${digest}`;
 }
 
-/**
- * The tenant UUID a fixture run actually writes under.
- *
- * This is `resolveTenantId` applied twice, and that is not a typo. `Ledger.append`
- * derives the tenant id from `request.scope.tenant` and then passes that UUID to
- * `ensureScope`, which resolves it *again* — so a caller that hands `append` the
- * slug `acme` ends up writing under `resolveTenantId(resolveTenantId("acme"))`,
- * and `tenants.slug` records the intermediate UUID rather than the slug.
- *
- * The benchmark has to agree with the system about where the rows are, or every
- * metric reads zero against a working system. The workaround is confined here;
- * the finding is reported rather than papered over, because the fix belongs in
- * `packages/ledger/src/ledger.ts` (pass the resolved UUID, not the slug, into
- * `ensureScope`), which is outside this package.
- */
-export function benchTenantId(slug: string): string {
-  return resolveTenantId(resolveTenantId(slug));
+
+/** A stable uuid for a (run, declared tenant) pair. Mirrors `resolveTenantId`'s shape. */
+function uuidFromHash(input: string): string {
+  const hash = createHash("sha256").update(input, "utf8").digest();
+  const bytes = Buffer.from(hash.subarray(0, 16));
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20, 32)].join("-");
 }
 
 function scopeKey(input: {
