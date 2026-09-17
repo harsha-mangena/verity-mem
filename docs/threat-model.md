@@ -562,12 +562,19 @@ evidence that two authorization bugs reached it at all.
   the logic reads correctly. But `forget()` binds `scopeIds: []` and `purposes: []`,
   and row-level security denies every row on an empty purpose set — so the scrub and
   the scan both observe nothing, and the job reports `verified` (see §6.1).
-- **Blob bytes are never reclaimed.** `RETENTION_STORES` names `events.blobs` and
-  the manifest counts it, but `packages/ledger/src/blobs.ts` has no delete path by
-  design. A payload stored out of line survives redaction on disk.
+- ~~**Blob bytes are never reclaimed.**~~ **Closed.** `BlobStore` now has `delete(ref)`
+  and `sweep()`, reclamation is reference-counted so a shared object survives until its
+  last authorized reference is gone, and the residual scan interrogates the physical
+  store rather than the database's own references. `delete` returns whether the object is
+  *verified absent*, not whether a delete was issued, and a store that cannot delete is
+  reported as residual rather than skipped.
 
-Until §6.1 is fixed, **do not tell anyone VerityMem can forget.** The system will
-agree with you, and it will be wrong.
+  What this does **not** cover, and the distinction matters for anyone reading the word
+  "verified": deletion is proven for the live stores this deployment declares. Backups,
+  replicas and point-in-time snapshots are outside it, which is why the specification
+  defers deletion-across-backups to v0.5 and why envelope encryption is not a v0.1
+  promise. A manifest from this system proves the live store is clean; it does not prove
+  the bytes are gone from everywhere they were ever copied.
 
 ### 5.5 Things this document is not
 
@@ -929,8 +936,9 @@ database, not reasoned about.
   `database` to `verified_record`, the strongest auto-accept class, so a caller that
   can reach the write path can self-declare the authority it needs. This is a
   constraint the authentication layer must impose; the packages cannot.
-- **Blob bytes are never reclaimed.** Redaction removes the ledger's reference and
-  the digest, but an out-of-line payload remains on disk in the blob store. Nothing
+- ~~**Blob bytes are never reclaimed.**~~ **Closed** — see Addendum 6. Redaction removes
+  the ledger's reference and the digest, and the object is now deleted from the physical
+  store once its last reference is gone. Historically: nothing
   in v0.1 can prove otherwise, which is precisely why the specification defers
   deletion-across-backups and crypto-shredding to v0.5. Until then, a retention
   manifest describes live stores only, and it says so.
@@ -1159,3 +1167,57 @@ would make the API an existence oracle for claims a caller cannot reach. For the
 **action gate** the caller is authenticated, is about to take a side effect, and cannot
 debug the refusal from the code alone. Whether that ambiguity should be preserved at the
 action gate is an open question, and it is flagged rather than resolved.
+
+---
+
+# Addendum 6 — physical blob reclamation (block B2)
+
+The missing-blocks assessment recorded this as P0: "The `BlobStore` contract has no
+deletion method, and physical reclamation is delegated to the operator… A job cannot
+claim complete live-store erasure while referenced bytes remain on disk." The earlier
+entry in this document went further and said not to tell anyone the system can forget.
+
+Both were right. An erase job cleared `events.payload_ref`, removed the claim
+projections, ran a residual scan **over database references**, found nothing, and
+reported `verified` — while the bytes sat on disk the whole time. The scan was the
+problem: asking the database whether it still points at a blob answers a question about
+the database.
+
+## What changed
+
+`BlobStore` gained two methods and a capability flag.
+
+- `delete(ref)` removes the object and returns whether it is **verified absent
+  afterwards**, not whether a delete was issued. `false` means the object survives, which
+  is the answer an erasure job must not round up.
+- `sweep()` enumerates what the store *physically holds*, so the residual scan
+  interrogates the backend.
+- `supportsDeletion` is `false` for a store that cannot remove objects. A store that
+  cannot delete **throws** rather than returning `false`, and a deployment on one reports
+  its objects as residual instead of skipping the check. "We could not look" and "we
+  looked and found nothing" must never render the same way.
+
+## The case that would have caused real damage
+
+A content-addressed store deduplicates. Two events with byte-identical payloads share one
+object, so clearing one event's reference removes a *reference* while the object remains
+live for the other holder. Deleting on the first detach would have destroyed a second
+subject's evidence and reported a successful erasure — data loss wearing an erasure
+costume.
+
+The manifest therefore makes three separate claims, and the assessment requires them to
+be separate: `references_removed`, `objects_deleted`, and `objects_retained_shared`. The
+reference count is taken *after* the payloads are cleared, so a ref still appearing in
+that result belongs to somebody else. Eight tests cover last-reference deletion, shared
+object retention, the count split, retry idempotency, an already-absent object, the
+store-versus-database scan inversion, and the filesystem store rather than only the
+in-memory stand-in.
+
+## What "verified" now means, stated precisely
+
+A manifest from this system proves that the **live stores it declares** hold no residual
+match for the subject. It does not prove the bytes are gone from everywhere they were
+ever copied: backups, replicas and point-in-time snapshots are outside the manifest's
+scope. That is why the specification defers deletion-across-backups to v0.5 and why
+envelope encryption is not a v0.1 promise — and why this section exists rather than a
+line claiming deletion is solved.
