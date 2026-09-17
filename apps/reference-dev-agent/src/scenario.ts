@@ -133,6 +133,8 @@ export interface ReferenceRun {
     readonly reason_codes: readonly string[];
     readonly instruction_matches: readonly string[];
     readonly accepted_claims: readonly string[];
+    /** Claim rows written as `proposed`: inspectable, and explicitly not believed. */
+    readonly proposed_claims: readonly string[];
     readonly quarantined_candidates: readonly string[];
   };
   readonly isolation: {
@@ -393,7 +395,8 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     content: HOSTILE_DOCUMENT,
   });
   const hostileWrites = await drainAndWindow(world, driver, hostileEvent.watermark);
-  const hostileAccepted = claimIdsOf(hostileWrites);
+  const hostileAccepted = acceptedClaimIdsOf(hostileWrites);
+  const hostileProposed = proposedClaimIdsOf(hostileWrites);
   const hostileDetail = await readHostileDetail(world, hostileWrites);
   record({
     step: 3,
@@ -406,8 +409,12 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
       instruction_matches: hostileDetail.instruction_matches,
       quarantined_candidates: hostileDetail.quarantined,
       accepted_claims: hostileAccepted,
+      // Claims that exist but hold no belief. Reported so the refusal is visible as a
+      // record rather than as an absence.
+      proposed_claims: hostileProposed,
       // The invariant, stated as a fact about this run rather than as a rule.
       accepted_claim_count: hostileAccepted.length,
+      proposed_claim_count: hostileProposed.length,
     },
   });
 
@@ -836,6 +843,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
       reason_codes: hostileWrites.flatMap((decision) => decision.reason_codes),
       instruction_matches: hostileDetail.instruction_matches,
       accepted_claims: hostileAccepted,
+      proposed_claims: hostileProposed,
       quarantined_candidates: hostileDetail.quarantined,
     },
     isolation: {
@@ -974,8 +982,39 @@ async function drainAndWindow(world: World, driver: WorkerDriver, since: number)
   return decisionsSince(world, since);
 }
 
+/**
+ * Claim ids produced by a set of decisions, split by whether they hold belief.
+ *
+ * The gate now writes a claim row for `needs_review` and `quarantine` outcomes too, with
+ * status `proposed` rather than `accepted`, so that a relation can reference it and
+ * `/explain` can show what was refused. A single list of "the claim ids" therefore
+ * conflates two different facts, and the field that reported it was called
+ * `accepted_claims` while containing claims that were explicitly not accepted — which
+ * made the quarantine step *look* like it had accepted three privileged claims when the
+ * database said `proposed` on all three.
+ *
+ * The outcome is the authority on whether belief was taken: `accept` and
+ * `accept_limited_scope` are the only two.
+ */
+const BELIEF_OUTCOMES: readonly string[] = ["accept", "accept_limited_scope"];
+
 function claimIdsOf(decisions: readonly DecisionRow[]): string[] {
   return decisions
+    .map((decision) => decision.claim_id)
+    .filter((claimId): claimId is string => claimId !== null);
+}
+
+function acceptedClaimIdsOf(decisions: readonly DecisionRow[]): string[] {
+  return decisions
+    .filter((decision) => BELIEF_OUTCOMES.includes(decision.outcome))
+    .map((decision) => decision.claim_id)
+    .filter((claimId): claimId is string => claimId !== null);
+}
+
+/** Claim rows written for an outcome that withheld belief. */
+function proposedClaimIdsOf(decisions: readonly DecisionRow[]): string[] {
+  return decisions
+    .filter((decision) => !BELIEF_OUTCOMES.includes(decision.outcome))
     .map((decision) => decision.claim_id)
     .filter((claimId): claimId is string => claimId !== null);
 }

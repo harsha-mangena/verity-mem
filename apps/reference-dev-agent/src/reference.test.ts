@@ -107,7 +107,12 @@ describe("reference workload: multi-agent software delivery", () => {
       !run.hostile.outcomes.includes("accept"),
       `no candidate from an external instruction may be accepted, saw ${run.hostile.outcomes.join(", ")}`,
     );
-    assert.deepEqual(run.hostile.accepted_claims, [], "the hostile document must create no claim at all");
+    // `accepted_claims` is what must be empty — the invariant is that the hostile
+    // document never produces a claim that holds belief. It is not that no row exists:
+    // a quarantined candidate now gets a claim row with status `proposed`, which is what
+    // lets an operator see what was refused, on what evidence, and why. A refusal that
+    // left no trace would be unauditable.
+    assert.deepEqual(run.hostile.accepted_claims, [], "the hostile document must create no accepted claim");
     assert.ok(
       run.hostile.quarantined_candidates.length > 0,
       "the decision record must show the quarantine, not just the absence of a claim",
