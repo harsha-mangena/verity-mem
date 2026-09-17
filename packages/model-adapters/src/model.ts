@@ -165,6 +165,99 @@ export class OllamaAdapter implements LlmAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// Anthropic
+// ---------------------------------------------------------------------------
+
+export interface AnthropicOptions {
+  readonly baseUrl: string;
+  readonly apiKey: string;
+  readonly model: string;
+  readonly version?: string;
+  readonly timeoutMs?: number;
+  readonly fetchImpl?: typeof fetch;
+}
+
+/**
+ * Anthropic Messages API adapter.
+ *
+ * The system prompt is a top-level field rather than a message, which is not a
+ * cosmetic difference: it is the only provider interface here that gives the
+ * instructions a structurally separate channel from the content. The extraction
+ * prompt deliberately keeps source content in the *user* turn and states that the
+ * fenced region is data, so the separation the API offers and the separation the
+ * prompt describes agree.
+ */
+export class AnthropicAdapter implements LlmAdapter {
+  readonly id: string;
+  readonly available: boolean;
+  private readonly options: AnthropicOptions;
+
+  constructor(options: AnthropicOptions) {
+    this.options = options;
+    this.id = `anthropic:${options.model}`;
+    this.available = options.apiKey.length > 0 && options.model.length > 0;
+  }
+
+  async complete(request: CompletionRequest): Promise<CompletionResponse> {
+    if (!this.available) {
+      throw new LlmUnavailableError("Anthropic adapter is not configured");
+    }
+    const doFetch = this.options.fetchImpl ?? fetch;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 30_000);
+    try {
+      const response = await doFetch(`${this.options.baseUrl.replace(/\/$/, "")}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": this.options.apiKey,
+          "anthropic-version": this.options.version ?? "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: this.options.model,
+          max_tokens: request.max_output_tokens ?? 1200,
+          temperature: request.temperature ?? 0,
+          system: request.system,
+          messages: [{ role: "user", content: request.user }],
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new LlmUnavailableError(
+          `anthropic returned ${response.status}: ${(await response.text()).slice(0, 300)}`,
+        );
+      }
+      const body = (await response.json()) as {
+        model?: string;
+        content?: { type: string; text?: string }[];
+        usage?: { input_tokens?: number; output_tokens?: number };
+      };
+      // Only text blocks are joined. A response that is entirely tool-use blocks
+      // yields an empty string, which the extractor's parser treats as "no claims"
+      // rather than as a malformed claim.
+      const text = (body.content ?? [])
+        .filter((block) => block.type === "text" && typeof block.text === "string")
+        .map((block) => block.text as string)
+        .join("\n");
+      return {
+        text,
+        model: body.model ?? this.options.model,
+        ...(body.usage
+          ? {
+              usage: {
+                ...(body.usage.input_tokens !== undefined ? { input_tokens: body.usage.input_tokens } : {}),
+                ...(body.usage.output_tokens !== undefined ? { output_tokens: body.usage.output_tokens } : {}),
+              },
+            }
+          : {}),
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Deterministic offline stand-in
 // ---------------------------------------------------------------------------
 

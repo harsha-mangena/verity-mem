@@ -226,22 +226,21 @@ export class MemoryFacade {
     if (options.client !== undefined) {
       this.client = options.client;
     } else {
-      const clientOptions: ConstructorParameters<typeof VerityMemClient>[0] = {
+      this.client = new VerityMemClient({
         baseUrl: options.baseUrl ?? DEFAULT_BASE_URL,
-      };
-      if (options.token !== undefined) (clientOptions as { token?: string }).token = options.token;
-      if (options.adminToken !== undefined) (clientOptions as { adminToken?: string }).adminToken = options.adminToken;
-      if (options.fetch !== undefined) (clientOptions as { fetch?: unknown }).fetch = options.fetch;
-      this.client = new VerityMemClient(clientOptions);
+        ...(options.token === undefined ? {} : { token: options.token }),
+        ...(options.adminToken === undefined ? {} : { adminToken: options.adminToken }),
+        ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+      });
     }
     this.defaults = {
       tenant: options.tenant ?? "default",
       actorId: options.actorId ?? DEFAULT_ACTOR,
       purpose: options.purpose ?? DEFAULT_PURPOSE,
       ...(options.project === undefined ? {} : { project: options.project }),
-      ...(options.userId === undefined ? {} : { userId: options.userId }),
-      ...(options.agentId === undefined ? {} : { agentId: options.agentId }),
-      ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+      ...(options.userId === undefined ? {} : { user: options.userId }),
+      ...(options.agentId === undefined ? {} : { agent: options.agentId }),
+      ...(options.sessionId === undefined ? {} : { session: options.sessionId }),
     };
   }
 
@@ -397,6 +396,13 @@ export class MemoryFacade {
    * their originating event — until a decision appears. Polling is bounded and a
    * timeout is reported as `pending_extraction`, never as success: an unanswered
    * gate is not an accepted claim.
+   *
+   * The poll reads the decision off a `promotion` object on the candidate
+   * response. `ClaimCandidate` in `packages/contracts` does not include that
+   * object, so this is the facade's one dependency on a server response field the
+   * contracts do not freeze. When it is absent the outcome is reported as
+   * `unresolved`, never guessed, and `packages/sdk-ts/src/sdk.test.ts` pins that
+   * behaviour.
    */
   private async promotionFor(
     appended: EventAppendResponse,
@@ -461,10 +467,21 @@ export class MemoryFacade {
  *
  * Exhaustive over `DecisionOutcome` so that adding an outcome to the contract is
  * a compile error here rather than an unlabelled pass-through.
+ *
+ * The parameter is structurally open (`[key: string]: unknown`) because the
+ * server attaches the decision to this response and `ClaimCandidate` in
+ * `packages/contracts` does not describe it yet. An open shape here records that
+ * uncertainty instead of asserting a field the contracts have not frozen.
  */
 function promotionFromDecision(candidate: {
-  readonly promotion?: { readonly outcome?: string | null; readonly reason_codes?: readonly string[]; readonly policy_version?: string | null; readonly claim_id?: string | null };
+  readonly promotion?: {
+    readonly outcome?: string | null;
+    readonly reason_codes?: readonly string[];
+    readonly policy_version?: string | null;
+    readonly claim_id?: string | null;
+  };
   readonly claim_id?: string | null;
+  readonly [key: string]: unknown;
 }): FacadePromotion {
   const outcome = candidate.promotion?.outcome ?? null;
   const reasonCodes = candidate.promotion?.reason_codes ?? [];

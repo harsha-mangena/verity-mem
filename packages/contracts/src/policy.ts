@@ -6,6 +6,7 @@
  * answer back, which is the only way "why did the system believe this in March?"
  * has a real answer.
  */
+import { type Static, Type } from "@sinclair/typebox";
 
 /**
  * Claim kinds that can never be auto-accepted, whatever their evidence says.
@@ -68,6 +69,34 @@ export const GATE_THRESHOLDS: GateThresholds = {
   reviewBurdenCeiling: 0.02,
   lexicalEntailmentFloor: 0.6,
 };
+
+/**
+ * The commit policy as data, for the API surface.
+ *
+ * `GET /v1/claims/{id}/explain` hands the policy that governed a promotion back to
+ * the caller, so the shape has to be expressible as a schema rather than only as a
+ * TypeScript interface. The interface above remains the type the engine is written
+ * against; this is its wire form, and `DEFAULT_COMMIT_POLICY` is asserted to
+ * satisfy both so the two cannot diverge silently.
+ */
+export const CommitPolicySchema = Type.Object(
+  {
+    version: Type.String(),
+    quarantineKinds: Type.Array(Type.String()),
+    autoAcceptAuthorities: Type.Array(Type.String()),
+    stalenessHorizonDays: Type.Record(Type.String(), Type.Number()),
+    thresholds: Type.Object(
+      {
+        entailmentFloor: Type.Number(),
+        reviewBurdenCeiling: Type.Number(),
+        lexicalEntailmentFloor: Type.Number(),
+      },
+      { additionalProperties: false },
+    ),
+  },
+  { $id: "CommitPolicy", additionalProperties: false },
+);
+export type CommitPolicyDocument = Static<typeof CommitPolicySchema>;
 
 export interface CommitPolicy {
   readonly version: string;

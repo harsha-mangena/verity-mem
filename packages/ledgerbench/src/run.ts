@@ -157,8 +157,6 @@ export interface LineResult {
   readonly seq?: number;
   readonly candidate_id?: string;
   readonly error?: string;
-  /** Present only on an errored line; kept so a failure is diagnosable without a rerun. */
-  readonly error_stack?: string | null;
   readonly assertions: readonly AssertionRecord[];
 }
 
@@ -323,16 +321,12 @@ export class FixtureRunner {
     // had not written. A fixture tenant is a physical partition, not a name; the
     // name is only used for scope resolution inside the run.
     const tenantId = randomUUID();
-    if (process.env["LEDGERBENCH_TRACE"] === "1") {
-      console.error(`[run] slug=${tenantSlug} runScope=${this.runScope} predictedTenant=${tenantId}`);
-    }
     const clock = fixedClock(this.options.clockStart ?? "2026-09-17T12:00:00.000Z");
     // Ids are seeded from the run instance, not from the run scope. See `runToken`:
     // pinning the ids to a reusable scope is what makes a rerun collide with its
     // predecessor. The sequence inside a run stays deterministic, which is what the
     // replay metric compares.
     const idSeed = `ledgerbench:${seed}:${this.runScope}:${this.runToken}:${fixture.header.fixture_id}`;
-    if (process.env["LEDGERBENCH_TRACE"] === "1") console.error(`[run] idSeed=${idSeed}`);
     const ids = seededIds(idSeed);
     const blobs = new MemoryBlobStore();
     const ledger = new Ledger({ db, blobs, clock, ids });
@@ -523,9 +517,6 @@ class RunState {
    * any claim is written: the append is the first thing a fixture does.
    */
   private adoptTenant(tenantId: string): void {
-    if (process.env["LEDGERBENCH_TRACE"] === "1") {
-      console.error(`[adopt] predicted=${this.tenantId} actual=${tenantId}`);
-    }
     if (tenantId === this.tenantId) return;
     this.tenantId = tenantId;
     this.scopesById.clear();
@@ -848,12 +839,6 @@ class RunState {
       // reach, or the benchmark would be testing a write path that does not ship.
       const request = this.runScoped(entry);
       const receipt = await this.deps.ledger.append(request, { principal: request.actor_id });
-      if (process.env["LEDGERBENCH_TRACE"] === "1") {
-        console.error(
-          `[append] declared=${JSON.stringify(entry.event.scope.tenant)} receiptTenant=${receipt.scope.tenant_id} ` +
-            `stateTenant=${this.tenantId} scope=${receipt.scope.scope_id}`,
-        );
-      }
       // The receipt is the only trustworthy statement about where the row landed.
       this.adoptTenant(receipt.scope.tenant_id);
       await this.learnAllScopes();
@@ -909,8 +894,7 @@ class RunState {
         kind: entry.kind,
         outcome: "error",
         ...(candidateId !== undefined ? { candidate_id: candidateId } : {}),
-        error: `${(error as Error).message}`,
-        error_stack: (error as Error).stack ?? null,
+        error: (error as Error).message,
         assertions,
       });
     }
@@ -1152,8 +1136,7 @@ class RunState {
         line_id: entry.line_id,
         kind: entry.kind,
         outcome: "error",
-        error: `${(error as Error).message}`,
-        error_stack: (error as Error).stack ?? null,
+        error: (error as Error).message,
         assertions,
       });
     }
@@ -1252,8 +1235,7 @@ class RunState {
         line_id: entry.line_id,
         kind: entry.kind,
         outcome: "error",
-        error: `${(error as Error).message}`,
-        error_stack: (error as Error).stack ?? null,
+        error: (error as Error).message,
         assertions,
       });
     }
@@ -1341,8 +1323,7 @@ class RunState {
         line_id: entry.line_id,
         kind: entry.kind,
         outcome: "error",
-        error: `${(error as Error).message}`,
-        error_stack: (error as Error).stack ?? null,
+        error: (error as Error).message,
         assertions,
       });
     }
@@ -1545,16 +1526,7 @@ class RunState {
     }
     // An assertion evaluated before any claim read sees the live set: it is the
     // best available answer, and returning [] would fabricate a failure.
-    const chosen = snapshot.length > 0 ? snapshot : this.claims;
-    if (process.env["LEDGERBENCH_DEBUG_SNAPSHOT"] === "1") {
-      console.error(
-        `[snapshot] line=${targetId} targetIndex=${targetIndex} history=${JSON.stringify(
-          this.claimHistory.map((point) => ({ i: point.lineIndex, n: point.claims.length })),
-        )} chosen=${chosen.length} ` +
-          JSON.stringify(chosen.map((c) => `${c.claim_id.slice(-4)} ${c.subject}|${c.predicate} [${c.status}]`)),
-      );
-    }
-    return chosen;
+    return snapshot.length > 0 ? snapshot : this.claims;
   }
 
   private async checkExpectation(
@@ -1996,12 +1968,6 @@ class RunState {
   /** Read the run's claims through the real span verification path. */
   async refreshClaims(): Promise<void> {
     this.claims = await this.inTenant((executor) => this.selectClaims(executor, {}));
-    if (process.env["LEDGERBENCH_TRACE"] === "1") {
-      console.error(
-        `[refresh] tenant=${this.tenantId} scopes=${this.allScopeIds().length} claims=${this.claims.length} ` +
-          JSON.stringify(this.claims.map((c) => `${c.claim_id.slice(-4)} ${c.subject}|${c.predicate}|${JSON.stringify(c.object)} [${c.status}]`)),
-      );
-    }
     this.claimHistory.push({ lineIndex: this.lineIndex, claims: this.claims });
     this.relations = await this.inTenant(async (executor) => {
       const result = await executor.query<{ from_claim: string; to_claim: string; rel: string }>(

@@ -33,6 +33,10 @@ export interface Env {
     readonly apiKey: string | null;
     readonly model: string | null;
     readonly ollamaBaseUrl: string | null;
+    readonly ollamaModel: string | null;
+    readonly anthropicApiKey: string | null;
+    readonly anthropicModel: string | null;
+    readonly anthropicBaseUrl: string;
   };
   readonly gate: {
     readonly backend: "lexical" | "onnx";
@@ -124,6 +128,10 @@ export function loadEnv(overrides: Partial<Record<string, string>> = {}): Env {
       apiKey: get("OPENAI_API_KEY") ?? null,
       model: get("OPENAI_MODEL") ?? null,
       ollamaBaseUrl: get("OLLAMA_BASE_URL") ?? null,
+      ollamaModel: get("OLLAMA_MODEL") ?? null,
+      anthropicApiKey: get("ANTHROPIC_API_KEY") ?? null,
+      anthropicModel: get("ANTHROPIC_MODEL") ?? null,
+      anthropicBaseUrl: get("ANTHROPIC_BASE_URL") ?? "https://api.anthropic.com",
     },
     gate: {
       backend: (get("GATE_ENTAILMENT_BACKEND") ?? "lexical") === "onnx" ? "onnx" : "lexical",

@@ -6,6 +6,7 @@
  * poisoning fixtures and the gate calibration loop all read these strings, so an
  * ad-hoc code is an unmeasured decision.
  */
+import { Type } from "@sinclair/typebox";
 export const REASON_CODES = {
   // ---- span and evidence integrity (deterministic, pre-model) -------------
   SPAN_RESOLVED: "span.resolved",
@@ -94,6 +95,18 @@ const REASON_CODE_SET = new Set<string>(REASON_CODE_VALUES);
 export function isKnownReasonCode(code: string): boolean {
   return REASON_CODE_SET.has(code);
 }
+
+/**
+ * The reason-code registry, exposed as a schema.
+ *
+ * `GET /v1/claims/{id}/explain` returns a `reason_help` map and clients validate
+ * against it, so the registry needs a runtime form. It is derived from the same
+ * `REASON_CODES` object the engine reads — never a parallel list — so a code that
+ * exists in one and not the other remains impossible. The object is non-empty by
+ * construction, which matters because a `Type.Union` of zero literals throws at
+ * module load.
+ */
+export const ReasonCodeSchema = Type.Union(Object.values(REASON_CODES).map((code) => Type.Literal(code)));
 
 /**
  * Human-readable explanations, surfaced by /explain so an operator is never
