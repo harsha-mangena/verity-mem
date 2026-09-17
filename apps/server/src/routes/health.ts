@@ -86,10 +86,40 @@ export function registerHealthRoutes(app: FastifyInstance, options: HealthRouteO
           : "the configured entailment backend is unavailable; the gate degrades to needs_review rather than to ungated",
       });
 
+      // The embedding projection is reported because a reader/writer model mismatch makes the
+      // dense channel return zero rows with no error — indistinguishable, to a caller, from an
+      // authorization denial. An operator should learn it here rather than from a support
+      // ticket about "memory quality".
+      let projection: unknown = null;
+      try {
+        const { projectionSummary } = await import("@veritymem/retrieval");
+        projection = await projectionSummary({
+          db: deps.db,
+          embeddings: {
+            model_id: deps.embeddings.model_id,
+            dimensions: deps.embeddings.dimensions,
+            isModelCall: deps.embeddings.isModelCall,
+          },
+        });
+        const summary = projection as { compatible: boolean; detail: string };
+        checks.push({
+          name: "embedding_projection",
+          ok: summary.compatible,
+          detail: summary.compatible ? null : summary.detail,
+        });
+      } catch (error) {
+        checks.push({
+          name: "embedding_projection",
+          ok: false,
+          detail: error instanceof Error ? error.message : "projection summary unavailable",
+        });
+      }
+
       const ready = checks.every((check) => check.ok);
       await reply.code(ready ? 200 : 503).send({
         status: ready ? "ready" : "not_ready",
         checks,
+        embedding_projection: projection,
         gate: {
           backend: deps.entailment.name,
           is_model_call: deps.entailment.isModelCall,

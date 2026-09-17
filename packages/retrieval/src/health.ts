@@ -165,3 +165,62 @@ export async function healthCheck(
       : "ok";
   return { status, findings };
 }
+
+
+/**
+ * A cluster-wide summary of the embedding projection, for an unauthenticated readiness
+ * endpoint.
+ *
+ * Deliberately a *summary* rather than per-tenant findings. `/readyz` carries no identity, so
+ * it cannot scope a query to one tenant, and a readiness endpoint that enumerated tenants
+ * would disclose the shape of a multi-tenant deployment to anyone who can reach it. What an
+ * operator needs from this endpoint is "is anything misconfigured", and that is answerable
+ * as a comparison between the configured model and the distinct models the projections were
+ * written by.
+ */
+export interface ProjectionSummary {
+  readonly configured_model_id: string;
+  readonly configured_dimensions: number;
+  /** The distinct models the dense projections in this cluster were written by, with counts. */
+  readonly written_by: readonly { readonly model_id: string | null; readonly tenants: number }[];
+  /** True when every recorded projection matches the configured reader. */
+  readonly compatible: boolean;
+  readonly detail: string;
+}
+
+export async function projectionSummary(dependencies: HealthDependencies): Promise<ProjectionSummary> {
+  // A system context is not needed and is not available here: the application role can read
+  // `projection_versions` for its own tenant only, and this endpoint has no tenant. The query
+  // therefore reports on whatever the connection's scope admits, which for an unauthenticated
+  // request is nothing, and the summary says so rather than implying a measurement it did not
+  // make.
+  const rows = await dependencies.db
+    .systemQuery<{ model_id: string | null; tenants: number }>(
+      `SELECT model_version AS model_id, count(*)::int AS tenants
+         FROM projection_versions
+        WHERE projection = 'dense' AND tenant_id IS NOT NULL
+        GROUP BY model_version
+        ORDER BY tenants DESC`,
+    )
+    .catch(() => ({ rows: [] as { model_id: string | null; tenants: number }[] }));
+
+  const writtenBy = rows.rows;
+  const mismatched = writtenBy.filter(
+    (row) => row.model_id !== null && row.model_id !== dependencies.embeddings.model_id,
+  );
+  const compatible = mismatched.length === 0;
+
+  return {
+    configured_model_id: dependencies.embeddings.model_id,
+    configured_dimensions: dependencies.embeddings.dimensions,
+    written_by: writtenBy,
+    compatible,
+    detail: compatible
+      ? writtenBy.length === 0
+        ? "no dense projection recorded; the dense channel contributes nothing until a rebuild runs."
+        : "every recorded dense projection was written by the configured embedding model."
+      : `${mismatched.reduce((sum, row) => sum + row.tenants, 0)} projection(s) were written by a ` +
+        `different embedding model. The dense channel returns zero rows for those tenants and the ` +
+        `empty result looks like an authorization denial. Rebuild with POST /v1/replay, mode=rebuild.`,
+  };
+}

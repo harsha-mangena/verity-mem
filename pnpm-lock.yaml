@@ -189,6 +189,9 @@ importers:
       '@veritymem/ledger':
         specifier: workspace:*
         version: link:../ledger
+      '@veritymem/retrieval':
+        specifier: workspace:*
+        version: link:../retrieval
       pg:
         specifier: 8.16.3
         version: 8.16.3

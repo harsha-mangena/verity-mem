@@ -26,8 +26,11 @@ import {
   GATE_THRESHOLDS,
   REASON_CODES,
   isKnownReasonCode,
+  type ActionGateRequest,
+  type ActionRisk,
   type ClaimKind,
   type EventAppendRequest,
+  type MemoryPacket,
   type OriginKind,
 } from "@veritymem/contracts";
 import {
@@ -52,6 +55,7 @@ import {
   type ResolvedScope,
   type SpanRecord,
 } from "@veritymem/ledger";
+import { compose, evaluateAction, HashEmbeddingBackend, type ComposeResult } from "@veritymem/retrieval";
 import { FixtureParseError } from "./errors.ts";
 import {
   type EraseMode,
@@ -59,6 +63,8 @@ import {
   type FixtureBodyLine,
   type FixtureCandidate,
   type FixtureFile,
+  type FixtureQuery,
+  type FixtureRelevance,
   type FixtureSpan,
   type ResolveOutcome,
 } from "./types.ts";
@@ -147,6 +153,89 @@ export interface RelationRow {
   readonly rel: string;
 }
 
+/**
+ * A claim the packet returned, reduced to what the read-path stages score.
+ *
+ * `entailment` is recomputed by the benchmark against the production verifier rather
+ * than copied from the packet, because the packet's own `entailment` field comes from
+ * the compose path, which sets it from digest resolution alone. Scoring composition
+ * with the composer's own claim would be scoring the composer against itself.
+ */
+export interface ReturnedClaimRecord {
+  readonly claim_id: string;
+  readonly kind: string;
+  readonly statement: { readonly subject: string; readonly predicate: string; readonly object: unknown };
+  readonly status: string;
+  readonly use: string;
+  readonly use_reason_codes: readonly string[];
+  readonly evidence_count: number;
+  readonly resolvable_evidence: number;
+  /** Null when no evidence resolved, so nothing could be tested against the verifier. */
+  readonly entailment: string | null;
+  readonly entailment_score: number | null;
+  readonly entailment_backend: string | null;
+}
+
+/** Claims a declared matcher matched in a packet, with the fixture's own reason. */
+export interface QueryMatchHit {
+  readonly reason: string;
+  readonly claim_ids: readonly string[];
+}
+
+/**
+ * One executed query and what the read path answered.
+ *
+ * The raw packet travels with the outcome so every read-path metric can be
+ * recomputed from the artifact without re-running the benchmark, and so a reader can
+ * check the runner's arithmetic against the bytes it was given.
+ */
+export interface QueryOutcome {
+  readonly query_id: string;
+  readonly fixture_id: string;
+  readonly line_id: string;
+  readonly text: string;
+  readonly principal: string;
+  readonly purpose: string;
+  /** True when the fixture declares the memory holds an answer to this query. */
+  readonly has_answer: boolean | null;
+  readonly limit: number;
+  readonly decision: string;
+  readonly decision_reason_codes: readonly string[];
+  readonly returned: readonly ReturnedClaimRecord[];
+  readonly missing: readonly string[];
+  readonly candidates_considered: number;
+  readonly candidates_denied_by_authz: number;
+  readonly channels_used: readonly string[];
+  readonly plan_denied_dimensions: readonly string[];
+  readonly latency_ms: number;
+  readonly relevant: readonly QueryMatchHit[];
+  readonly stale: readonly QueryMatchHit[];
+  readonly absent: readonly QueryMatchHit[];
+  /** Non-empty when the query could not be issued as declared. */
+  readonly defects: readonly string[];
+}
+
+/**
+ * One action-gate evaluation.
+ *
+ * `claims_resolved` and `claims_declared` are both recorded because an action gate
+ * asked about a claim that does not exist fails closed and *looks* like a correct
+ * refusal. Without the two counts side by side, an unsafe-allow rate of zero could
+ * mean "the gate is safe" when it means "the fixture never built a claim".
+ */
+export interface ActionGateRecord {
+  readonly fixture_id: string;
+  readonly line_id: string;
+  readonly action: string;
+  readonly action_risk: string;
+  readonly verdict: string;
+  readonly allowed: boolean;
+  readonly reason_codes: readonly string[];
+  readonly claims_resolved: number;
+  readonly claims_declared: number;
+  readonly defects: readonly string[];
+}
+
 export interface LineResult {
   readonly file: string;
   readonly line: number;
@@ -192,6 +281,17 @@ export interface FixtureRunResult {
   }[];
   readonly ledger_row_count: number;
   readonly residual: Readonly<Record<string, number>> | null;
+  /**
+   * Every query this fixture declared, with the packet the read path produced.
+   *
+   * Empty is a fact about the fixture, and the read-path stages report it as
+   * `no_data` rather than as a zero: a fixture that declares no query measures no
+   * retrieval, and a benchmark that averaged over it would report a rate over a
+   * denominator it invented.
+   */
+  readonly queries: readonly QueryOutcome[];
+  /** Every action the fixture asked the gate to judge, with the verdict it returned. */
+  readonly action_gates: readonly ActionGateRecord[];
   readonly assertions_total: number;
   readonly assertions_passed: number;
   readonly assertions_failed: number;
@@ -394,6 +494,8 @@ export class FixtureRunner {
       grants: state.grants,
       ledger_row_count: state.ledgerRowCount,
       residual,
+      queries: state.queryOutcomes,
+      action_gates: state.actionGateOutcomes,
       assertions_total: allAssertions.length,
       assertions_passed: allAssertions.filter((entry) => entry.status === "pass").length,
       assertions_failed: allAssertions.filter((entry) => entry.status === "fail").length,
@@ -513,6 +615,19 @@ class RunState {
   decisionRecords: DecisionRecord[] = [];
   ledgerRowCount = 0;
   residual: Record<string, number> = {};
+  /** Read-path outcomes, in the order the fixture declared them. */
+  queryOutcomes: QueryOutcome[] = [];
+  /** Action-gate verdicts, in declaration order. */
+  actionGateOutcomes: ActionGateRecord[] = [];
+  /**
+   * The packet a query on a line produced, keyed by line id.
+   *
+   * `expect_missing` and `expect_abstain` are assertions about a packet, and the
+   * packet is produced by the line they sit on. Keying by line rather than passing it
+   * through the assertion call keeps `checkExpectation` free of read-path state: an
+   * assertion that needed a packet argument would silently need one for every caller.
+   */
+  private readonly packetByLine = new Map<string, QueryOutcome>();
 
   constructor(deps: RunStateDeps, blobs: MemoryBlobStore) {
     this.deps = deps;

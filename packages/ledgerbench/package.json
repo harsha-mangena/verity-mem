@@ -17,6 +17,7 @@
     "@veritymem/contracts": "workspace:*",
     "@veritymem/gate": "workspace:*",
     "@veritymem/ledger": "workspace:*",
+    "@veritymem/retrieval": "workspace:*",
     "pg": "8.16.3"
   },
   "devDependencies": {
