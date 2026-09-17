@@ -238,18 +238,19 @@ export async function callerReach(
 /**
  * Read one object inside a bound request context, or report that it is not there.
  *
- * Two sequential transactions, deliberately not nested. The first discovers the
- * caller's reach — membership plus live grants — and the second performs the read
- * with that reach bound. Nesting them would check a second connection out of the
- * pool while the first is held, and with a pool of N, N concurrent requests would
- * deadlock: every request holding an outer connection and waiting for an inner one.
- * That failure mode is invisible in a single-request test and appears as an
- * unexplained hang under load, so the shape is avoided structurally rather than
- * documented.
+ * One transaction, with the caller's reach bound into it exactly once. The reach is
+ * discovered on a separate pooled connection beforehand (see `discoverReach`) rather
+ * than in a nested transaction, and that is a correctness requirement rather than an
+ * optimisation: `veritymem.set_request_context` writes transaction-local GUCs, so a
+ * nested `withRequest` does not shadow the outer binding — it *overwrites* it for the
+ * remainder of the outer transaction. A handler that discovered its reach inside its
+ * own transaction would therefore run its real query under the discovery binding,
+ * which has no scopes and no purposes, and every row would vanish. The symptom is a
+ * 404 on an object that demonstrably exists.
  *
- * The binding carries the caller's reachable scope ids *and* the purposes those
- * scopes hold. Both are required: the predicate denies an empty purpose set, so a
- * read bound without purposes returns nothing even for rows the caller holds. See
+ * The binding carries the caller's reachable scope ids *and* the purposes those scopes
+ * hold. Both are required: the predicate denies an empty purpose set, so a read bound
+ * without purposes returns nothing even for rows the caller holds. See
  * `CallerReach.purposes`.
  */
 export async function withReadContext<T>(
@@ -299,31 +300,25 @@ export async function withWriteContext<T>(
 }
 
 /**
- * Discover reach in its own short transaction.
+ * Discover the caller's reach on its own pooled connection.
  *
- * `action: "api:reach"` rather than `"api:read"`: the trace of what a request did
- * should show that one round trip resolved authorization and did not touch claim
- * data, which is the property the whole read path depends on.
+ * This is the one place the server reads tenant-scoped tables outside
+ * `withRequest`, and the exception is narrow enough to state precisely. `systemQuery`
+ * clears the session context before and after, and `tenant_id` is passed as a bound
+ * parameter, so the queries are correct rather than relying on the policies:
+ * `principal_scopes`, `grants` and `scopes` are all tenant-keyed with no scope column,
+ * and their policies (`principal_scopes_own`, `grants_authorized`, `scopes_tenant`)
+ * are predicates over the tenant alone. There is no scope dimension for a request
+ * context to bind, and therefore no row these queries can reach that a
+ * `withRequest` binding would have excluded. It cannot read an event or a claim: those
+ * tables are guarded by the predicate whose inputs this function exists to compute.
+ *
+ * The alternative — a nested `withRequest` — is not available, because the GUCs are
+ * transaction-local and an inner binding overwrites the outer one.
  */
 async function discoverReach(deps: ServerDeps, caller: TenantContext): Promise<CallerReach> {
   const now = deps.clock.now().toISOString();
-  // The discovery transaction binds no scope and no purpose, and that is safe rather
-  // than convenient: it reads `principal_scopes`, `grants` and `scopes`, none of which
-  // carries claim content, and `scopes` is deliberately readable within the tenant
-  // because resolving a scope *is* part of authorization. It cannot read an event or a
-  // claim, because those tables are guarded by the predicate whose inputs this
-  // transaction exists to compute.
-  return deps.db.withRequest(
-    {
-      tenant: caller.tenantId,
-      principal: caller.principal,
-      scopeIds: [],
-      purposes: [],
-      action: "api:reach",
-    },
-    async (executor) => callerReach(executor, { tenantId: caller.tenantId, principal: caller.principal, now }),
-    { readOnly: true },
-  );
+  return callerReach(deps.db, { tenantId: caller.tenantId, principal: caller.principal, now });
 }
 
 /**

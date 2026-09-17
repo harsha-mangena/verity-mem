@@ -420,7 +420,7 @@ injection.
 | Instruction-like content recorded on the decision | Yes | `GateResult.detail.instruction_flagged`, `instruction_matches` |
 | Retrieved memory returned as structured data with provenance | **Yes** | `MemoryPacket` → `PacketClaim` → `PacketEvidence`, with `event_id`, `span_id`, `start`, `end`, `quote`, `digest`, `digest_ok` per evidence item and `use` + `use_reason_codes` per claim |
 | Model-ready prose is optional and accompanied by machine-readable evidence | **Yes, by omission** | There is no prose renderer at all. `MemoryPacket` has no prose field, so this cannot be violated by the read path |
-| A function that composes a prompt from a packet, with escalation | **No** | Does not exist. Nothing turns a packet into a prompt |
+| A function that composes a prompt from a packet, with escalation | **Yes** | `renderPacketForModel` in `packages/mcp-server/src/render.ts`. Every `<` in stored content is replaced with U+2039 so no payload line can begin with `<<<`; each render uses a fresh nonce; `findRenderViolations` re-derives the invariant from the rendered text and a violated render is refused rather than emitted |
 
 ### 4.4 Residual risk, stated plainly
 
@@ -969,3 +969,32 @@ shows its work.
 
 The earlier failures were real and are described above; none were suppressed to make
 the suite green.
+
+
+---
+
+# Addendum 2 — a claim in this document that became false
+
+§4.3/T9 previously recorded, in the capability table, that a function composing a
+prompt from a packet does **not** exist. That was true when written and is no longer
+true: `renderPacketForModel` in `packages/mcp-server/src/render.ts` is exactly that
+function, and it implements the control §4.4 asked for rather than merely existing.
+
+The row has been corrected in place *and* recorded here, because a threat model is a
+claim about a moment in time. Silently editing a row would leave a reader unable to
+tell whether the document was always right or was quietly repaired after the fact —
+and the second is far more useful to know.
+
+What the function does, so the correction can be checked rather than trusted:
+
+- every `<` in stored content is replaced with U+2039, so no payload line can begin
+  with the `<<<` fence marker;
+- each render uses a fresh nonce, so a stored string cannot guess the delimiter;
+- `findRenderViolations` re-derives the invariant from the rendered text and returns
+  the lines that break it;
+- a render that violates the invariant is **refused**, not emitted with a warning.
+
+The residual exposure is unchanged and worth restating: this protects the *packet*
+rendering path. It does not protect a caller that builds its own prompt from the
+packet's fields, and nothing in the system can prevent that — which is why the
+adapter contract says to pass the packet, not snippets.

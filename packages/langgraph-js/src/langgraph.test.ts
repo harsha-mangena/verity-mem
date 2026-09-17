@@ -699,7 +699,7 @@ describe("ClaimBackedStore over the REST surface", () => {
       () => store.search(["tenant:acme", "user:alice", "purpose:a", "purpose:b"], { filter: { query: "x" } }),
       (error: unknown) => error instanceof ScopeViolationError && error.code === "ambiguous_purpose",
     );
-    assert.deepEqual(harness.requests, []);
+    assert.equal(harness.requests.length, 0, "no request may be made for a refused operation");
   });
 
   it("reports batch failures instead of dropping them", async () => {
@@ -865,7 +865,7 @@ describe("gate_action raises on a denied action", () => {
         ),
       (error: unknown) => error instanceof ScopeViolationError && error.code === "no_claims",
     );
-    assert.deepEqual(harness.requests, []);
+    assert.equal(harness.requests.length, 0, "no request may be made for a refused operation");
 
     await assert.rejects(
       () => gateAction({}, { client: harness.client, scope: SCOPE, purpose: "release_planning", actor_id: "agent:planner" }),
@@ -974,7 +974,7 @@ describe("afterRun proposes rather than accepts", () => {
           .propose_claims({ transcript: [{ role: "user", content: "hi" }] }),
       /no run id/,
     );
-    assert.deepEqual(harness.requests, []);
+    assert.equal(harness.requests.length, 0, "no request may be made for a refused operation");
   });
 });
 
@@ -1010,7 +1010,7 @@ describe("recall and observation hooks", () => {
       () => beforeRun({ client: harness.client }, { query: "q", scope: SCOPE, purpose: "hr_review" }),
       (error: unknown) => error instanceof ScopeViolationError && error.code === "purpose_not_in_scope",
     );
-    assert.deepEqual(harness.requests, []);
+    assert.equal(harness.requests.length, 0, "no request may be made for a refused operation");
   });
 
   it("records tool identity, both hashes and the side-effect status", async () => {
