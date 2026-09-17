@@ -41,7 +41,11 @@ interface UnigramPiece {
 interface TokenizerJson {
   readonly normalizer?: { readonly type?: string; readonly normalizers?: readonly NormalizerNode[] };
   readonly pre_tokenizer?: { readonly type?: string; readonly pretokenizers?: readonly PreTokenizerNode[] };
-  readonly added_tokens?: readonly { readonly id: number; readonly content: string }[];
+  readonly added_tokens?: readonly {
+    readonly id: number;
+    readonly content: string;
+    readonly special?: boolean;
+  }[];
   readonly model: {
     readonly type: string;
     readonly unk_id: number;
@@ -71,6 +75,7 @@ export class SentencePieceUnigram {
   private readonly vocab: Map<string, number>;
   private readonly scores: Float64Array;
   private readonly pieces: string[];
+  private readonly specialIds: Map<string, number>;
   private readonly unkId: number;
   private readonly charsmapSha256: string | null;
   private sourceDigest: string | null = null;
@@ -103,7 +108,21 @@ export class SentencePieceUnigram {
       if (id !== undefined) this.scores[id] = score;
     }
     // Added tokens are appended to the id space and must resolve like any other piece.
+    //
+    // Special tokens are also kept in their own table because the Viterbi walk below
+    // cannot produce them: a `special` token that is *already in the vocabulary* keeps its
+    // own id and its own (absent) score, so the walk segments `[CLS]` into whatever
+    // ordinary pieces happen to cover those characters. For this checkpoint that produced
+    // `[507, 1]` instead of the declared `1`, and since the encoder has no
+    // `added_tokens.json` entry to fall back on, every caller that built a sequence from
+    // `encode("[CLS]")` silently handed the model a token it was never trained to see in
+    // that position. `encode` consults this table before the walk.
+    this.specialIds = new Map();
     for (const token of json.added_tokens ?? []) {
+      if (token.special === true) {
+        this.specialIds.set(token.content, token.id);
+        continue;
+      }
       while (this.pieces.length <= token.id) this.pieces.push("");
       this.pieces[token.id] = token.content;
       this.vocab.set(token.content, token.id);
@@ -176,7 +195,7 @@ export class SentencePieceUnigram {
    * strips control characters and applies a few mappings that are not NFKC. On those
    * inputs this tokeniser can differ from the reference and therefore reach a different
    * verdict. `normalizerSha256` is recorded on every decision so the gap is auditable,
-   * and `tokenizer.test.ts` measures agreement on the inputs this release claims to
+   * and `onnx-entailment.test.ts` measures agreement on the inputs this release claims to
    * handle.
    */
   normalize(input: string): string {
@@ -201,6 +220,15 @@ export class SentencePieceUnigram {
    * the reference does when `byte_fallback` is false.
    */
   encode(text: string): EncodedIds {
+    // A whole-input special token is returned as its declared id. This is checked before
+    // normalisation because the declared id is what callers building a sequence layout
+    // (`[CLS] … [SEP] … [SEP]`) depend on, and normalising `[CLS]` first would only make
+    // the match fail.
+    const special = this.specialIds.get(text);
+    if (special !== undefined) {
+      return { ids: [special], pieces: [text] };
+    }
+
     let prepared = this.normalize(text);
     if (this.prependScheme === "always" && !prepared.startsWith(this.replacement)) {
       prepared = this.replacement + prepared;

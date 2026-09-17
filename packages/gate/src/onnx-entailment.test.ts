@@ -15,7 +15,7 @@
  *     node scripts/fetch-model.mjs        # then re-run this file
  */
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { before, describe, it } from "node:test";
 import {
   ONNX_LABEL_ORDER,
@@ -40,6 +40,137 @@ if (!assetsPresent) {
       `  The production entailment verifier is therefore UNVERIFIED in this environment.\n\n`,
   );
 }
+
+/**
+ * The sentence *pair*, asserted without the model.
+ *
+ * `EntailmentRequest` carries both `proposition` and `hypothesis` and documents why they
+ * are different strings; the model must be asked about the proposition. An earlier
+ * revision encoded `hypothesis`, which put the subject key and predicate namespace into
+ * the sequence as if the evidence had to state them.
+ *
+ * This is deliberately outside the model-assets guard. It is precisely the defect class a
+ * full-model test localises badly and a skipped test hides completely, so it must run on
+ * every machine — including CI, which never has the 233 MB weights.
+ */
+describe("onnx entailment sentence pair", () => {
+  const options = {
+    modelPath: "unused.onnx",
+    tokenizerPath: "unused.json",
+    entailmentThreshold: 0.5,
+    contradictionThreshold: 0.5,
+  };
+  const assets = { modelSha256: "a".repeat(64), tokenizerSha256: "b".repeat(64), normalizerSha256: null };
+
+  /**
+   * A tokenizer that records what it was asked to encode, keyed by text.
+   *
+   * The special ids are this checkpoint's declared values (see
+   * `tokenizer.json`'s `added_tokens`), not the BERT-style 101/102 that a
+   * different family of checkpoint uses.
+   */
+  const SPECIAL_IDS: Record<string, number> = { "[CLS]": 1, "[SEP]": 2 };
+  function recordingTokenizer(idsFor: (text: string) => number[]) {
+    const encoded: string[] = [];
+    const stub = {
+      encode(text: string) {
+        encoded.push(text);
+        // Special tokens get their real ids so the sequence layout is checkable; the test
+        // bodies only ever encode ordinary text through `idsFor`.
+        return { ids: SPECIAL_IDS[text] === undefined ? idsFor(text) : [SPECIAL_IDS[text]!] };
+      },
+      sourceSha256: "b".repeat(64),
+      normalizerSha256: null,
+    };
+    return { stub, encoded };
+  }
+
+  /** A session that returns the given logits and records the ids it was fed. */
+  function recordingSession(logits: number[]) {
+    const feeds: Array<{ input_ids: number[]; attention_mask: number[] }> = [];
+    const stub = {
+      inputNames: ["input_ids", "attention_mask"],
+      async run(input: Record<string, { data: BigInt64Array }>) {
+        feeds.push({
+          input_ids: Array.from(input["input_ids"]!.data, Number),
+          attention_mask: Array.from(input["attention_mask"]!.data, Number),
+        });
+        return { logits: { data: logits } };
+      },
+    };
+    return { stub, feeds };
+  }
+
+  function backendOver(logits: number[]) {
+    const { stub: tokenizer, encoded } = recordingTokenizer((text) => [text.length]);
+    const { stub: session, feeds } = recordingSession(logits);
+    const ort = {
+      InferenceSession: { create: async () => session },
+      // No parameter properties: `--experimental-strip-types` strips types without
+      // transforming syntax, and a parameter property is syntax a transform would have to
+      // generate code for. Written out longhand so the file runs under strip-only mode.
+      Tensor: class {
+        readonly data: BigInt64Array;
+        readonly dims: number[];
+        constructor(_type: string, data: BigInt64Array, dims: number[]) {
+          this.data = data;
+          this.dims = dims;
+        }
+      },
+    };
+    const backend = OnnxEntailmentBackend.overComponents(
+      ort as never,
+      session as never,
+      tokenizer as never,
+      options,
+      assets,
+    );
+    return { backend, encoded, feeds };
+  }
+
+  it("encodes the proposition, not the hypothesis", async () => {
+    const { backend, encoded } = backendOver([0, 5, 0]);
+
+    await backend.entails({
+      premise: "My employee id is E-1042",
+      proposition: "employee_id E-1042",
+      hypothesis: "user:alice employee_id E-1042",
+    });
+
+    assert.ok(
+      encoded.includes("employee_id E-1042"),
+      `the proposition was not encoded; encoded instead: ${JSON.stringify(encoded)}`,
+    );
+    assert.ok(
+      !encoded.includes("user:alice employee_id E-1042"),
+      "the hypothesis was encoded as the sentence pair's second half; the model must be " +
+        "asked whether the evidence entails the proposition, not whether it states the " +
+        "extractor's key",
+    );
+  });
+
+  it("places premise and proposition in one [CLS] … [SEP] … [SEP] sequence", async () => {
+    // The order is part of the checkpoint's contract, and the sequence layout is what a
+    // cross-encoder scores. Asserting it here catches a future edit that silently
+    // concatenates the documents into one segment.
+    const { backend, feeds } = backendOver([0, 5, 0]);
+
+    await backend.entails({
+      premise: "ab",
+      proposition: "cde",
+      hypothesis: "unused-hypothesis",
+    });
+
+    assert.equal(feeds.length, 1);
+    const ids = feeds[0]!.input_ids;
+    assert.equal(ids.length, feeds[0]!.attention_mask.length, "attention span must match the sequence");
+    assert.ok(feeds[0]!.attention_mask.every((m) => m === 1), "no padding is introduced");
+    // The stub tokenizer encodes each text as its own length, so the ids identify which
+    // text landed where: premise "ab" -> 2, proposition "cde" -> 3.
+    assert.deepEqual(ids.slice(0, 3), [1, 2, 2], "CLS, premise, SEP");
+    assert.deepEqual(ids.slice(3), [3, 2], "proposition, SEP");
+  });
+});
 
 describe("onnx entailment verifier", { skip: !assetsPresent ? "model assets absent — see the diagnostic above" : false }, () => {
   let backend: OnnxEntailmentBackend;
@@ -69,6 +200,31 @@ describe("onnx entailment verifier", { skip: !assetsPresent ? "model assets abse
     // The previous implementation read [contradiction, neutral, entailment], which
     // returned every neutral verdict as entailed — the worst possible direction.
     assert.deepEqual(ONNX_LABEL_ORDER, ["contradiction", "entailed", "neutral"]);
+  });
+
+  it("encodes the sequence separators as the ids the tokenizer file declares", () => {
+    // The defect this pins: `added_tokens` marks `[CLS]`/`[SEP]` as `special` at ids 1 and
+    // 2, but the Viterbi walk segmented those bracketed characters as ordinary pieces and
+    // produced `[507, 1]` and `[507, 2]`. The model was therefore never shown a separator
+    // at all, and every verdict was computed over a malformed sequence. The ids are read
+    // from `tokenizer.json` and compared against the file, so a checkpoint whose ids
+    // differ is caught rather than assumed to be BERT-style 101/102.
+    const declared = JSON.parse(
+      readFileSync(TOKENIZER_PATH, "utf8"),
+    ) as { added_tokens?: Array<{ id: number; content: string; special?: boolean }> };
+    const expected = new Map(
+      (declared.added_tokens ?? []).filter((t) => t.special === true).map((t) => [t.content, t.id]),
+    );
+
+    for (const [token, id] of expected) {
+      assert.deepEqual(
+        backend.tokenizer().encode(token).ids,
+        [id],
+        `${token} must encode to its declared id ${id}, not to a segmentation of its characters`,
+      );
+    }
+    assert.equal(expected.get("[CLS]"), 1, "this checkpoint declares [CLS] = 1");
+    assert.equal(expected.get("[SEP]"), 2, "this checkpoint declares [SEP] = 2");
   });
 
   it("reproduces the model card's own two examples", async () => {

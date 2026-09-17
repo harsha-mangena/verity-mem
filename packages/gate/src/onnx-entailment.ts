@@ -4,7 +4,7 @@
  * This replaces an earlier implementation that produced correctly-shaped tensors from a
  * placeholder tokenizer. That version could not be trusted for scoring and was
  * documented as such, which meant the deployment's default verifier was a lexical proxy
- * — the exact gap the missing-blocks assessment names as P0. Three defects are fixed
+ * — the exact gap the missing-blocks assessment names as P0. Four defects are fixed
  * here, and each was independently sufficient to make the backend useless:
  *
  *   1. **Tokenisation.** The model's own `tokenizer.json` is loaded and its Unigram
@@ -15,10 +15,19 @@
  *      `[contradiction, neutral, entailment]`, which swaps *neutral* and *entailment* —
  *      so every neutral verdict was returned as entailed. That is the worst possible
  *      direction for this system: it promotes unsupported claims. Confirmed against the
- *      model card's own two examples, which are asserted in `tokenizer.test.ts`.
+ *      model card's own two examples, which are asserted in `onnx-entailment.test.ts`.
  *   3. **Input names.** This export takes `input_ids` and `attention_mask` only. The
  *      previous code fed a `token_type_ids` tensor the session does not declare, which
  *      ORT rejects.
+ *   4. **The sentence pair.** The model was asked whether the evidence entailed
+ *      `request.hypothesis` rather than `request.proposition`. `EntailmentRequest`
+ *      documents why those differ: the hypothesis carries the subject key and predicate
+ *      namespace, which are artefacts of how a claim is keyed and which the source
+ *      sentence therefore never states. Every claim whose subject was implied by the
+ *      sentence — most of them — scored `neutral` for a reason unrelated to entailment,
+ *      and the ONNX path consequently rejected grounded writes the lexical path accepted.
+ *      `onnx-entailment.test.ts` now pins the encoded pair so the two fields cannot be
+ *      swapped again.
  *
  * Reproducibility is a first-class property rather than a hope: the model file, the
  * tokenizer file and the normaliser's character map are each hashed at load, and all
@@ -97,7 +106,7 @@ export class OnnxEntailmentBackend implements EntailmentBackend {
 
   private readonly session: OrtSession;
   private readonly ort: OrtModule;
-  private readonly tokenizer: SentencePieceUnigram;
+  private readonly tokenizerInstance: SentencePieceUnigram;
   private readonly options: OnnxEntailmentOptions;
 
   private constructor(
@@ -109,7 +118,7 @@ export class OnnxEntailmentBackend implements EntailmentBackend {
   ) {
     this.ort = ort;
     this.session = session;
-    this.tokenizer = tokenizer;
+    this.tokenizerInstance = tokenizer;
     this.options = options;
     this.assets = assets;
     this.modelSha256 = assets.modelSha256;
@@ -126,6 +135,39 @@ export class OnnxEntailmentBackend implements EntailmentBackend {
    * change back to the lexical backend, which is visible in the decision record.
    */
   static async load(options: OnnxEntailmentOptions): Promise<OnnxEntailmentBackend> {
+    return OnnxEntailmentBackend.loadChecked(options);
+  }
+
+  /**
+   * The tokenizer this backend scores with.
+   *
+   * Exposed so the sequence-layout contract can be asserted against the tokenizer file
+   * itself rather than against a restatement of it.
+   */
+  tokenizer(): SentencePieceUnigram {
+    return this.tokenizerInstance;
+  }
+
+  /**
+   * Construct a backend over caller-supplied components.
+   *
+   * This exists so a test can drive the real `entails()` with a stub session and a stub
+   * tokenizer and assert *which text is encoded into the sequence pair* — the defect class
+   * that a mock-only test cannot see and that a full-model test cannot localise. It is not
+   * the supported entry point: `load()` is, because it is the one that hashes the assets
+   * and refuses to run unpinned.
+   */
+  static overComponents(
+    ort: OrtModule,
+    session: OrtSession,
+    tokenizer: SentencePieceUnigram,
+    options: OnnxEntailmentOptions,
+    assets: OnnxAssets,
+  ): OnnxEntailmentBackend {
+    return new OnnxEntailmentBackend(ort, session, tokenizer, options, assets);
+  }
+
+  private static async loadChecked(options: OnnxEntailmentOptions): Promise<OnnxEntailmentBackend> {
     for (const [label, path] of [
       ["model", options.modelPath],
       ["tokenizer", options.tokenizerPath],
@@ -186,12 +228,20 @@ export class OnnxEntailmentBackend implements EntailmentBackend {
 
   async entails(request: EntailmentRequest): Promise<EntailmentVerdict> {
     const maxLength = this.options.maxLength ?? 512;
-    const cls = this.tokenizer.encode("[CLS]").ids;
-    const sep = this.tokenizer.encode("[SEP]").ids;
+    const cls = this.tokenizerInstance.encode("[CLS]").ids;
+    const sep = this.tokenizerInstance.encode("[SEP]").ids;
     // Premise then hypothesis, single sequence: this is a cross-encoder over a sentence
     // *pair*, and the order is part of the checkpoint's contract.
-    const premise = this.tokenizer.encode(request.premise).ids;
-    const hypothesis = this.tokenizer.encode(request.hypothesis).ids;
+    //
+    // The pair is (evidence, *proposition*), not (evidence, hypothesis). `EntailmentRequest`
+    // documents the distinction and the lexical backend scores `proposition`; an earlier
+    // revision of this file scored `hypothesis` instead, which fed the model the subject
+    // key (`user:alice`) and predicate namespace (`preference`) as if the evidence had to
+    // state them. Those are artefacts of how the claim is keyed, so the premise never
+    // contains them and a grounded claim scored `neutral` for a reason that has nothing to
+    // do with entailment.
+    const premise = this.tokenizerInstance.encode(request.premise).ids;
+    const hypothesis = this.tokenizerInstance.encode(request.proposition).ids;
     const ids = [...cls, ...premise, ...sep, ...hypothesis, ...sep].slice(0, maxLength);
 
     const mask = new Array<bigint>(ids.length).fill(1n);
