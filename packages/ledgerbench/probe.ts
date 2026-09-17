@@ -1,0 +1,10 @@
+import { randomUUID } from "node:crypto";
+import { FixtureRunner } from "./src/run.ts";
+import { parseFixtureFile } from "./src/parse.ts";
+const scope = `clean-${randomUUID().slice(0, 8)}`;
+process.env["LEDGERBENCH_TRACE"] = "1";
+const runner = new FixtureRunner({ seed: 7, runScope: scope });
+const r = await runner.run(parseFixtureFile("/Users/venom/verity-mem/fixtures/poisoning/P02_unsupported_specifics.jsonl"));
+console.log("scope:", scope, "tenant:", r.tenant, "claims:", r.claims.length);
+console.log("failures:", r.lines.flatMap(l=>l.assertions).filter(a=>a.status==="fail").map(a=>a.detail));
+await runner.close();

@@ -32,6 +32,10 @@ export interface TestContext {
   readonly tenantSlug: string;
   readonly blobs: MemoryBlobStore;
   readonly startedAt: string;
+  /** The seeded id generator, so a test using it produces reproducible ids. */
+  readonly ids: ReturnType<typeof seededIds>;
+  /** The fixed clock, so age and staleness assertions are deterministic. */
+  readonly clock: ReturnType<typeof fixedClock>;
   close(): Promise<void>;
 }
 
@@ -39,17 +43,15 @@ export async function createTestContext(label: string): Promise<TestContext> {
   const db = new Db({ connectionString: env.databaseUrl, max: 4 });
   const blobs = new MemoryBlobStore();
   const clock = fixedClock("2026-09-17T12:00:00.000Z");
-  const ledger = new Ledger({
-    db,
-    blobs,
-    clock,
-    ids: seededIds(`${label}-${randomUUID().slice(0, 8)}`),
-  });
+  const ids = seededIds(`${label}-${randomUUID().slice(0, 8)}`);
+  const ledger = new Ledger({ db, blobs, clock, ids });
   return {
     db,
     ledger,
     tenantSlug: `test-${label}-${randomUUID().slice(0, 8)}`,
     blobs,
+    ids,
+    clock,
     startedAt: "2026-09-17T12:00:00.000Z",
     async close() {
       await db.close();

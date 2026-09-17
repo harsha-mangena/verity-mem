@@ -106,7 +106,19 @@ export class PreferenceFormExtractor implements Extractor {
               proposals.push({
                 kind: "preference",
                 subject: subjectKey("user", input.actor_id),
-                predicate: `setting.${subject.toLowerCase().replace(/\s+/g, "_")}`,
+                // The predicate carries the *setting*, which is where the
+                // meaning lives; the object carries only the value the sentence
+                // actually states.
+                //
+                // This split is deliberate and it is checked by the gate. A
+                // predicate is not required to appear in the evidence, but
+                // everything in the object is: an object that mentions a value
+                // the span never states is the hallucination shape the entailment
+                // check exists to catch. Putting a JSON key like `value` or a
+                // namespace like `preference` into the object would make the claim
+                // assert tokens the sentence does not contain, and the check would
+                // — correctly — refuse to call it entailed.
+                predicate: `preference.${subject.toLowerCase().replace(/\s+/g, "_")}`,
                 object: raw,
                 spans: [spanFromMatch(match)],
                 confidence: 0.9,
@@ -187,6 +199,17 @@ export class DecisionStatementExtractor implements Extractor {
   readonly isModelCall = false;
   readonly produces = ["decision", "event"] as const;
 
+  /**
+   * Predicates are namespaced (`decision.approved`, not `approved`).
+   *
+   * This is not cosmetic. Conflict detection compares claims that share a subject
+   * *and* a predicate, so a bare `approved` predicate makes every approval by the
+   * same person about the same key: two approvals of two different deploy windows
+   * become a contradiction, the gate correctly refuses to pick a winner, and a
+   * perfectly good second approval lands in the review queue. Namespacing the
+   * predicate is what keeps "a different object" from being read as "a
+   * contradictory object".
+   */
   private static readonly PATTERNS: readonly {
     readonly pattern: RegExp;
     readonly predicate: string;
@@ -194,22 +217,22 @@ export class DecisionStatementExtractor implements Extractor {
   }[] = [
     {
       pattern: /\bI\s+approv(?:e|ed)\s+(?:the\s+)?([^.;\n]{3,120})/gi,
-      predicate: "approved",
+      predicate: "decision.approved",
       objectGroup: 1,
     },
     {
       pattern: /\bI\s+reject(?:ed)?\s+(?:the\s+)?([^.;\n]{3,120})/gi,
-      predicate: "rejected",
+      predicate: "decision.rejected",
       objectGroup: 1,
     },
     {
       pattern: /\bwe\s+(?:have\s+)?decided\s+(?:to\s+)?([^.;\n]{3,120})/gi,
-      predicate: "decided",
+      predicate: "plan.decided",
       objectGroup: 1,
     },
     {
       pattern: /\bdeadline\s+is\s+([^.;\n]{3,80})/gi,
-      predicate: "deadline",
+      predicate: "plan.deadline",
       objectGroup: 1,
     },
   ];

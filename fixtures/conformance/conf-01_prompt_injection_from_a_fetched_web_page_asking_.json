@@ -20,7 +20,7 @@
         "origin": "document",
         "actor_id": "tool:web_fetch",
         "scope": {
-          "tenant": "acme",
+          "tenant": "bench-conf",
           "project": "payments",
           "purpose": [
             "release_planning"

@@ -107,8 +107,41 @@ export interface ExpectConflict {
   readonly against_object?: unknown;
 }
 
+/**
+ * The claim was withdrawn. Distinct from `expect_superseded`: revocation means the
+ * claim must not be used, supersession means a newer claim replaced it. A matcher
+ * that accepted either for both would let a system that never revokes pass a
+ * revocation fixture.
+ */
 export interface ExpectRevoked extends ClaimMatch {
   readonly type: "expect_revoked";
+}
+
+/** The claim was replaced by a newer one and is history, not current belief. */
+export interface ExpectSuperseded extends ClaimMatch {
+  readonly type: "expect_superseded";
+}
+
+/**
+ * The relation must exist as a `claim_relations` row, not only in the decision
+ * detail.
+ *
+ * Split out from `expect_conflict` deliberately. `expect_conflict` asserts the
+ * *detection*, which is what the conflict metric measures and what the gate
+ * produces today. Persisting the row is a separate promise the data model makes,
+ * and it is only kept for `duplicates` and `supersedes`. Folding the two together
+ * would make a correct detection report as a failure with no way to tell the two
+ * apart; keeping them apart lets the stage metric count the gap explicitly.
+ */
+export interface ExpectRelationPersisted {
+  readonly type: "expect_relation_persisted";
+  readonly kind: RelationKind;
+  readonly subject?: string;
+  readonly predicate?: string;
+  readonly object?: unknown;
+  readonly against_subject?: string;
+  readonly against_predicate?: string;
+  readonly against_object?: unknown;
 }
 
 export interface ExpectMissing {
@@ -158,7 +191,9 @@ export type Expectation =
   | ExpectNeedsReview
   | ExpectScopeNarrowed
   | ExpectConflict
+  | ExpectRelationPersisted
   | ExpectRevoked
+  | ExpectSuperseded
   | ExpectMissing
   | ExpectReason
   | ExpectGrant
@@ -173,7 +208,9 @@ export const EXPECTATION_TYPES: readonly Expectation["type"][] = [
   "expect_needs_review",
   "expect_scope_narrowed",
   "expect_conflict",
+  "expect_relation_persisted",
   "expect_revoked",
+  "expect_superseded",
   "expect_missing",
   "expect_reason",
   "expect_grant",

@@ -13,12 +13,14 @@
     "test": "node --experimental-strip-types --test src/ledgerbench.test.ts"
   },
   "dependencies": {
+    "@sinclair/typebox": "0.34.52",
     "@veritymem/contracts": "workspace:*",
     "@veritymem/gate": "workspace:*",
     "@veritymem/ledger": "workspace:*",
     "pg": "8.16.3"
   },
   "devDependencies": {
-    "@types/node": "22.18.1"
+    "@types/node": "22.18.1",
+    "@types/pg": "8.15.5"
   }
 }

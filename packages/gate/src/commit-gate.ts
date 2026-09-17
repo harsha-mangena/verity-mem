@@ -457,7 +457,11 @@ export class CommitGate {
     if (usableSupport.length > 0) {
       const premise = usableSupport.map((entry) => entry.quote ?? "").join("\n");
       const hypothesis = renderStatement(candidate.subject, candidate.predicate, candidate.object);
-      const verdict = await this.deps.entailment.entails({ premise, hypothesis });
+      // The proposition omits the subject key. See EntailmentRequest.proposition:
+      // the subject is implied by the span, and requiring the extractor's own
+      // subject vocabulary to appear in the source fails grounded claims.
+      const proposition = renderStatement("", candidate.predicate, candidate.object);
+      const verdict = await this.deps.entailment.entails({ premise, hypothesis, proposition });
       aggregate = verdict.result;
       aggregateScore = verdict.score;
       entailmentBackend = verdict.backend;

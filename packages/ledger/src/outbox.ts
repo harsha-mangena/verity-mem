@@ -33,6 +33,55 @@ export interface OutboxRunSummary {
   readonly kinds: Record<string, number>;
 }
 
+/**
+ * Build the request context for a message.
+ *
+ * The scope and purposes come from the message payload, because the handler must
+ * see the rows it is meant to process. Binding an empty scope array with an empty
+ * purpose set is not "unrestricted" — the policies deny every row — so a worker
+ * that omitted them would silently do nothing while reporting success, which is
+ * exactly the bug this function exists to prevent recurring.
+ *
+ * A partial binding is an error rather than a default: a message that names a scope
+ * but no purposes cannot be processed correctly, and guessing "no purposes" would
+ * reproduce the silent no-op in a subtler form.
+ */
+export function bindingFor(message: OutboxMessage): {
+  tenant: string;
+  principal: string;
+  scopeIds: readonly string[];
+  purposes: readonly string[];
+  action: string;
+} {
+  const scopeIds = Array.isArray(message.payload["scope_ids"])
+    ? (message.payload["scope_ids"] as unknown[]).filter((value): value is string => typeof value === "string")
+    : [];
+  const purposes = Array.isArray(message.payload["purposes"])
+    ? (message.payload["purposes"] as unknown[]).filter((value): value is string => typeof value === "string")
+    : [];
+
+  if (scopeIds.length === 0) {
+    throw new Error(
+      `outbox message ${message.outbox_id} (kind ${message.kind}) carries no scope_ids; ` +
+        `a handler bound without a scope would read nothing and report success`,
+    );
+  }
+  if (purposes.length === 0) {
+    throw new Error(
+      `outbox message ${message.outbox_id} (kind ${message.kind}) carries no purposes; ` +
+        `an empty purpose set is denied by every policy, so the handler would be a silent no-op`,
+    );
+  }
+
+  return {
+    tenant: message.tenant_id,
+    principal: "system:worker",
+    scopeIds,
+    purposes,
+    action: "worker:process",
+  };
+}
+
 export class OutboxWorker {
   private readonly db: Db;
   private readonly processors = new Map<string, OutboxProcessor>();
@@ -70,18 +119,9 @@ export class OutboxWorker {
           // Leave it retryable rather than deleting work this worker cannot do.
           throw new Error(`no processor registered for outbox kind ${message.kind}`);
         }
-        await this.db.withRequest(
-          {
-            tenant: message.tenant_id,
-            principal: "system:worker",
-            scopeIds: [],
-            purposes: [],
-            action: "worker:process",
-          },
-          async () => {
-            await processor.handle(message);
-          },
-        );
+        await this.db.withRequest(bindingFor(message), async () => {
+          await processor.handle(message);
+        });
         await this.complete(message.outbox_id);
         completed += 1;
       } catch (error) {

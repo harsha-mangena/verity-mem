@@ -21,7 +21,7 @@
             "origin": "document",
             "actor_id": "tool:web_fetch",
             "scope": {
-              "tenant": "acme",
+              "tenant": "bench-conf",
               "project": "payments",
               "purpose": [
                 "release_planning"
@@ -81,7 +81,7 @@
             "origin": "document",
             "actor_id": "tool:web_fetch",
             "scope": {
-              "tenant": "acme",
+              "tenant": "bench-conf",
               "project": "payments",
               "purpose": [
                 "release_planning"
@@ -143,7 +143,7 @@
             "origin": "user",
             "actor_id": "user:alice",
             "scope": {
-              "tenant": "acme",
+              "tenant": "bench-conf",
               "project": "payments",
               "user": "alice",
               "purpose": [
@@ -166,7 +166,10 @@
               }
             ],
             "requested_scope": {
-              "project": "payments"
+              "project": "payments",
+              "purpose": [
+                "release_planning"
+              ]
             }
           }
         }
@@ -206,7 +209,7 @@
             "origin": "user",
             "actor_id": "user:alice",
             "scope": {
-              "tenant": "acme",
+              "tenant": "bench-conf",
               "project": "payments",
               "purpose": [
                 "release_planning"
@@ -237,7 +240,7 @@
             "origin": "user",
             "actor_id": "user:bob",
             "scope": {
-              "tenant": "acme",
+              "tenant": "bench-conf",
               "project": "payments",
               "purpose": [
                 "release_planning"
@@ -301,7 +304,7 @@
             "origin": "tool",
             "actor_id": "tool:ci",
             "scope": {
-              "tenant": "acme",
+              "tenant": "bench-conf",
               "project": "payments",
               "purpose": [
                 "release_planning"
@@ -346,7 +349,7 @@
             "origin": "tool",
             "actor_id": "tool:ci",
             "scope": {
-              "tenant": "acme",
+              "tenant": "bench-conf",
               "project": "payments",
               "purpose": [
                 "release_planning"
@@ -410,7 +413,7 @@
             "origin": "document",
             "actor_id": "tool:web_fetch",
             "scope": {
-              "tenant": "acme",
+              "tenant": "bench-conf",
               "project": "payments",
               "purpose": [
                 "release_planning"
@@ -469,7 +472,7 @@
             "origin": "tool",
             "actor_id": "tool:ci",
             "scope": {
-              "tenant": "acme",
+              "tenant": "bench-conf",
               "project": "payments",
               "purpose": [
                 "release_planning"
@@ -500,7 +503,7 @@
             "origin": "tool",
             "actor_id": "tool:ci",
             "scope": {
-              "tenant": "acme",
+              "tenant": "bench-conf",
               "project": "payments",
               "purpose": [
                 "release_planning"
@@ -564,7 +567,7 @@
             "origin": "database",
             "actor_id": "tool:hr_db",
             "scope": {
-              "tenant": "acme",
+              "tenant": "bench-p06",
               "project": "people-ops",
               "user": "erin",
               "purpose": [
@@ -624,7 +627,7 @@
             "origin": "user",
             "actor_id": "user:alice",
             "scope": {
-              "tenant": "acme",
+              "tenant": "bench-conf",
               "project": "payments",
               "user": "alice",
               "purpose": [
@@ -695,7 +698,7 @@
             "origin": "user",
             "actor_id": "user:gina",
             "scope": {
-              "tenant": "acme",
+              "tenant": "bench-d02",
               "project": "support",
               "user": "gina",
               "purpose": [

@@ -256,7 +256,19 @@ export class IngestPipeline {
    * produces rather than by remembering to update this function.
    */
   private isBlocked(extractor: Extractor, admission: AdmissionResult): boolean {
+    // Privileged *model* extractors are blocked outright when content is external
+    // and instruction-like: a model reading an injection and being asked to
+    // propose permissions is the case where routing itself is the risk.
+    //
+    // Deterministic privileged extractors are deliberately NOT blocked. They
+    // recognise an imperative sentence and propose a `procedure` candidate with
+    // the weaker authority that external origin implies, which the gate then
+    // quarantines. Blocking them here would be easy and would also remove the
+    // quarantine path from the audit trail: the decision record is how an operator
+    // learns that a hostile procedure was seen and refused, and a silently
+    // dropped candidate teaches nobody anything.
     if (!admission.blocked_extractors.includes("privileged")) return false;
+    if (!extractor.isModelCall) return false;
     return extractor.produces.some((kind) => kind === "procedure" || kind === "permission");
   }
 
@@ -403,14 +415,50 @@ export class IngestPipeline {
     if (Object.keys(request).length === 0) {
       return { scope_id: eventScope.scope_id };
     }
-    const purposes = request.purpose && request.purpose.length > 0 ? request.purpose : eventScope.purpose;
+
+    // A candidate may only narrow *within* the event's scope. Every dimension the
+    // event binds is carried over unless the request names the *same* value; a
+    // request that names a different value is a widening attempt and is dropped, so
+    // the gate sees a genuine narrowing rather than a request it must reject.
+    //
+    // Carrying the event's dimensions across is not cosmetic. The scopes table
+    // requires at least one bound dimension, so a request naming only a user would
+    // otherwise lose the event's project, and the gate would read the missing
+    // project on the *requested* side as "wider than the evidence" and downgrade a
+    // perfectly good narrow request to a review item. That is how a scope
+    // mechanism quietly converts into review burden.
+    const carry = <T extends string | null>(
+      requested: string | undefined,
+      eventValue: T,
+    ): string | undefined => {
+      if (requested === undefined) return eventValue ?? undefined;
+      if (eventValue !== null && requested !== eventValue) return undefined;
+      return requested;
+    };
+
+    const purposes =
+      request.purpose && request.purpose.length > 0
+        ? request.purpose.filter((purpose) => eventScope.purpose.includes(purpose))
+        : eventScope.purpose;
+
+    const dimensions = {
+      project: carry(request.project, eventScope.project),
+      user: carry(request.user, eventScope.user),
+      agent: carry(request.agent, eventScope.agent),
+      session: carry(request.session, eventScope.session),
+    };
+    if (Object.values(dimensions).every((value) => value === undefined)) {
+      // Nothing survived the narrowing attempt, so the request was pure widening.
+      return { scope_id: eventScope.scope_id };
+    }
+
     const scope = await ensureScope(executor, {
       tenant: eventScope.tenant_id,
-      ...(request.project ?? eventScope.project ? { project: request.project ?? eventScope.project ?? undefined } : {}),
-      ...(request.user ?? eventScope.user ? { user: request.user ?? eventScope.user ?? undefined } : {}),
-      ...(request.agent ?? eventScope.agent ? { agent: request.agent ?? eventScope.agent ?? undefined } : {}),
-      ...(request.session ?? eventScope.session ? { session: request.session ?? eventScope.session ?? undefined } : {}),
-      purpose: purposes,
+      ...(dimensions.project !== undefined ? { project: dimensions.project } : {}),
+      ...(dimensions.user !== undefined ? { user: dimensions.user } : {}),
+      ...(dimensions.agent !== undefined ? { agent: dimensions.agent } : {}),
+      ...(dimensions.session !== undefined ? { session: dimensions.session } : {}),
+      purpose: purposes.length > 0 ? purposes : eventScope.purpose,
     });
     return { scope_id: scope.scope_id };
   }
@@ -493,6 +541,10 @@ export class IngestPipeline {
           claim_id: result.claim_id,
           tenant_id: event.tenant_id,
           scope_id: event.scope.scope_id,
+          // See the note on the extract message: the worker binds these into the
+          // request context, and without them the projection read is denied.
+          scope_ids: [result.detail.scope.accepted_scope_id],
+          purposes: event.scope.purpose,
           decision_id: result.decision_id,
         }),
       ],

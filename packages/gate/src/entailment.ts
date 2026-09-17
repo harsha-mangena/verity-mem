@@ -22,7 +22,19 @@ import type { EntailmentResult } from "@veritymem/contracts";
 export interface EntailmentRequest {
   /** The evidence text, concatenated in span order. */
   readonly premise: string;
-  /** The candidate rendered as a natural-language proposition. */
+  /**
+   * The proposition being tested, rendered from the predicate and object only.
+   *
+   * This is deliberately *not* the same string as `hypothesis`. The full
+   * statement includes the subject key (`user:alice`) and the predicate namespace
+   * (`preference`), which are artefacts of how the claim is keyed rather than
+   * things the evidence needs to state. Requiring an extractor's own vocabulary to
+   * appear in the source would fail every grounded claim whose subject is implied
+   * by the sentence — which is most of them — and would convert the gate's
+   * precision into review burden.
+   */
+  readonly proposition: string;
+  /** The full statement, for the decision detail and /explain. */
   readonly hypothesis: string;
 }
 
@@ -63,12 +75,25 @@ const STOP_WORDS = new Set([
  */
 const NEGATIONS = new Set(["not", "no", "never", "none", "cannot", "without", "refused", "rejected", "denied"]);
 
+/**
+ * Tokenise for lexical comparison.
+ *
+ * Punctuation that is *internal* to a token is split, because `editor_keymap` and
+ * "editor keymap" are the same words and a comparison that treats them as opaque
+ * strings would score a perfectly grounded claim as unsupported. Separators at the
+ * edges are dropped rather than split so that `user:alice` keeps a usable token
+ * instead of producing an empty one.
+ *
+ * The cost is that a dotted or underscored identifier matches its parts as well as
+ * its whole. For an entailment pre-filter that is the right trade: a false
+ * "supported" only means the claim proceeds to the next check, while a false
+ * "unsupported" silently converts grounded claims into review burden.
+ */
 export function tokenize(text: string): string[] {
   return text
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s._:@/-]+/gu, " ")
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
     .split(/\s+/)
-    .map((token) => token.replace(/^[._:@/-]+|[._:@/-]+$/g, ""))
     .filter((token) => token.length > 0);
 }
 
@@ -119,36 +144,38 @@ export class LexicalEntailmentBackend implements EntailmentBackend {
   async entails(request: EntailmentRequest): Promise<EntailmentVerdict> {
     const premiseTokens = contentTokens(request.premise);
     const premiseSalient = salientTokens(request.premise);
-    const hypothesisTokens = contentTokens(request.hypothesis);
-    const hypothesisSalient = salientTokens(request.hypothesis);
+    const propositionTokens = contentTokens(request.proposition);
 
-    if (hypothesisTokens.size === 0) {
+    if (propositionTokens.size === 0) {
+      // Nothing to check: a claim whose object carries no content words is not
+      // supported by anything, and saying `neutral` is honest.
       return verdict("neutral", 0);
     }
 
-    // Rule 1: unsupported specifics.
-    if (hypothesisSalient.size > 0) {
-      let supported = 0;
-      for (const token of hypothesisSalient) {
-        if (premiseSalient.has(token) || premiseTokens.has(token)) supported += 1;
-      }
-      if (supported === 0) {
-        return verdict("neutral", 0);
-      }
+    // Rule 1 — unsupported specifics. A number, date, identifier or proper
+    // quantity in the proposition that appears nowhere in the evidence is the
+    // dominant hallucination shape, and it is a hard fail rather than a low score.
+    const propositionSalient = salientTokens(request.proposition);
+    if (propositionSalient.size > 0) {
+      const supported = [...propositionSalient].filter(
+        (token) => premiseSalient.has(token) || premiseTokens.has(token),
+      ).length;
+      if (supported === 0) return verdict("neutral", 0);
     }
 
-    // Rule 2: polarity mismatch on the shared vocabulary.
+    // Rule 2 — polarity. "approved the window" and "did not approve the window"
+    // share every content word and mean opposite things.
     const premiseNegated = tokenize(request.premise).some((token) => NEGATIONS.has(token));
-    const hypothesisNegated = tokenize(request.hypothesis).some((token) => NEGATIONS.has(token));
-    const overlap = [...hypothesisTokens].filter((token) => premiseTokens.has(token)).length;
-    const score = overlap / hypothesisTokens.size;
+    const propositionNegated = tokenize(request.proposition).some((token) => NEGATIONS.has(token));
 
-    if (premiseNegated !== hypothesisNegated && score >= this.floor) {
+    const overlap = [...propositionTokens].filter((token) => premiseTokens.has(token)).length;
+    const score = overlap / propositionTokens.size;
+
+    if (premiseNegated !== propositionNegated && score >= this.floor) {
       return verdict("contradiction", score);
     }
 
     if (score >= this.floor) return verdict("entailed", score);
-    if (score === 0) return verdict("neutral", 0);
     return verdict("neutral", score);
   }
 }
@@ -327,26 +354,26 @@ function pseudoTokenize(premise: string, hypothesis: string, maxLength: number):
  * decision detail.
  */
 export function renderStatement(subject: string, predicate: string, object: unknown): string {
-  let rendered: string;
-  if (object === null || object === undefined) {
-    rendered = "";
-  } else if (typeof object === "string") {
-    rendered = object;
-  } else if (typeof object === "number" || typeof object === "boolean") {
-    rendered = String(object);
-  } else if (Array.isArray(object)) {
-    rendered = object.map((item) => (typeof item === "string" ? item : JSON.stringify(item))).join(", ");
-  } else if (typeof object === "object") {
-    const record = object as Record<string, unknown>;
-    rendered = Object.keys(record)
-      .sort()
-      .map((key) => {
-        const value = record[key];
-        return `${key} ${typeof value === "string" ? value : JSON.stringify(value)}`;
-      })
-      .join(" ");
-  } else {
-    rendered = String(object);
-  }
-  return `${subject} ${predicate} ${rendered}`.replace(/\s+/g, " ").trim();
+  // Identifiers are rendered with their separators turned into spaces. The purpose
+  // of this string is to be *compared against evidence text*, and a comparison
+  // that sees `editor_keymap` as one opaque token will not find it in the sentence
+  // "my editor keymap is vim" — which is exactly the sentence the span cites.
+  const flatten = (value: string): string => value.replace(/[._:@/-]+/g, " ");
+
+  const renderObject = (value: unknown): string => {
+    if (value === null || value === undefined) return "";
+    if (typeof value === "string") return flatten(value);
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+    if (Array.isArray(value)) return value.map((item) => renderObject(item)).join(" ");
+    if (typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      return Object.keys(record)
+        .sort()
+        .map((key) => `${flatten(key)} ${renderObject(record[key])}`)
+        .join(" ");
+    }
+    return String(value);
+  };
+
+  return `${flatten(subject)} ${flatten(predicate)} ${renderObject(object)}`.replace(/\s+/g, " ").trim();
 }

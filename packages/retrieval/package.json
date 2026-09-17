@@ -12,6 +12,11 @@
     "@veritymem/contracts": "workspace:*",
     "@veritymem/ledger": "workspace:*",
     "@veritymem/claims": "workspace:*",
-    "@veritymem/policy": "workspace:*"
+    "@veritymem/policy": "workspace:*",
+    "@veritymem/gate": "workspace:*",
+    "@veritymem/model-adapters": "workspace:*"
+  },
+  "devDependencies": {
+    "@veritymem/testkit": "workspace:*"
   }
 }

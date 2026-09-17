@@ -20,7 +20,7 @@
         "origin": "user",
         "actor_id": "user:alice",
         "scope": {
-          "tenant": "acme",
+          "tenant": "bench-conf",
           "project": "payments",
           "user": "alice",
           "purpose": [

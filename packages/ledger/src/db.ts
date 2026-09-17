@@ -179,6 +179,50 @@ export class Db {
     }
   }
 
+  /**
+   * Run `fn` in a transaction bound to a tenant-wide system context.
+   *
+   * For maintenance paths only: projection rebuilds, retention, replay. The
+   * context reaches every row in its own tenant and nothing outside it, and it is
+   * set through a dedicated database function rather than by passing an empty
+   * scope array — an empty scope array with an empty purpose set is *denied* by
+   * every policy, which is how a retention job once scanned nothing and reported
+   * success.
+   *
+   * Requiring the call to be named makes the privilege visible at the call site.
+   */
+  async withSystemContext<T>(
+    binding: { readonly tenant: string; readonly actor: string },
+    fn: (executor: QueryExecutor) => Promise<T>,
+    options: { readOnly?: boolean } = {},
+  ): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query(options.readOnly ? "BEGIN READ ONLY" : "BEGIN");
+      await client.query(`SELECT veritymem.set_system_context($1::uuid, $2)`, [
+        binding.tenant,
+        binding.actor,
+      ]);
+      const result = await requestContext.run({ tx: client }, () => fn(this));
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // Ignore: the connection is unusable either way.
+      }
+      throw error;
+    } finally {
+      try {
+        await client.query("RESET ALL");
+      } catch {
+        // Ignore.
+      }
+      client.release();
+    }
+  }
+
   async close(): Promise<void> {
     await this.pool.end();
   }

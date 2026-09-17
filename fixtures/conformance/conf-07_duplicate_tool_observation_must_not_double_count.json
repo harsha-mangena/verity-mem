@@ -20,7 +20,7 @@
         "origin": "tool",
         "actor_id": "tool:ci",
         "scope": {
-          "tenant": "acme",
+          "tenant": "bench-conf",
           "project": "payments",
           "purpose": [
             "release_planning"
@@ -51,7 +51,7 @@
         "origin": "tool",
         "actor_id": "tool:ci",
         "scope": {
-          "tenant": "acme",
+          "tenant": "bench-conf",
           "project": "payments",
           "purpose": [
             "release_planning"

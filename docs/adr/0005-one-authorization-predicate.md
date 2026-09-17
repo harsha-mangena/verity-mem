@@ -145,7 +145,42 @@ END IF;
 | Project-scoped caller reaches users in that project | test *"lets a project-scoped caller reach every user in that project"* |
 
 All eight ran green on the reference database at the time of writing
-(`pnpm test`: 28 tests, 28 pass, 0 fail).
+(`pnpm test`: 28 tests, 28 pass, 0 fail — that suite has since grown; the eight
+isolation cases below are the ones this ADR rests on).
+
+## Postscript — the rule has since acquired a second implementation
+
+`migrations/0007_scope_contains.sql` (added after this ADR was written) extracts the
+directional containment question into its own function,
+`veritymem.scope_contains(p_outer, p_inner)`, and rewrites `scope_reachable()` to
+delegate to it. The extraction is in the spirit of this ADR. **The semantic change it
+carries is not.**
+
+`scope_contains` tests each dimension with `o.<dim> IS NOT DISTINCT FROM i.<dim>`,
+which makes the relation narrower than the `0006` rule this ADR describes. Under
+`0007`, a caller bound to a specific value on a dimension no longer reaches a row
+whose scope leaves that dimension unbound — so a user-bound scope stops reaching the
+project-wide scope it sits inside. Under `0006`, it did reach it.
+
+As of this writing `0007` is present in the tree and **is not recorded in
+`schema_migrations`**, so the running database still applies the `0006` rule inside
+the RLS policies while `veritymem.scope_contains()` carries the `0007` rule. Two
+implementations of containment now exist in the same database and disagree on two of
+six probed cases (`docs/data-model.md` §5.2 has the table).
+
+This is the condition this ADR was written to eliminate, arriving from a different
+direction: not two policies OR'd together, but two *rules* with different bodies. The
+remedy is the same one, and it should be applied before `0007` ships:
+
+1. Point the policies and the planner at `scope_contains` (or `scope_reachable`) and
+   nowhere else, so the rule exists once.
+2. Ship a self-check with the migration that proves the narrowing is intentional and
+   the direction is right — `0007` already does this, and its self-check is better
+   than `0006`'s because it constructs its own scopes in a rolled-back transaction
+   instead of selecting whatever rows happen to exist.
+3. Treat the narrowing as a behaviour change: measure the read paths before and after,
+   and update the containment table in `docs/threat-model.md` §2/A4, which currently
+   documents the `0006` rule.
 
 ## Alternatives rejected
 

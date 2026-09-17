@@ -20,7 +20,7 @@
         "origin": "database",
         "actor_id": "tool:hr_db",
         "scope": {
-          "tenant": "acme",
+          "tenant": "bench-p06",
           "project": "people-ops",
           "user": "erin",
           "purpose": [

@@ -11,5 +11,8 @@
   },
   "dependencies": {
     "@sinclair/typebox": "0.34.52"
+  },
+  "devDependencies": {
+    "@veritymem/ledger": "workspace:*"
   }
 }

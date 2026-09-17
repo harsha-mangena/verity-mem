@@ -19,7 +19,7 @@
         "origin": "user",
         "actor_id": "user:gina",
         "scope": {
-          "tenant": "acme",
+          "tenant": "bench-d02",
           "project": "support",
           "user": "gina",
           "purpose": [

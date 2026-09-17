@@ -21,7 +21,7 @@
         "origin": "user",
         "actor_id": "user:alice",
         "scope": {
-          "tenant": "acme",
+          "tenant": "bench-conf",
           "project": "payments",
           "purpose": [
             "release_planning"
@@ -52,7 +52,7 @@
         "origin": "user",
         "actor_id": "user:bob",
         "scope": {
-          "tenant": "acme",
+          "tenant": "bench-conf",
           "project": "payments",
           "purpose": [
             "release_planning"

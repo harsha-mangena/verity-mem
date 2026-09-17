@@ -442,6 +442,17 @@ export class Ledger {
           return { ...winner, deduplicated: true, extraction_queued: false };
         }
 
+        // Record that this principal participates in this scope. Membership is a
+        // server-side fact established at the moment the server has authenticated
+        // the principal and bound the scope — not something a later read request
+        // can assert about itself. The read planner computes reach from this table
+        // plus grants, so a caller cannot widen its own read scope by asking.
+        await executor.query(`SELECT veritymem.record_participation($1::uuid, $2, $3::uuid)`, [
+          tenantId,
+          principal,
+          scope.scope_id,
+        ]);
+
         await executor.query(
           `INSERT INTO outbox (tenant_id, kind, payload)
            VALUES ($1::uuid, 'extract.event', $2::jsonb)`,
@@ -452,7 +463,11 @@ export class Ledger {
               tenant: request.scope.tenant,
               tenant_id: tenantId,
               scope_id: scope.scope_id,
-              chain_input: chainInput,
+              // The worker needs these to bind a request context. Omitting them is
+              // what made the projection worker silently read nothing: an empty
+              // scope array with an empty purpose set is denied by every policy.
+              scope_ids: [scope.scope_id],
+              purposes: scope.purpose,
             }),
           ],
         );
