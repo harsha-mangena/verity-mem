@@ -98,11 +98,19 @@ work on a held-out corpus, not a code change, and it is not done.
   same subject and predicate produce `contradicts` and therefore review. That is what
   keeps `unsafe_auto_accept_rate` at zero and it is also part of why review burden
   exceeds its ceiling.
-- **Review burden is above its ceiling.** 6.5% of non-adversarial writes need review
-  against a 2% ceiling on the fixture corpus. Neither number is a production workload,
-  and the target fails.
+- **Review burden is above its ceiling.** On the default lexical gate the acceptance
+  run reports 10.0% of 40 non-adversarial writes needing review against a 2% ceiling;
+  with the ONNX verifier provisioned the figure is 6.5% of 31. Neither number is a
+  production workload, and the target fails either way. Review burden is also
+  computed per decision rather than per fixture: classifying it per fixture let a
+  single adversarial fixture exclude that fixture's ordinary writes from the
+  denominator, which reported 0.0% and was wrong.
 - **`reviewBurdenCeiling` has no reader in library code.** It is configuration that
   documents an intent no code enforces.
+- **A run that was scored without a pinned model digest cannot claim
+  `deterministic_projections`.** The gate reports the missing pin as a second reason
+  beside the absent projection rebuild, so a run cannot pass that target by running
+  on a dirty tree.
 - **`origin` and `actor_id` are caller-supplied.** A caller that misreports its own
   origin is not detected, which bounds every authority judgement that reads them.
 

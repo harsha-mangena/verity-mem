@@ -50,7 +50,7 @@ pnpm install -r
 pnpm db:up          # PostgreSQL 17 + pgvector on 127.0.0.1:55432
 pnpm migrate        # apply migrations
 pnpm typecheck
-pnpm test           # 280 tests against the real database
+pnpm test           # 304 tests against the real database
 ```
 
 Copy `.env.example` to `.env` to change any default. The server, MCP server and
@@ -137,7 +137,7 @@ node scripts/fetch-model.mjs    # provisions the production entailment verifier
 ```
 
 `scripts/verify.sh` pins and asserts Node, PostgreSQL, pgvector and Python versions, runs
-migrations, typechecks, runs 280 tests plus the offline Python harness, exercises the
+migrations, typechecks, runs 304 tests plus the offline Python harness, exercises the
 reference workload end to end, drives the HTTP surface over a real socket, and writes a
 summary naming the exact commit and every version it ran against. A missing tool is a
 failure rather than a skip, and the benchmark's exit code is the gate — a partial pass that
