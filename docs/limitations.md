@@ -58,7 +58,61 @@ work on a held-out corpus, not a code change, and it is not done.
 
 ## Measurements that do not exist
 
-- **The one-million-claim corpus that exists is incomplete.** The tenant
+- **At one million claims the read path does not complete inside its own statement
+  timeout.** A complete corpus now exists
+  (`perf-ref-1190477-<suffix>`, 1,190,477 claims, events, spans, evidence rows and
+  embeddings, 23,810 relation edges, loaded in 5,659.6 s), and a benchmark against it
+  **fails**: every request on the `current/free-text` and `current/entity` shapes was
+  cancelled with `canceling statement due to statement timeout`, which is
+  `statement_timeout: 30_000` from `packages/ledger/src/db.ts`. The v0.1 target is
+  250 ms, so this is not a near miss; on this configuration the read path does not
+  complete at the scale the target names.
+
+  The cause is a working set that cannot be cached, not a slow query in isolation.
+  Each measured in isolation against the same corpus, with `SET statement_timeout`
+  raised:
+
+  | piece | time |
+  | --- | --- |
+  | lexical channel query (full predicate, `websearch_to_tsquery`) | 0.4-160 ms |
+  | dense channel query (HNSW + joins, warm) | 158 ms |
+  | tenant-filtered `claims` x `claim_embeddings` join | 1,398 ms |
+  | `EXPLAIN` of the un-reranked join | parallel seq scan of `claims`, 1,095 ms |
+
+  and the configuration it runs against:
+
+  | setting | value |
+  | --- | --- |
+  | database size | 23 GB |
+  | `claim_embeddings` (HNSW index included) | 19 GB |
+  | `shared_buffers` | **128 MB** |
+  | `effective_cache_size` | 4 GB |
+  | machine RAM | 16 GB |
+
+  The index is roughly 150x the buffer pool, so `EXPLAIN` shows the planner abandoning
+  index-driven access on `claims` for a parallel sequential scan, and concurrent
+  requests evict each other. Four concurrent readers each sat at 16-30 s per query.
+
+  This is recorded as a configuration and design finding, not as a benchmark result:
+  the published deploy configuration has never been tuned for the scale its own target
+  names, and the honest statement is that **the one-million-claim p95 is unknown
+  because the workload does not finish**. Raising `shared_buffers`,
+  `effective_cache_size`, `work_mem` and `hnsw.ef_search`, and deciding between a
+  global HNSW index and a per-tenant one, are the work that would make the number
+  measurable. The target also still requires a *published reference machine*, which
+  this is not.
+- **The dense channel's ANN search is global across tenants.** `claim_embeddings_hnsw_idx`
+  indexes the bare `embedding` column with no tenant key, and the dense channel orders by
+  `e.embedding <=> $vector` over a join that is filtered by `c.tenant_id` afterwards, so
+  the index scan considers every tenant's vectors and the tenant predicate is applied to
+  the candidates it returns. On the reference corpus that index holds 1,011,129 vectors
+  from 1,217 tenants at the time of measurement. Beyond the latency consequence above,
+  this is the "filtering after vector search leaks through counts, timing, and generated
+  summaries" case that `docs/isolation-assessment.md` names: the number of candidates
+  scanned, and the latency, depend on how much data *other* tenants hold. A per-tenant
+  index, or partitioning `claim_embeddings` by tenant so the index is local, is the
+  structural fix. It is not fixed here.
+- **The original one-million-claim corpus that exists is incomplete.** The tenant
   `perf-bench-veritymem-perf-v1-1190477` holds 1,185,477 events, spans and claims, of
   which 995,801 are `accepted`, but only **395,000 embeddings** — 40% of the claims have
   no dense projection — and no `projection_versions` row, so the dense channel has no
