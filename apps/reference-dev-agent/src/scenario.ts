@@ -196,20 +196,30 @@ export interface IsolationProbe {
   readonly query: string;
   /** The predicate the authorization read looked for. */
   readonly predicate: string;
-  /** The same probe with the caller's own user in the selector, for comparison. */
-  readonly selector_as_user: string;
-  readonly authorized_scopes_as_user: readonly string[];
-  readonly claims_returned_as_user: readonly string[];
   readonly principal: string;
-  readonly selector: string;
-  readonly authorized_scopes: readonly string[];
-  /** What `compose` returned. */
-  readonly claims_returned: readonly string[];
-  readonly decision: string;
-  readonly missing: readonly string[];
-  /** What the database itself says is reachable under the authorized scopes. */
+  /**
+   * The probe as the specification frames it: the selector names the caller, so the
+   * planner must resolve only scopes that bind that user.
+   */
+  readonly selector_own_user: string;
+  readonly authorized_scopes_own_user: readonly string[];
+  readonly claims_returned_own_user: readonly string[];
+  readonly decision_own_user: string;
+  readonly missing_own_user: readonly string[];
+  readonly reached_other_principals_claim_own_user: boolean;
+  /**
+   * The same principal asking project-wide, which is a legitimate project operator
+   * query and is expected to reach the project's users. Recorded so the difference
+   * between "narrowed by the selector" and "isolated by the deployment" is visible.
+   */
+  readonly selector_project_wide: string;
+  readonly authorized_scopes_project_wide: readonly string[];
+  readonly claims_returned_project_wide: readonly string[];
+  readonly decision_project_wide: string;
+  readonly missing_project_wide: readonly string[];
+  readonly reached_other_principals_claim_project_wide: boolean;
+  /** What the database itself says is reachable under the probe's authorized scopes. */
   readonly reachable_scopes: readonly ScopeVisibility[];
-  readonly reached_other_principals_claim: boolean;
 }
 
 export interface ValidityWindow {
@@ -521,55 +531,61 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     purpose: "billing_ops",
   });
 
+  const describeScopes = (scopes: readonly { project: string | null; user_id: string | null }[]): string[] =>
+    scopes.map((scope) => (scope.user_id === null ? `project=${scope.project}` : `user=${scope.user_id}`));
+  const reachesAnotherUser = (
+    claims: readonly { claim_id: string; scope: { user: string | null } }[],
+  ): boolean => claims.some((claim) => claim.scope.user !== null && claim.scope.user !== teammate);
+
   const sameProjectProbe: IsolationProbe = {
     query: "Which deploy window did Alice approve?",
     predicate: "decision.approved",
-    selector_as_user: `project=${world.project}, user=${teammate}`,
-    authorized_scopes_as_user: teammateAsSelfPacket.plan.authorized_scopes.map((scope) =>
-      scope.user_id === null ? "project" : `user=${scope.user_id}`,
-    ),
-    claims_returned_as_user: teammateAsSelfPacket.packet.claims.map((claim) => claim.claim_id),
     principal: `user:${teammate}`,
-    selector: `project=${world.project}`,
-    authorized_scopes: teammatePacket.plan.authorized_scopes.map((scope) =>
-      scope.user_id === null ? "project" : `user=${scope.user_id}`,
-    ),
-    claims_returned: teammatePacket.packet.claims.map((claim) => claim.claim_id),
-    decision: teammatePacket.packet.decision,
-    missing: teammatePacket.packet.missing,
+    selector_own_user: `project=${world.project}, user=${teammate}`,
+    authorized_scopes_own_user: describeScopes(teammateAsSelfPacket.plan.authorized_scopes),
+    claims_returned_own_user: teammateAsSelfPacket.packet.claims.map((claim) => claim.claim_id),
+    decision_own_user: teammateAsSelfPacket.packet.decision,
+    missing_own_user: teammateAsSelfPacket.packet.missing,
+    reached_other_principals_claim_own_user: reachesAnotherUser(teammateAsSelfPacket.packet.claims),
+    selector_project_wide: `project=${world.project}`,
+    authorized_scopes_project_wide: describeScopes(teammatePacket.plan.authorized_scopes),
+    claims_returned_project_wide: teammatePacket.packet.claims.map((claim) => claim.claim_id),
+    decision_project_wide: teammatePacket.packet.decision,
+    missing_project_wide: teammatePacket.packet.missing,
+    reached_other_principals_claim_project_wide: reachesAnotherUser(teammatePacket.packet.claims),
     reachable_scopes: await scopeVisibility(world, {
       principal: `user:${teammate}`,
-      scopeIds: teammatePacket.plan.authorized_scope_ids,
+      scopeIds: teammateAsSelfPacket.plan.authorized_scope_ids,
       purposes: [...PROJECT_PURPOSES],
       predicate: "decision.approved",
     }),
-    reached_other_principals_claim: teammatePacket.packet.claims.some(
-      (claim) => claim.scope.user !== null && claim.scope.user !== teammate,
-    ),
   };
   const crossProjectProbe: IsolationProbe = {
     query: "Which deploy window did Alice approve?",
     predicate: "decision.approved",
-    selector_as_user: "project=billing, user=bob",
-    authorized_scopes_as_user: [],
-    claims_returned_as_user: [],
     principal: `user:${teammate}`,
-    selector: "project=billing, user=bob",
-    authorized_scopes: crossProjectPacket.plan.authorized_scopes.map((scope) =>
-      scope.project === null ? "tenant" : `project=${scope.project}`,
+    selector_own_user: "project=billing, user=bob",
+    authorized_scopes_own_user: describeScopes(crossProjectPacket.plan.authorized_scopes),
+    claims_returned_own_user: crossProjectPacket.packet.claims.map((claim) => claim.claim_id),
+    decision_own_user: crossProjectPacket.packet.decision,
+    missing_own_user: crossProjectPacket.packet.missing,
+    reached_other_principals_claim_own_user: crossProjectPacket.packet.claims.some(
+      (claim) => claim.scope.project !== null && claim.scope.project !== "billing",
     ),
-    claims_returned: crossProjectPacket.packet.claims.map((claim) => claim.claim_id),
-    decision: crossProjectPacket.packet.decision,
-    missing: crossProjectPacket.packet.missing,
+    selector_project_wide: "project=billing",
+    authorized_scopes_project_wide: describeScopes(crossProjectPacket.plan.authorized_scopes),
+    claims_returned_project_wide: crossProjectPacket.packet.claims.map((claim) => claim.claim_id),
+    decision_project_wide: crossProjectPacket.packet.decision,
+    missing_project_wide: crossProjectPacket.packet.missing,
+    reached_other_principals_claim_project_wide: crossProjectPacket.packet.claims.some(
+      (claim) => claim.scope.project !== null && claim.scope.project !== "billing",
+    ),
     reachable_scopes: await scopeVisibility(world, {
       principal: `user:${teammate}`,
       scopeIds: crossProjectPacket.plan.authorized_scope_ids,
       purposes: ["billing_ops"],
       predicate: "decision.approved",
     }),
-    reached_other_principals_claim: crossProjectPacket.packet.claims.some(
-      (claim) => claim.scope.project !== null && claim.scope.project !== "billing",
-    ),
   };
 
   record({

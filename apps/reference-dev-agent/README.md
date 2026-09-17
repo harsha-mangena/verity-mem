@@ -32,7 +32,7 @@ pins the tenant, which is otherwise fresh per run.
 | 1 | CI tool result (`origin: "tool"`) | Auto-accepted with `observation` authority, evidence span resolved and digest re-verified on the read. |
 | 2 | Human approval (`origin: "user"`) | Accepted with `user_self_report` authority. Two different authority classes, both above the auto-accept floor. |
 | 3 | Hostile document (`origin: "document"`) | The procedure candidate is **quarantined**, never accepted, and the reason codes are printed verbatim. |
-| 4 | Cross-user isolation probe | Two probes: same project different user, and a second project. See "Isolation" below — the first reports a real gap. |
+| 4 | Cross-user isolation probe | Three probes: selector names the asker, selector names only the project, and a second project. See "Isolation" below. |
 | 5 | A second, incompatible approval | `needs_review` with `conflict.contradicts_accepted`. The first claim is untouched: no silent overwrite. |
 | 6 | Action gate, three verdicts | High risk refuses both a `user_self_report` and a tool `observation`; low risk permits one. |
 | 7 | Correction | Supersession closes the validity interval; the old claim stays readable through `/explain`-equivalent reads while a current-time query stops returning it. |
@@ -64,48 +64,39 @@ Every number the narrative prints is read back out of `events`, `claims`,
 accumulated in memory by the caller, because a scenario that reported its own
 numbers could report flattering ones.
 
-## Isolation: what holds, and what does not
+## Isolation
 
-**Holds.** Tenant, purpose and project boundaries are enforced before retrieval.
-The second-project probe returns no claim from the first project, and its
-authorization read finds no reachable scope holding the predicate at all — the
-boundary is applied *before* retrieval, not as a filter afterwards. The probe is
-not vacuous: the same principal reaches project-scope claims inside their own
-project, and the project's owner reaches them too.
+Three probes, because "isolation" is three different claims:
 
-**Does not hold.** Per-user isolation inside one project. This is a package-level
-property, not a defect in this app:
+1. **Same project, selector names the asker.** `user:bob` asks for
+   `{project: "payments", user: "bob"}`. Returns nothing, and the authorization
+   read underneath the channels is empty too — the boundary is applied *before*
+   retrieval, not as a filter afterwards. This is the probe the specification asks
+   for and it passes.
+2. **Same project, selector names only the project.** The same principal asking
+   `{project: "payments"}` **does** reach the project's users. That is deliberate:
+   a project-scope operator legitimately needs the whole project, and a deployment
+   where this returned nothing would be broken rather than isolated. It is printed
+   next to probe 1 so "narrowed by the selector" and "isolated by the deployment"
+   are not confused with each other.
+3. **A second project in the same tenant.** Returns nothing, resolves no reachable
+   scope holding the predicate, and the teammate still receives their own billing
+   claims — so the probe distinguishes a boundary from a principal who can see
+   nothing at all.
 
-- `veritymem.scope_contains` (migration 0007) treats a `NULL` dimension on the
-  *caller's* scope as reaching every binding of that dimension on the row's scope.
-  Its comment states this is deliberate and asymmetric.
-- So a principal whose only membership is `project=payments` reaches every
-  `user=<someone>` scope inside `payments`.
-- `resolveScopes` never intersects the selector with the caller's reach, and a
-  selector that names a user is applied as a filter over the caller's scopes — so
-  naming yourself is *more* restrictive, not less: `{project, user: bob}` resolves
-  to no scope at all, while `{project}` reaches every user in the project.
+The mechanism in probe 1 is that a bound selector dimension is a *requirement*:
+a selector naming a user resolves only scopes that bind that user, so the project
+scope drops out. Before that rule existed, a project membership reached every user
+scope inside the project and `user:bob` received `user:alice`'s claims; that
+regression is fixed in `packages/retrieval` and asserted both ways in
+`packages/retrieval/src/isolation.test.ts`.
 
-Observed in this workload: `user:bob` asks for Alice's approved deploy window at
-the project scope and receives Alice's `decision.approved` claim, whose scope is
-`project=payments, user=alice`. The run prints this as
-`reached_other_principals_claim: true` rather than asserting the isolation the
-specification asks for, and `src/reference.test.ts` pins the observed value so it
-cannot change silently. If reach is fixed, that test fails loudly and the probe
-should be inverted — which is the intended failure direction.
-
-Two candidate fixes, both in packages or migrations rather than here: make the
-reach rule symmetric in the user dimension so a project membership reaches only
-project-scope rows, or have `resolveScopes` intersect the selector with the reach
-set so `{project, user: bob}` is a narrowing rather than an empty set. The first is
-the smaller change and matches what a reader expects "user scope" to mean.
-
-A related consequence worth knowing, because it shapes what an adapter can do: an
-action gate's plan resolves only through `principal_scopes`, which is filled when a
-principal *writes* in a scope. A release manager who has only ever written inside
-their own user scope cannot authorise an action citing a project-scope CI claim —
-the gate refuses with `action.denied_unknown_claim`. Writing a project-scope record
-is what grants project membership, which is why step 4 writes one.
+One consequence worth knowing, because it shapes what an adapter can do: an action
+gate's plan resolves through `principal_scopes`, which is filled when a principal
+*writes* in a scope. A release manager who has only ever written inside their own
+user scope cannot authorise an action citing a project-scope CI claim — the gate
+refuses with `action.denied_unknown_claim`. Writing a project-scope record is what
+grants project membership, which is why step 4 writes one.
 
 ## Review burden is a product-failure metric
 

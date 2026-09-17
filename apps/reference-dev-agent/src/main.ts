@@ -133,30 +133,30 @@ export async function runDemo(options: DemoOptions): Promise<ReferenceRun> {
       narrative.raw(`  human approval accepted:            ${result.approval.claim_id ?? "(none)"} (${result.approval.authority ?? "n/a"})`);
       narrative.raw(`  hostile procedure accepted:         ${result.hostile.accepted_claims.length === 0 ? "no — quarantined" : "YES (defect)"}`);
       narrative.raw(
-        `  isolation, same project:            teammate returned ${result.isolation.same_project.claims_returned.length} claim(s); ` +
-          `reached another principal's claim: ${result.isolation.same_project.reached_other_principals_claim ? "YES (boundary not enforced)" : "no"}`,
+        `  isolation, same project:            probe (selector names the teammate) returned ` +
+          `${result.isolation.same_project.claims_returned_own_user.length} claim(s); reached another principal's claim: ` +
+          `${result.isolation.same_project.reached_other_principals_claim_own_user ? "YES (LEAK)" : "no"}`,
       );
       narrative.raw(
-        `  isolation, second project:          teammate returned ${result.isolation.cross_project.claims_returned.length} claim(s); ` +
-          `reached another project's claim: ${result.isolation.cross_project.reached_other_principals_claim ? "YES (LEAK)" : "no"} ` +
-          `(missing: ${result.isolation.cross_project.missing.length})`,
+        `  isolation, project-wide selector:   returned ${result.isolation.same_project.claims_returned_project_wide.length} claim(s); ` +
+          `reached another principal's claim: ${result.isolation.same_project.reached_other_principals_claim_project_wide ? "yes, on purpose" : "NO (a project operator would be blind)"}`,
       );
       narrative.raw(
-        "  The first line is the probe the specification asks for and it reports a real",
+        `  isolation, second project:          returned ${result.isolation.cross_project.claims_returned_project_wide.length} claim(s); ` +
+          `reached another project's claim: ${result.isolation.cross_project.reached_other_principals_claim_project_wide ? "YES (LEAK)" : "no"}`,
       );
       narrative.raw(
-        "  gap: within one project there is no per-user boundary, because scope",
+        "  A selector that names the caller resolves only scopes binding that user, so the",
       );
       narrative.raw(
-        "  containment treats an unbound dimension as reaching every binding of it.",
+        "  teammate reaches nothing of Alice's. A project-wide selector still reaches the",
       );
       narrative.raw(
-        "  `scope.within_event_scope` still holds at promotion time, and purposes, tenant",
+        "  project's users, which is what a project-scope operator is for — the two lines",
       );
       narrative.raw(
-        "  and project are enforced. apps/reference-dev-agent/README.md has the mechanism",
+        "  are printed together so narrowing and isolation are not confused with each other.",
       );
-      narrative.raw("  and the two candidate fixes.");
       narrative.raw(`  contradiction detected:             ${result.contradiction.reason_codes.includes("conflict.contradicts_accepted") ? "yes — needs_review" : "no (defect)"}`);
       narrative.raw(`  correction history readable:        ${result.correction.readable_after_supersession ? "yes" : "no (defect)"}; current-time query returns it: ${result.correction.in_current_query ? "yes (defect)" : "no"}`);
       narrative.raw(`  retention residual matches:         ${result.retention.residual_matches} per ${result.retention.residual_scan.length} stores (${result.retention.status})`);

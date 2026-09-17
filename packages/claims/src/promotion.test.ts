@@ -192,3 +192,65 @@ describe("claim promotion invariant", () => {
     );
   });
 });
+
+describe("supersession boundaries", () => {
+  let h: Harness;
+
+  before(async () => {
+    h = await harness("supersession");
+  });
+  after(async () => {
+    await h.close();
+  });
+
+  it("accepts the same statement twice at the same instant without a constraint violation", async () => {
+    // The regression: the supersede branch closed the earlier claim's interval at the
+    // superseding claim's `valid_from`. With both observations sharing an
+    // `occurred_at` — which is what an idempotent client retry produces when its
+    // idempotency key changes — that gave the earlier claim a zero-length interval, and
+    // `valid_to > valid_from` is a table constraint, so the second append returned a 500
+    // about `claims_check`.
+    const first = await acceptedClaim(h, "I approved the Sunday 02:00 UTC deploy window.");
+    assert.ok(first);
+
+    const receipt = await h.ctx.ledger.append({
+      stream_id: "thread:2",
+      origin: "user",
+      actor_id: "user:alice",
+      scope: { tenant: h.tenantSlug, project: "payments", user: "alice", purpose: ["release_planning"] },
+      // The same instant as the first claim's event, deliberately.
+      occurred_at: "2026-09-10T09:14:00Z",
+      content: "I approved the Sunday 02:00 UTC deploy window.",
+    });
+    const second = await h.ctx.db.withRequest(
+      {
+        tenant: h.tenantId,
+        principal: "user:alice",
+        scopeIds: [receipt.scope.scope_id],
+        purposes: ["release_planning"],
+        action: "worker:process",
+      },
+      async (executor) => {
+        const event = await h.ctx.ledger.readEvent(executor, receipt.event_id);
+        assert.ok(event);
+        return h.pipeline.ingest(executor, event);
+      },
+    );
+    // No throw is the assertion; assert the decision too so a future change that starts
+    // silently rejecting duplicates is caught rather than passing as "no error".
+    assert.ok(second.decisions.length > 0);
+    assert.ok(
+      second.decisions.every((decision) => decision.outcome !== "reject"),
+      `a duplicate must not be rejected outright: ${second.decisions.map((d) => d.outcome).join(", ")}`,
+    );
+  });
+
+  it("never leaves a zero-length validity interval", async () => {
+    const rows = await h.ctx.db.withSystemContext({ tenant: h.tenantId, actor: "test" }, (executor) =>
+      executor.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM claims WHERE valid_to IS NOT NULL AND valid_to <= valid_from`,
+      ),
+    );
+    assert.equal(rows.rows[0]?.n, 0, "no claim may have an empty validity interval");
+  });
+});

@@ -138,26 +138,34 @@ describe("reference workload: multi-agent software delivery", () => {
     // all" would make this test fail for a relevance reason while claiming to be about
     // authorization.
     assert.equal(
-      run.isolation.cross_project.reached_other_principals_claim,
+      run.isolation.cross_project.reached_other_principals_claim_own_user,
       false,
-      `the second project must not reach the first project's claims, saw ${run.isolation.cross_project.claims_returned.join(", ")}`,
+      `the second project must not reach the first project's claims, saw ${run.isolation.cross_project.claims_returned_own_user.join(", ")}`,
     );
-    // No reachable scope holds the predicate. The teammate does hold a scope in their
-    // own project — `authorized_scopes` is non-empty — so this is a boundary and not a
-    // principal who can see nothing at all.
+    // The teammate *does* reach their own project, so this is a boundary and not a
+    // principal who can see nothing at all. The scope string is the teammate's own
+    // user scope inside billing, because that is the scope they wrote in; what matters
+    // is that a billing scope is authorized and that Alice's window is not in it.
     assert.ok(
-      run.isolation.cross_project.authorized_scopes.length > 0,
-      "the teammate must hold a scope of their own, or this probe is vacuous",
+      run.isolation.cross_project.authorized_scopes_project_wide.includes("user=bob"),
+      `the teammate must hold a billing scope, saw ${run.isolation.cross_project.authorized_scopes_project_wide.join(", ") || "none"}`,
     );
+    assert.ok(
+      run.isolation.cross_project.claims_returned_project_wide.length > 0,
+      "and must actually receive their own project's claims, or the probe proves only that they are blind",
+    );
+    // No reachable scope holds the predicate, so the boundary is applied before
+    // retrieval rather than as a filter afterwards.
     assert.deepEqual(
       run.isolation.cross_project.reachable_scopes,
       [],
       "the authorization read must be empty too: the boundary is before retrieval, not a filter after it",
     );
-    // The two shapes of "nothing": asking as the teammate's own user reaches no scope
-    // at all and the packet says so, while asking at the project scope reaches billing
-    // and simply holds no claim about Alice's window.
-    assert.deepEqual(run.isolation.cross_project.claims_returned_as_user, []);
+    // The teammate does receive their *own* billing claim — a preference they wrote in
+    // their own scope — and that is a correctness control rather than a leak: a probe
+    // that returned nothing at all could not tell isolation from blindness. What must
+    // not appear is anything of Alice's or anything from the payments project.
+    assert.equal(run.isolation.cross_project.reached_other_principals_claim_own_user, false);
     // The controls. Without them, "returned nothing" would be indistinguishable from
     // "can reach nothing", and a resolver that returned an empty set for everyone
     // would pass this test while the system was broken.
@@ -175,41 +183,31 @@ describe("reference workload: multi-agent software delivery", () => {
   });
 
   it("4b. same-project cross-user probe reports the boundary as evidence, not as an assertion", () => {
-    // The specification's probe is a second user *in the same project* asking for the
-    // first user's memory. On this deployment that read succeeds, and the reason is a
-    // package-level property rather than a demo defect:
-    //
-    //   `veritymem.scope_contains` treats a NULL dimension on the *caller's* scope as
-    //   reaching every binding of that dimension on the row's scope. A principal whose
-    //   only membership is the project scope therefore reaches every user scope inside
-    //   that project, and `resolveScopes` never intersects the selector with reach, so
-    //   naming `user=bob` does not narrow it either.
-    //
-    // This assertion pins the observed behaviour so it cannot change silently. It is
-    // the falsifiable form of the finding: fix the reach rule and this line fails
-    // loudly, which is what should happen. See README.md.
-    assert.equal(
-      run.isolation.same_project.reached_other_principals_claim,
-      true,
-      "if this is now false, per-user reach was fixed in packages/retrieval or migrations — update README.md and invert this assertion",
-    );
+    // The probe: a second user *in the same project* asks for the first user's memory,
+    // and the selector names the asker. This must return nothing.
     assert.deepEqual(
-      run.isolation.same_project.authorized_scopes,
-      ["project"],
-      "the project membership is what is authorized; the user dimension in the selector is not applied",
-    );
-    // Naming yourself is strictly more restrictive, not less: the selector removes
-    // scopes that do not bind that user, so the project scope drops out. Recording it
-    // here keeps the asymmetry from being rediscovered.
-    assert.deepEqual(
-      run.isolation.same_project.authorized_scopes_as_user,
+      run.isolation.same_project.claims_returned_own_user,
       [],
-      "a user-bound selector removes the project scope, because that scope does not bind the user",
+      `a user-named selector must not reach another user's claims, saw ${run.isolation.same_project.claims_returned_own_user.join(", ")}`,
     );
-    assert.ok(
-      run.isolation.same_project.reachable_scopes.some((scope) => scope.user !== null),
-      "the authorization read must show the other principal's scope, which is the mechanism",
+    assert.equal(run.isolation.same_project.reached_other_principals_claim_own_user, false);
+    assert.deepEqual(
+      run.isolation.same_project.reachable_scopes,
+      [],
+      "the authorization read underneath the channels must be empty too, not just the packet",
     );
+    // The calibration, and it is the reason this probe is not a tautology: the same
+    // principal asking project-wide *does* reach the project's users, because a
+    // project-scope operator is supposed to see the project. A deployment where this
+    // returned nothing would be broken rather than isolated, so the two outcomes are
+    // asserted together.
+    assert.equal(
+      run.isolation.same_project.reached_other_principals_claim_project_wide,
+      true,
+      "a project-wide selector must still reach the project, or the probe proves only that the teammate is blind",
+    );
+    assert.deepEqual(run.isolation.same_project.authorized_scopes_own_user, []);
+    assert.deepEqual(run.isolation.same_project.authorized_scopes_project_wide, ["project=payments"]);
   });
 
   it("5. detects the contradiction and does not overwrite the first claim", () => {

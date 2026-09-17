@@ -763,11 +763,24 @@ export class CommitGate {
       // Closed at the *superseding* claim's valid_from, not at the gate clock. The
       // earlier claim was believed until the moment the new one became true, and using
       // the clock instead can produce an interval whose bounds cross.
+      //
+      // The comparison is strictly `<`, not `<=`, and that is load-bearing. Two
+      // observations with the *same* `occurred_at` — the same sentence appended twice,
+      // which is exactly what an idempotent client retry produces when its idempotency
+      // key changes — have the same `valid_from`. Closing the earlier one at that
+      // instant gives it a zero-length interval, and `valid_to > valid_from` is a table
+      // constraint, so the whole append rolls back with `claims_check` and the caller
+      // sees a 500 about a constraint rather than anything about duplicates.
+      //
+      // Leaving the earlier claim open in that case is also the honest answer: two
+      // claims that became true at the same moment cannot be ordered by valid time, and
+      // the `duplicates` relation already records that they say the same thing. Only
+      // the relation is written; nothing is silently overwritten.
       await executor.query(
         `UPDATE claims
             SET status = 'superseded', valid_to = $2::timestamptz
           WHERE claim_id = $1::uuid AND valid_to IS NULL AND claim_id <> $3::uuid
-            AND valid_from <= $2::timestamptz`,
+            AND valid_from < $2::timestamptz`,
         [stripPrefix(hit.claim_id), validFrom, stripPrefix(claimId)],
       );
     }

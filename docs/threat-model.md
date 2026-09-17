@@ -1057,3 +1057,65 @@ project-wide principal still reaches the users in its project.
 **Why the existing tests missed it:** they asserted that a project-scoped caller reaches
 the project's users, which is true, and never asserted the converse. A suite can only
 find the direction it looks in.
+
+
+---
+
+# Addendum 4 — five more defects found by the delegated agents, and the acceptance run
+
+Every defect below was reported by the agent that found it and fixed by whoever owned
+the file. None were worked around.
+
+| # | Defect | Consequence | Fix |
+| --- | --- | --- | --- |
+| 1 | `OutboxWorker` could not claim a single message | 5,531 pending messages, all invisible; the worker claimed nothing forever while reporting itself healthy | Migrations 0011/0012: `SECURITY DEFINER` claim/complete/fail/lag functions, tenant-parameterised. `outbox.test.ts` now asserts a claim actually happens |
+| 2 | Cross-user isolation did not exist inside a project | `user:bob` received `user:alice`'s claims, and naming himself narrowed nothing | `resolveScopes` treats a bound selector dimension as a requirement. `isolation.test.ts` asserts both directions |
+| 3 | Supersession closed an interval at the gate clock | A post-dated observation produced `lower > upper` and rolled back the whole append | The interval closes at the superseding claim's `valid_from` |
+| 4 | Supersession closed an interval at the *same* instant | A duplicate claim at the same `occurred_at` produced a zero-length interval and `claims_check` returned a 500 | The guard is strictly `<`; two claims true at the same moment cannot be ordered by valid time, and only the `duplicates` relation is written |
+| 5 | Tenant derivation was not idempotent | A caller passing a slug wrote under `resolveTenantId(resolveTenantId(slug))` — a valid partition it could not predict and its own read path would never look in | `resolveTenantId` returns an existing UUID unchanged |
+
+Defect 4 is worth naming precisely because it was the second bug in the same three
+lines. The first fix corrected *which* timestamp closed the interval; the second
+corrected the *comparison*. A fix that is right about the value and wrong about the
+boundary still returns a 500, and only a test that wrote the same sentence twice at the
+same instant would have caught it.
+
+## What the acceptance run actually establishes
+
+`bash scripts/verify.sh` passes, and it is the only claim this document makes about the
+build as a whole. It checks, in order:
+
+1. PostgreSQL 17.11 with pgvector 0.8.6 reachable, queried directly.
+2. Migrations apply, none pending; 18 tables carry row-level security with 18 policies;
+   the application role is confirmed as **not** holding `BYPASSRLS`.
+3. `tsc --noEmit` clean across every workspace project.
+4. 270 tests pass against the real database, serial because the suite writes to a
+   shared append-only ledger.
+5. The offline Python harness passes.
+6. The reference workload completes all nine steps: a CI observation accepted, a human
+   approval accepted, a hostile procedure quarantined, isolation probes in both
+   directions, a contradiction recorded rather than overwritten, a corrected claim
+   still readable through history, a retention run with a zero residual scan over five
+   stores, and the action gate refusing at high risk and allowing at low risk.
+7. The HTTP surface, over a real socket: 202 on append, a packet whose claim carries a
+   verified quote and `digest_ok: true` with zero model calls, `/explain` in 15 ms, 403
+   for an agent credential on an admin route, and the single error shape on bad input.
+
+## What it does not establish, and cannot
+
+- **The review-burden target is failing.** LedgerBench measures 11.5% on
+  non-adversarial fixtures against a 2% ceiling, and 30.3% across all writes because the
+  suite deliberately includes quarantine paths. The specification calls this a
+  product-failure metric rather than an ops metric, and by its own criterion the gate is
+  miscalibrated: either the policy narrows what it accepts, or the human-review branch
+  is abandoned. This is the most important open number in the repository and it is
+  reported as a failure, not deferred.
+- **Cross-tenant isolation is unmeasured.** The specification states that a self-graded
+  isolation claim is worthless and requires an external red team. An in-house suite can
+  show that no cross-tenant *write* is admitted; it cannot show that no cross-tenant
+  *read* is possible, and it is reported as unmeasured rather than as zero.
+- **p95 latency is unmeasured.** It requires a published reference machine at one
+  million accepted claims.
+- **Four evaluation stages are `not_implemented`** rather than scored zero:
+  retrieval, composition, abstention and the action gate are exercised by the tests and
+  the demo, but no fixture stage scores them.

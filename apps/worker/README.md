@@ -45,7 +45,7 @@ gate".
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DATABASE_URL` | `postgres://veritymem_app:veritymem_app@127.0.0.1:55432/veritymem` | Application connection. This role is **not** a superuser and does **not** have `BYPASSRLS`, so row-level security applies to this process exactly as it does to the API. |
-| `WORKER_TENANT_SLUGS` | *(empty)* | Comma-separated tenant slugs this worker claims for. **Required in practice** — see the constraint below. An empty list logs `worker.no_tenants` and claims nothing forever. |
+| `WORKER_TENANT_SLUGS` | *(empty)* | Comma-separated tenant slugs this worker claims for. **Required in practice** — see the constraint below. Constructing the worker with an empty list throws rather than claiming nothing silently. |
 | `WORKER_BATCH_SIZE` | `25` | Messages claimed per tenant per cycle. |
 | `WORKER_POLL_INTERVAL_MS` | `1000` | Sleep between cycles when work is available. |
 | `LEDGER_BLOB_DIR` | `<repo>/.veritymem/blobs` | Content-addressed store for payloads above the inline limit. |
@@ -88,8 +88,7 @@ no model endpoint is configured, which is a supported deployment and not an erro
 {"ts":"…","level":"info","service":"veritymem-worker","msg":"worker.batch",
  "claimed":3,"completed":3,"failed":0,
  "kinds":{"extract.event":2,"project.claim":1},
- "tenants_with_work":1,
- "projection_lag_pending":0,"projection_lag_oldest_available_at":null}
+ "projection_lag_pending":0}
 ```
 
 | Field | Meaning |
@@ -98,9 +97,7 @@ no model endpoint is configured, which is a supported deployment and not an erro
 | `completed` | Messages whose processor returned and whose row was marked complete. |
 | `failed` | Messages whose processor threw. The outbox recorded the error and scheduled a retry with backoff; this process does not retry them itself. |
 | `kinds` | Per-kind breakdown of the claimed messages, so a stall is attributable to extraction or to projection. |
-| `tenants_with_work` | How many configured tenants contributed a message. |
-| `projection_lag_pending` | **Projection lag**: pending outbox rows (`completed_at IS NULL AND attempts < max_attempts`) across this worker's tenants. Rows that have exhausted `max_attempts` are excluded — those are a dead letter, not lag. |
-| `projection_lag_oldest_available_at` | The oldest due time among pending rows. A timestamp far in the past means the queue is behind rather than momentarily empty. |
+| `projection_lag_pending` | **Projection lag**: pending outbox rows (`completed_at IS NULL AND attempts < max_attempts`) across this worker's tenants, summed from `veritymem.outbox_lag`. Rows that have exhausted `max_attempts` are excluded — those are a dead letter, not lag. |
 
 ### `worker.no_tenants`, `worker.cycle_failed`, `worker.stopping`, `worker.stopped`, `worker.drained`
 
@@ -123,48 +120,42 @@ batch was still running when the signal arrived. `worker.drained` is emitted by
 Closing the pool before step 2 would abort a transaction mid-gate, and claiming
 after step 1 would take on work the process has already committed to abandoning.
 
-## Two constraints worth knowing before you deploy this
+## Three constraints worth knowing before you deploy this
 
-### 1. The tenant list is required because of a defect in `packages/ledger`
+### 1. The tenant list is required because claiming is tenant-addressable
 
-`migrations/0009` enables row-level security on `outbox` with the policy
-`tenant_id = veritymem.current_tenant_id()`. `OutboxWorker.claim()`,
-`.complete()` and `.fail()` all run through `Db.systemQuery`, which by contract
-takes a **fresh pooled connection** with no request context bound — so
-`current_tenant_id()` is NULL, the policy evaluates to FALSE, and the claim matches
-zero rows. The symptom is the worst kind: `runOnce` returns
-`{claimed: 0, completed: 0, failed: 0}` and the worker looks healthy while the
-queue never drains.
+`OutboxWorker` claims through the `veritymem.outbox_claim` SECURITY DEFINER
+function with an explicit tenant array (`tenants` in its options), so a worker
+claims its own tenants rather than the head of a global queue. A global claim is
+wrong in both directions: it takes work belonging to another deployment, and a
+backlog in one tenant starves every other tenant behind it in `outbox_id` order.
+`WORKER_TENANT_SLUGS` is how this process says which tenants it serves, and
+constructing an `OutboxWorker` with an empty list is rejected rather than silently
+claiming nothing — a worker with no tenants looks exactly like an idle one.
 
-Measured against this database, with one pending `extract.event` row for the
-tenant:
-
-```
-db.query(...)       inside a system context -> 1 row
-db.systemQuery(...) inside a system context -> 0 rows   <- a different connection
-new OutboxWorker(db).runOnce(5)             -> {claimed: 0, completed: 0, failed: 0}
-```
-
-Wrapping `OutboxWorker.runOnce` in `db.withSystemContext` therefore does **not**
-help: the context is transaction-local on the outer connection and `systemQuery`
-never sees it. The correct fix is inside `packages/ledger` — `claim`, `complete` and
-`fail` each need a tenant scope. That package is owned elsewhere, so
-`src/claim-loop.ts` is a **port** of those three statements with the original's
-semantics preserved (`SKIP LOCKED`, `attempts + 1`, `max_attempts`,
-`min(300, 2 ** min(attempts, 8))` seconds of backoff, unknown kind throws,
-`bindingFor` from the ledger rather than a copy). Two consequences are real:
-
-- tenants must be enumerated in configuration, because there is no unbound read
-  that can list them either (`tenants` is tenant-keyed too);
-- throughput is bounded by tenants × batch size per cycle, not by batch size.
-
-Delete `src/claim-loop.ts` and go back to `new OutboxWorker(db, processors)` the
-moment the ledger package binds a tenant in those three statements.
+The history is worth one paragraph, because it is why `--once` reports a lag and the
+README insists on a tenant list. Migration 0009 enabled row-level security on
+`outbox` with a tenant policy, which was right in principle, but the claim path went
+through `Db.systemQuery` — which is *not* a bypass; it holds a rollback and
+`RESET ALL`, not owner rights — so an unbound connection matched nothing. The worker
+claimed nothing, completed nothing and failed nothing, forever, while reporting
+itself healthy: 5,531 pending rows, all invisible. The repair moved claim, complete,
+fail and lag into privileged functions with an explicit tenant parameter. A queue a
+worker cannot read is worse than a queue with no policy, because the failure is
+invisible.
 
 ### 2. Shutdown is not crash safety
 
-A `SIGKILL` between claiming and completing leaves messages locked until their
-`locked_at` is reaped; no message is lost, because the outbox row is still pending,
-but it will not be retried until the lock is considered stale. Extraction is
-idempotent by construction (candidates are keyed on the event, the extractor and
-the span set), so a redelivery cannot double-write a claim.
+A `SIGKILL` between claiming and completing leaves messages locked until the lock is
+considered stale; no message is lost, because the outbox row is still pending, but it
+will not be retried until then. Extraction is idempotent by construction (candidates
+are keyed on the event, the extractor and the span set), so a redelivery cannot
+double-write a claim.
+
+### 3. Projection lag counts pending messages, not dead letters
+
+`projection_lag_pending` is `veritymem.outbox_lag` summed over this worker's tenants:
+rows that are `completed_at IS NULL` and under `max_attempts`. A message that has
+exhausted its attempts is a dead letter rather than lag, and counting it would make
+the metric climb forever on a permanent failure while hiding a real backlog behind a
+known one. Inspect `outbox.last_error` for those.
