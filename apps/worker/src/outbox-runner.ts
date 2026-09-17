@@ -115,15 +115,18 @@ export function createOutboxRunner(options: OutboxRunnerOptions): OutboxRunner {
     stop: () => worker.stop(),
     async drain(drainOptions = {}): Promise<CycleSummary> {
       const maxCycles = drainOptions.maxCycles ?? 10_000;
-      const total: CycleSummary = { claimed: 0, completed: 0, failed: 0, kinds: {}, tenants_with_work: [] };
+      let claimed = 0;
+      let completed = 0;
+      let failed = 0;
+      const kinds: Record<string, number> = {};
       const seen = new Set<string>();
       for (let cycle = 0; cycle < maxCycles; cycle += 1) {
         const summary = await runCycle();
-        total.claimed += summary.claimed;
-        total.completed += summary.completed;
-        total.failed += summary.failed;
+        claimed += summary.claimed;
+        completed += summary.completed;
+        failed += summary.failed;
         for (const [kind, count] of Object.entries(summary.kinds)) {
-          total.kinds[kind] = (total.kinds[kind] ?? 0) + count;
+          kinds[kind] = (kinds[kind] ?? 0) + count;
         }
         for (const tenant of summary.tenants_with_work) seen.add(tenant);
         // An empty cycle is the only signal that the queue is drained. Backoff
@@ -131,7 +134,7 @@ export function createOutboxRunner(options: OutboxRunnerOptions): OutboxRunner {
         // claims nothing is genuinely finished rather than momentarily empty.
         if (summary.claimed === 0) break;
       }
-      return { ...total, tenants_with_work: [...seen] };
+      return { claimed, completed, failed, kinds, tenants_with_work: [...seen] };
     },
   };
 }

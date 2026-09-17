@@ -217,8 +217,10 @@ export function installErrorHandler(
     // they must still leave in the single error shape.
     const status = typeof candidate.statusCode === "number" ? candidate.statusCode : 500;
     if (status >= 400 && status < 500) {
-      const code: ApiErrorCode = status === 415 ? "validation_failed" : status === 413 ? "validation_failed" : "validation_failed";
-      send(reply, new ApiError(code, "the request could not be parsed or accepted", status));
+      // 415 and 413 are the two a client can actually act on, and both are the
+      // client's fault rather than a server fault, so they stay in the 4xx family
+      // with the same code as any other malformed request.
+      send(reply, new ApiError("validation_failed", "the request could not be parsed or accepted", status));
       return;
     }
 

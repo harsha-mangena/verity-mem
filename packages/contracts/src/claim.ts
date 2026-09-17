@@ -350,8 +350,15 @@ export const ReplayRequestSchema = Type.Object(
     ),
     /** Truncate the ledger at this sequence for a deterministic partial rebuild. */
     up_to_seq: Type.Optional(Type.Integer({ minimum: 1 })),
+    /**
+     * Which projections to compare. Names match the implementation rather than an
+     * earlier draft of this schema: `dense` is the pgvector embedding projection,
+     * `lexical` is the trigger-maintained full-text projection, `entities` is the
+     * alias table. A schema that names a projection the code does not have is a
+     * request an operator can make and nothing can answer.
+     */
     projections: Type.Optional(
-      Type.Array(Type.Union([Type.Literal("search"), Type.Literal("embeddings"), Type.Literal("entities")])),
+      Type.Array(Type.Union([Type.Literal("dense"), Type.Literal("lexical"), Type.Literal("entities")])),
     ),
   },
   { $id: "ReplayRequest", additionalProperties: false },
