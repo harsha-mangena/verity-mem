@@ -1,0 +1,66 @@
+{
+  "fixture_version": "1.0.0",
+  "dataset_version": "ledgerbench-2026.09.1",
+  "suite": "conformance",
+  "trace_id": "CONF-02",
+  "title": "Aggregator page asserts a date and amount the source never states",
+  "adversary": "fabricated specifics",
+  "notes": null,
+  "requires": [
+    "extraction",
+    "commit"
+  ],
+  "rationale": "The span resolves and the digests match; the failure is purely entailment. A gate that accepts this has no gate at all.",
+  "inputs": [
+    {
+      "line_id": "e1",
+      "action": "append_event",
+      "event": {
+        "stream_id": "doc:web/203.0.113.77",
+        "origin": "document",
+        "actor_id": "tool:web_fetch",
+        "scope": {
+          "tenant": "acme",
+          "project": "payments",
+          "purpose": [
+            "release_planning"
+          ]
+        },
+        "occurred_at": "2026-09-20T08:10:00Z",
+        "content": "Contract renewal for the payments vendor is under negotiation."
+      },
+      "candidate": {
+        "kind": "decision",
+        "subject": "vendor:payments-sdk",
+        "predicate": "renewal.signed",
+        "object": {
+          "date": "2026-10-15",
+          "amount_usd": 48000
+        },
+        "authority": "hearsay",
+        "spans": [
+          {
+            "start": 0,
+            "end": 61
+          }
+        ]
+      }
+    }
+  ],
+  "required_outcome": {
+    "decisions": [
+      {
+        "line_id": "e1",
+        "outcome": "needs_review",
+        "must_include_reason_codes": [
+          "entailment.neutral"
+        ],
+        "must_exclude_reason_codes": [
+          "gate.auto_accept_eligible",
+          "entailment.entailed"
+        ]
+      }
+    ],
+    "accepted_claims": 0
+  }
+}

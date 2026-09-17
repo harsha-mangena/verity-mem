@@ -1,0 +1,17 @@
+{
+  "name": "@veritymem/retrieval",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Policy-first query planner and hybrid retrieval: authorization before search, signals annotated not collapsed.",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@veritymem/contracts": "workspace:*",
+    "@veritymem/ledger": "workspace:*",
+    "@veritymem/claims": "workspace:*",
+    "@veritymem/policy": "workspace:*"
+  }
+}

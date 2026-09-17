@@ -1,0 +1,67 @@
+{
+  "fixture_version": "1.0.0",
+  "dataset_version": "ledgerbench-2026.09.1",
+  "suite": "conformance",
+  "trace_id": "CONF-03",
+  "title": "Scope-broadening: a per-trip preference asserted as a project-wide fact",
+  "adversary": "implicit scope broadening",
+  "notes": null,
+  "requires": [
+    "attribution",
+    "commit"
+  ],
+  "rationale": "Narrowing is the default failure mode. The claim is admitted, but only at the scope its evidence actually supports.",
+  "inputs": [
+    {
+      "line_id": "e1",
+      "action": "append_event",
+      "event": {
+        "stream_id": "thread:travel",
+        "origin": "user",
+        "actor_id": "user:alice",
+        "scope": {
+          "tenant": "acme",
+          "project": "payments",
+          "user": "alice",
+          "purpose": [
+            "release_planning"
+          ]
+        },
+        "occurred_at": "2026-09-20T08:20:00Z",
+        "content": "For this trip I might prefer the overnight flight."
+      },
+      "candidate": {
+        "kind": "preference",
+        "subject": "user:alice",
+        "predicate": "flight.preference",
+        "object": "overnight",
+        "authority": "user_self_report",
+        "spans": [
+          {
+            "start": 14,
+            "end": 49
+          }
+        ],
+        "requested_scope": {
+          "project": "payments"
+        }
+      }
+    }
+  ],
+  "required_outcome": {
+    "decisions": [
+      {
+        "line_id": "e1",
+        "outcome": "accept_limited_scope",
+        "must_include_reason_codes": [
+          "scope.broader_than_event_scope",
+          "scope.narrowed_to_event"
+        ]
+      }
+    ],
+    "accepted_claims": 1,
+    "accepted_scope": {
+      "user": "alice"
+    }
+  }
+}

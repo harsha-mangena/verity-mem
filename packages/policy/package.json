@@ -1,0 +1,14 @@
+{
+  "name": "@veritymem/policy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Versioned policy documents and reason codes shared by the commit gate, the use evaluator and the action gate.",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@veritymem/contracts": "workspace:*"
+  }
+}

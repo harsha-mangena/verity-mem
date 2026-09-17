@@ -1,0 +1,23 @@
+{
+  "name": "@veritymem/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fastify API and MCP HTTP surface.",
+  "license": "Apache-2.0",
+  "main": "./src/main.ts",
+  "dependencies": {
+    "@fastify/swagger": "9.5.2",
+    "@fastify/swagger-ui": "5.2.2",
+    "@sinclair/typebox": "0.34.52",
+    "@veritymem/claims": "workspace:*",
+    "@veritymem/contracts": "workspace:*",
+    "@veritymem/gate": "workspace:*",
+    "@veritymem/ledger": "workspace:*",
+    "@veritymem/mcp-server": "workspace:*",
+    "@veritymem/model-adapters": "workspace:*",
+    "@veritymem/policy": "workspace:*",
+    "@veritymem/retrieval": "workspace:*",
+    "fastify": "5.6.1"
+  }
+}

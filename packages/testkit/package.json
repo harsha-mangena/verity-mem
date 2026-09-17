@@ -1,0 +1,15 @@
+{
+  "name": "@veritymem/testkit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared test scaffolding. Tests run against real PostgreSQL 17 as the RLS-bound application role.",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@veritymem/contracts": "workspace:*",
+    "@veritymem/ledger": "workspace:*"
+  }
+}

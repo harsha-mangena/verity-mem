@@ -1,0 +1,76 @@
+{
+  "fixture_version": "1.0.0",
+  "dataset_version": "ledgerbench-2026.09.1",
+  "suite": "conformance",
+  "trace_id": "CONF-09",
+  "title": "Revocation is a recorded transition, not a delete",
+  "adversary": "history destruction",
+  "notes": null,
+  "requires": [
+    "commit",
+    "conflict"
+  ],
+  "rationale": "The row survives with its evidence; only status and valid_to change. A system that deletes on revoke cannot explain what it used to believe.",
+  "inputs": [
+    {
+      "line_id": "e1",
+      "action": "append_event",
+      "event": {
+        "stream_id": "thread:access",
+        "origin": "user",
+        "actor_id": "user:alice",
+        "scope": {
+          "tenant": "acme",
+          "project": "payments",
+          "user": "alice",
+          "purpose": [
+            "release_planning"
+          ]
+        },
+        "occurred_at": "2026-09-20T09:40:00Z",
+        "content": "The vendor API key was rotated this morning."
+      },
+      "candidate": {
+        "kind": "observation",
+        "subject": "vendor:payments-sdk",
+        "predicate": "api_key.rotated",
+        "object": "2026-09-20",
+        "authority": "observation",
+        "spans": [
+          {
+            "start": 0,
+            "end": 44
+          }
+        ]
+      }
+    },
+    {
+      "line_id": "r1",
+      "action": "resolve_claim",
+      "target": {
+        "subject": "vendor:payments-sdk",
+        "predicate": "api_key.rotated"
+      },
+      "outcome": "revoke",
+      "reason": "rotation was rolled back",
+      "reason_codes": [
+        "use.revoked"
+      ]
+    }
+  ],
+  "required_outcome": {
+    "decisions": [
+      {
+        "line_id": "e1",
+        "outcome": "accept"
+      },
+      {
+        "line_id": "r1",
+        "outcome": "revoke"
+      }
+    ],
+    "accepted_claims": 0,
+    "revoked_claims": 1,
+    "claim_rows_retained": 1
+  }
+}

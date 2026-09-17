@@ -1,0 +1,18 @@
+{
+  "name": "@veritymem/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Extraction, gate and projection worker driven by the Postgres outbox with SKIP LOCKED.",
+  "license": "Apache-2.0",
+  "main": "./src/main.ts",
+  "dependencies": {
+    "@veritymem/claims": "workspace:*",
+    "@veritymem/contracts": "workspace:*",
+    "@veritymem/gate": "workspace:*",
+    "@veritymem/ledger": "workspace:*",
+    "@veritymem/model-adapters": "workspace:*",
+    "@veritymem/policy": "workspace:*",
+    "@veritymem/retrieval": "workspace:*"
+  }
+}

@@ -1,0 +1,66 @@
+# VerityMem v0.1 reference deployment.
+# One operational database (Postgres 17 + pgvector) plus content-addressed blob storage.
+# No Redis, no Neo4j, no separate vector store: every one of those would be a second
+# source of truth or a second operational dependency the spec deliberately omits.
+name: veritymem
+
+services:
+  postgres:
+    # pgvector 0.8.6 on PostgreSQL 17. Pinned by digest-equivalent tag, not floating.
+    image: pgvector/pgvector:0.8.6-pg17-trixie
+    container_name: veritymem-postgres
+    environment:
+      POSTGRES_USER: verity
+      POSTGRES_PASSWORD: verity
+      POSTGRES_DB: veritymem
+      # Deterministic collation so FTS ranking and ORDER BY are reproducible
+      # across machines; replay equality depends on it.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U verity -d veritymem"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - max_connections=200
+
+  minio:
+    # Content-addressed blob storage for large evidence payloads.
+    # Pulled from Quay: the minio/minio repository is no longer served by Docker Hub.
+    #
+    # Behind a profile because it is genuinely optional locally: the default blob
+    # store is the filesystem implementation, which is also content-addressed,
+    # immutable and rebuildable. Enable with:
+    #   docker compose --profile blobs up -d
+    profiles: ["blobs"]
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: veritymem-minio
+    environment:
+      MINIO_ROOT_USER: verity
+      MINIO_ROOT_PASSWORD: veritysecret
+    ports:
+      - "59000:9000"
+      - "59001:9001"
+    volumes:
+      - miniodata:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
+  miniodata:

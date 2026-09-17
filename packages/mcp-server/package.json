@@ -1,0 +1,21 @@
+{
+  "name": "@veritymem/mcp-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server over stdio and Streamable HTTP. Contributor profile by default; privileged tools are never registered.",
+  "license": "Apache-2.0",
+  "bin": {
+    "veritymem-mcp": "./src/stdio.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@sinclair/typebox": "0.34.52",
+    "@veritymem/contracts": "workspace:*",
+    "@veritymem/sdk-ts": "workspace:*",
+    "zod": "3.25.76"
+  }
+}

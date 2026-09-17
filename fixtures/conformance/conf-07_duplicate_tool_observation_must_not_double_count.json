@@ -1,0 +1,99 @@
+{
+  "fixture_version": "1.0.0",
+  "dataset_version": "ledgerbench-2026.09.1",
+  "suite": "conformance",
+  "trace_id": "CONF-07",
+  "title": "Duplicate tool observation must not double-count into two current claims",
+  "adversary": "accumulation",
+  "notes": null,
+  "requires": [
+    "commit",
+    "conflict"
+  ],
+  "rationale": "Accumulation without supersession is how an ADD-only store ends up with two contradictory-current rows for one fact.",
+  "inputs": [
+    {
+      "line_id": "e1",
+      "action": "append_event",
+      "event": {
+        "stream_id": "repo:acme/payments",
+        "origin": "tool",
+        "actor_id": "tool:ci",
+        "scope": {
+          "tenant": "acme",
+          "project": "payments",
+          "purpose": [
+            "release_planning"
+          ]
+        },
+        "occurred_at": "2026-09-20T09:00:00Z",
+        "content": "Build 9102 status is failed."
+      },
+      "candidate": {
+        "kind": "observation",
+        "subject": "build:9102",
+        "predicate": "status",
+        "object": "failed",
+        "authority": "observation",
+        "spans": [
+          {
+            "start": 0,
+            "end": 28
+          }
+        ]
+      }
+    },
+    {
+      "line_id": "e2",
+      "action": "append_event",
+      "event": {
+        "stream_id": "repo:acme/payments",
+        "origin": "tool",
+        "actor_id": "tool:ci",
+        "scope": {
+          "tenant": "acme",
+          "project": "payments",
+          "purpose": [
+            "release_planning"
+          ]
+        },
+        "occurred_at": "2026-09-20T09:20:00Z",
+        "content": "Build 9102 status is failed."
+      },
+      "candidate": {
+        "kind": "observation",
+        "subject": "build:9102",
+        "predicate": "status",
+        "object": "failed",
+        "authority": "observation",
+        "spans": [
+          {
+            "start": 0,
+            "end": 28
+          }
+        ]
+      }
+    }
+  ],
+  "required_outcome": {
+    "decisions": [
+      {
+        "line_id": "e1",
+        "outcome": "accept"
+      },
+      {
+        "line_id": "e2",
+        "outcome": "accept"
+      }
+    ],
+    "accepted_claims": 1,
+    "superseded_claims": 1,
+    "relations": [
+      {
+        "from": "build:9102|status|failed",
+        "to": "build:9102|status|failed",
+        "rel": "duplicates"
+      }
+    ]
+  }
+}

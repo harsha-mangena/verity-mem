@@ -1,0 +1,24 @@
+{
+  "name": "@veritymem/ledgerbench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "LedgerBench: the internal go/no-go instrument. Ground-truth event streams, an eleven-stage metric runner, and the conformance replay oracle.",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "ledgerbench": "node --experimental-strip-types src/cli.ts",
+    "test": "node --experimental-strip-types --test src/ledgerbench.test.ts"
+  },
+  "dependencies": {
+    "@veritymem/contracts": "workspace:*",
+    "@veritymem/gate": "workspace:*",
+    "@veritymem/ledger": "workspace:*",
+    "pg": "8.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.18.1"
+  }
+}

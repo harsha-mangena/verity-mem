@@ -1,0 +1,23 @@
+{
+  "name": "@veritymem/langgraph",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "LangGraph integration: a BaseStore over claims plus recall/record/propose/gate_action nodes.",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@veritymem/contracts": "workspace:*",
+    "@veritymem/sdk-ts": "workspace:*"
+  },
+  "peerDependencies": {
+    "@langchain/core": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@langchain/core": {
+      "optional": true
+    }
+  }
+}

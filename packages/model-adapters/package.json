@@ -1,0 +1,16 @@
+{
+  "name": "@veritymem/model-adapters",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Thin model interfaces: OpenAI-compatible, Anthropic, Ollama, plus a deterministic offline stand-in. A gateway is never a required control-plane dependency.",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@veritymem/contracts": "workspace:*",
+    "@veritymem/ledger": "workspace:*",
+    "@veritymem/gate": "workspace:*"
+  }
+}

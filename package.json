@@ -1,0 +1,30 @@
+{
+  "name": "veritymem",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A proof-carrying memory layer for AI agents. Evidence is canonical; extracted memory is a disposable projection.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "packageManager": "pnpm@9.15.9",
+  "scripts": {
+    "migrate": "node --experimental-strip-types scripts/migrate.ts",
+    "migrate:verify": "node --experimental-strip-types scripts/migrate.ts --verify",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --experimental-strip-types --test --test-concurrency=1 \"packages/*/src/**/*.test.ts\" \"apps/*/src/**/*.test.ts\"",
+    "test:unit": "node --experimental-strip-types --test \"packages/*/src/**/*.test.ts\"",
+    "db:up": "docker compose -f deploy/compose/docker-compose.yml up -d",
+    "db:down": "docker compose -f deploy/compose/docker-compose.yml down",
+    "db:reset": "docker compose -f deploy/compose/docker-compose.yml down -v && docker compose -f deploy/compose/docker-compose.yml up -d --wait",
+    "dev:server": "node --experimental-strip-types --watch apps/server/src/main.ts",
+    "dev:worker": "node --experimental-strip-types --watch apps/worker/src/main.ts",
+    "demo": "node --experimental-strip-types apps/reference-dev-agent/src/main.ts",
+    "eval:ledgerbench": "node --experimental-strip-types scripts/ledgerbench.ts"
+  },
+  "devDependencies": {
+    "@types/node": "22.18.1",
+    "typescript": "5.9.2"
+  }
+}

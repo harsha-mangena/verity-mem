@@ -1,0 +1,15 @@
+{
+  "name": "@veritymem/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Frozen event, candidate, claim, decision and packet schemas. Shared by the server, worker, SDK, MCP server and adapters.",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts",
+    "./schemas": "./src/schemas/index.ts"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "0.34.52"
+  }
+}

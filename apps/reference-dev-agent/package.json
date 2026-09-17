@@ -1,0 +1,14 @@
+{
+  "name": "@veritymem/reference-dev-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-agent software-delivery reference workload: mechanically checkable authority, and the demo entry point.",
+  "license": "Apache-2.0",
+  "main": "./src/main.ts",
+  "dependencies": {
+    "@veritymem/contracts": "workspace:*",
+    "@veritymem/ledger": "workspace:*",
+    "@veritymem/sdk-ts": "workspace:*"
+  }
+}

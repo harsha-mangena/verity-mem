@@ -1,0 +1,74 @@
+{
+  "fixture_version": "1.0.0",
+  "dataset_version": "ledgerbench-2026.09.1",
+  "suite": "conformance",
+  "trace_id": "CONF-10",
+  "title": "Erase one subject and prove the deletion by scan",
+  "adversary": "unproven deletion",
+  "notes": null,
+  "requires": [
+    "deletion"
+  ],
+  "rationale": "Zero is only meaningful if something actually scanned for it. The row surviving proves the ledger still testifies that the event existed.",
+  "inputs": [
+    {
+      "line_id": "e1",
+      "action": "append_event",
+      "event": {
+        "stream_id": "thread:support",
+        "origin": "user",
+        "actor_id": "user:gina",
+        "scope": {
+          "tenant": "acme",
+          "project": "support",
+          "user": "gina",
+          "purpose": [
+            "case_handling"
+          ]
+        },
+        "occurred_at": "2026-09-20T09:50:00Z",
+        "content": "Gina's delivery address is 9 Kiln Street, Leeds."
+      },
+      "candidate": {
+        "kind": "user_self_report",
+        "subject": "user:gina",
+        "predicate": "delivery_address",
+        "object": "9 Kiln Street, Leeds",
+        "authority": "user_self_report",
+        "spans": [
+          {
+            "start": 27,
+            "end": 47
+          }
+        ]
+      }
+    },
+    {
+      "line_id": "d1",
+      "action": "erase_subject",
+      "subject_or_scope": {
+        "user": "gina"
+      },
+      "mode": "erase",
+      "reason": "gdpr_art17"
+    }
+  ],
+  "required_outcome": {
+    "decisions": [
+      {
+        "line_id": "e1",
+        "outcome": "accept"
+      }
+    ],
+    "residual_matches": 0,
+    "residual_stores": [
+      "events",
+      "blobs",
+      "claims",
+      "embeddings",
+      "fts",
+      "cache"
+    ],
+    "ledger_rows_preserved": 1
+  }
+}

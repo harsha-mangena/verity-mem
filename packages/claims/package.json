@@ -1,0 +1,15 @@
+{
+  "name": "@veritymem/claims",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Claim lifecycle and bi-temporal model: promotion, relations, current/as_of/during semantics.",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@veritymem/contracts": "workspace:*",
+    "@veritymem/ledger": "workspace:*"
+  }
+}
