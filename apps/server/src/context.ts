@@ -32,6 +32,21 @@ import { ApiError } from "./errors.ts";
 import type { Identity } from "./identity.ts";
 import type { ServerDeps } from "./config.ts";
 
+/**
+ * A query function, bound or unbound.
+ *
+ * Deliberately a function rather than a `QueryExecutor`, because reach discovery runs
+ * on a pooled connection *outside* a request context while every other read runs
+ * inside one, and the two only look alike. Taking an executor would let a caller pass
+ * either one and the type would not say which — which is how a `Db` handed to a
+ * function expecting a bound executor throws "database access outside a request
+ * context" at runtime instead of failing to compile.
+ */
+export type QueryFn = <R extends Record<string, unknown>>(
+  text: string,
+  params?: readonly unknown[],
+) => Promise<{ rows: R[]; rowCount: number | null }>;
+
 export interface CallerScope {
   readonly scope_id: string;
   readonly project: string | null;
@@ -127,10 +142,10 @@ export function resolveCallerTenant(input: {
  * asking" true rather than aspirational.
  */
 export async function callerScopes(
-  executor: QueryExecutor,
+  query: QueryFn,
   input: { readonly tenantId: string; readonly principal: string; readonly now: string },
 ): Promise<CallerScope[]> {
-  const memberScopes = await executor.query<CallerScope>(
+  const memberScopes = await query<CallerScope>(
     `SELECT s.scope_id, s.project, s.user_id, s.agent_id, s.session_id, s.purpose
        FROM principal_scopes ps
        JOIN scopes s ON s.scope_id = ps.scope_id
@@ -139,7 +154,7 @@ export async function callerScopes(
     [input.tenantId, input.principal],
   );
 
-  const grants = await executor.query<{
+  const grants = await query<{
     matrix: { project?: string; user?: string; agent?: string; session?: string };
     actions: string[];
     purpose: string[];
@@ -180,7 +195,7 @@ export async function callerScopes(
     clauses.length === 0
       ? []
       : (
-          await executor.query<CallerScope>(
+          await query<CallerScope>(
             `SELECT s.scope_id, s.project, s.user_id, s.agent_id, s.session_id, s.purpose
                FROM scopes s
               WHERE s.tenant_id = $1::uuid
@@ -226,27 +241,75 @@ export interface CallerReach {
 }
 
 export async function callerReach(
-  executor: QueryExecutor,
+  query: QueryFn,
   input: { readonly tenantId: string; readonly principal: string; readonly now: string },
 ): Promise<CallerReach> {
-  const scopes = await callerScopes(executor, input);
+  const scopes = await callerScopes(query, input);
   const purposes = new Set<string>();
   for (const scope of scopes) for (const purpose of scope.purpose) purposes.add(purpose);
   return { scopeIds: scopes.map((scope) => scope.scope_id), purposes: [...purposes] };
 }
 
 /**
- * Read one object inside a bound request context, or report that it is not there.
+ * Run a handler with the caller's reach bound into the request context.
  *
- * One transaction, with the caller's reach bound into it exactly once. The reach is
- * discovered on a separate pooled connection beforehand (see `discoverReach`) rather
- * than in a nested transaction, and that is a correctness requirement rather than an
- * optimisation: `veritymem.set_request_context` writes transaction-local GUCs, so a
- * nested `withRequest` does not shadow the outer binding — it *overwrites* it for the
- * remainder of the outer transaction. A handler that discovered its reach inside its
- * own transaction would therefore run its real query under the discovery binding,
- * which has no scopes and no purposes, and every row would vanish. The symptom is a
- * 404 on an object that demonstrably exists.
+ * One transaction, and this shape is a correctness requirement rather than a style
+ * choice. Two constraints force it, and each rules out an obvious alternative:
+ *
+ *  1. `veritymem.set_request_context` writes *transaction-local* GUCs. A nested
+ *     `withRequest` therefore does not shadow an outer binding — it overwrites it for
+ *     the remainder of the outer transaction. A handler that discovered its reach in a
+ *     nested transaction would run its real query under the discovery binding, whose
+ *     scope set is empty, and every row would vanish. The symptom is a 404 on an object
+ *     that demonstrably exists.
+ *  2. `principal_scopes` is readable only to the principal it describes: its policy is
+ *     `tenant_id = current_tenant_id() AND principal_id = current_principal_id()`.
+ *     Membership therefore cannot be read on an unbound connection at all — it would
+ *     come back empty and the caller would appear to belong to nothing.
+ *
+ * So the binding is taken once, with the tenant and principal set, and the reach is
+ * read with it. That first binding names no scopes and no purposes, which grants
+ * nothing: `principal_scopes`, `grants` and `scopes` carry no claim content, and the
+ * tables that do carry claim content are guarded by the predicate whose inputs this
+ * call exists to compute. Only after the reach is known is the context re-set, in the
+ * same transaction, to the caller's scopes and purposes.
+ */
+async function withReachContext<T>(
+  deps: ServerDeps,
+  caller: TenantContext,
+  action: string,
+  options: { readonly readOnly: boolean },
+  fn: (executor: QueryExecutor) => Promise<T>,
+): Promise<T> {
+  const now = deps.clock.now().toISOString();
+  return deps.db.withRequest(
+    {
+      tenant: caller.tenantId,
+      principal: caller.principal,
+      scopeIds: [],
+      purposes: [],
+      action: `${action}:reach`,
+    },
+    async (executor) => {
+      const reach = await callerReach(
+        (text, params) => executor.query(text, params),
+        { tenantId: caller.tenantId, principal: caller.principal, now },
+      );
+      await executor.query(`SELECT veritymem.set_request_context($1::uuid, $2, $3::uuid[], $4::text[], $5)`, [
+        caller.tenantId,
+        caller.principal,
+        `{${reach.scopeIds.join(",")}}`,
+        `{${reach.purposes.map(quoteArrayElement).join(",")}}`,
+        action,
+      ]);
+      return fn(executor);
+    },
+    { readOnly: options.readOnly },
+  );
+}
+
+/**
+ * Read one object, or report that it is not there.
  *
  * The binding carries the caller's reachable scope ids *and* the purposes those scopes
  * hold. Both are required: the predicate denies an empty purpose set, so a read bound
@@ -258,27 +321,16 @@ export async function withReadContext<T>(
   caller: TenantContext,
   fn: (executor: QueryExecutor) => Promise<T>,
 ): Promise<T> {
-  const reach = await discoverReach(deps, caller);
-  return deps.db.withRequest(
-    {
-      tenant: caller.tenantId,
-      principal: caller.principal,
-      scopeIds: reach.scopeIds,
-      purposes: reach.purposes,
-      action: "api:read",
-    },
-    fn,
-    { readOnly: true },
-  );
+  return withReachContext(deps, caller, "api:read", { readOnly: true }, fn);
 }
 
 /**
  * Bind a write.
  *
  * The scope set is the caller's reach, because every write this server performs is
- * either inside a scope the caller participates in or is a decision about an object
- * in one. A write that needs to reach an object the caller does not hold is not a
- * write this server performs.
+ * either inside a scope the caller participates in or is a decision about an object in
+ * one. A write that needs to reach an object the caller does not hold is not a write
+ * this server performs.
  */
 export async function withWriteContext<T>(
   deps: ServerDeps,
@@ -286,39 +338,20 @@ export async function withWriteContext<T>(
   action: string,
   fn: (executor: QueryExecutor) => Promise<T>,
 ): Promise<T> {
-  const reach = await discoverReach(deps, caller);
-  return deps.db.withRequest(
-    {
-      tenant: caller.tenantId,
-      principal: caller.principal,
-      scopeIds: reach.scopeIds,
-      purposes: reach.purposes,
-      action,
-    },
-    fn,
-  );
+  return withReachContext(deps, caller, action, { readOnly: false }, fn);
 }
 
 /**
- * Discover the caller's reach on its own pooled connection.
+ * Quote one element of a Postgres array literal.
  *
- * This is the one place the server reads tenant-scoped tables outside
- * `withRequest`, and the exception is narrow enough to state precisely. `systemQuery`
- * clears the session context before and after, and `tenant_id` is passed as a bound
- * parameter, so the queries are correct rather than relying on the policies:
- * `principal_scopes`, `grants` and `scopes` are all tenant-keyed with no scope column,
- * and their policies (`principal_scopes_own`, `grants_authorized`, `scopes_tenant`)
- * are predicates over the tenant alone. There is no scope dimension for a request
- * context to bind, and therefore no row these queries can reach that a
- * `withRequest` binding would have excluded. It cannot read an event or a claim: those
- * tables are guarded by the predicate whose inputs this function exists to compute.
- *
- * The alternative — a nested `withRequest` — is not available, because the GUCs are
- * transaction-local and an inner binding overwrites the outer one.
+ * The scope-id array is interpolated rather than bound, because `set_request_context`
+ * takes an array and the driver's parameter handling for `uuid[]` through a text
+ * literal is what the ledger package already does. Purposes are caller-adjacent
+ * strings, so a quote or backslash in one must not be able to terminate the literal
+ * early and append a purpose of the caller's choosing.
  */
-async function discoverReach(deps: ServerDeps, caller: TenantContext): Promise<CallerReach> {
-  const now = deps.clock.now().toISOString();
-  return callerReach(deps.db, { tenantId: caller.tenantId, principal: caller.principal, now });
+function quoteArrayElement(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
 /**

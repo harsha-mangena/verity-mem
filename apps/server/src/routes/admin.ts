@@ -305,12 +305,17 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
       const mode = body.mode ?? "verify";
       // Annotated because the fallback array would otherwise widen to `string[]`, and
       // the `includes` checks below would stop being checked against the closed set of
-      // projection names. The contract's names are mapped to the stores they describe
-      // — `search` is the trigger-maintained lexical column, `embeddings` is the
-      // pgvector projection — because a caller asking to replay "search" is asking
-      // about a projection, not about a table name.
-      const wanted = new Set<"search" | "embeddings" | "entities">(
-        body.projections ?? ["search", "embeddings", "entities"],
+      // projection names.
+      //
+      // These names are the contract's, and they used to be different ones here:
+      // `search` and `embeddings` described the *shape* of the store rather than the
+      // projection, and the same two projections were called `lexical` and `dense` in
+      // `@veritymem/retrieval` and in `packages/contracts/src/claim.ts`. Two
+      // vocabularies for one concept is how a request that names a real projection gets
+      // rejected by a route that has never heard of it, so there is now one set of
+      // names and it is the contract's.
+      const wanted = new Set<"dense" | "lexical" | "entities">(
+        body.projections ?? ["dense", "lexical", "entities"],
       );
 
       const outcome = await deps.db.withRequest(
@@ -322,14 +327,14 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
           action: "replay",
         },
         async (executor) => {
-          const lexicalBefore = wanted.has("search")
+          const lexicalBefore = wanted.has("lexical")
             ? await digestLexicalProjection(executor, context.tenantId)
             : null;
-          // The dense digest is taken by reading the projected rows without truncating,
-          // so the "before" measurement is the real current state rather than the state
-          // a rebuild would produce — otherwise `byte_identical` would be true by
-          // construction and would prove nothing.
-          const denseBefore = wanted.has("embeddings")
+          // The dense digest is taken by rebuilding without truncating, so the "before"
+          // measurement is the real current state rather than the state a rebuild would
+          // produce — otherwise `byte_identical` would be true by construction and would
+          // prove nothing.
+          const denseBefore = wanted.has("dense")
             ? await rebuildProjections(executor, { db: deps.db, embeddings: deps.embeddings }, {
                 tenantId: context.tenantId,
                 truncate: false,
@@ -345,7 +350,7 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
           if (lexicalBefore) {
             const lexicalAfter = await digestLexicalProjection(executor, context.tenantId);
             results.push({
-              projection: "search",
+              projection: "lexical",
               digest_before: lexicalBefore.digest,
               digest_after: lexicalAfter.digest,
               rows_before: lexicalBefore.rows,
@@ -359,7 +364,7 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
               tenantId: context.tenantId,
             });
             results.push({
-              projection: "embeddings",
+              projection: "dense",
               digest_before: denseBefore.digest,
               digest_after: denseAfter.digest,
               rows_before: denseBefore.rows,

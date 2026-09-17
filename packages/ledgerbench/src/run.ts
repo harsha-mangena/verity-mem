@@ -1739,8 +1739,12 @@ class RunState {
           };
         }
         case "expect_relation_persisted": {
+          // Relation endpoints are resolved against every claim the run holds, not
+          // the as-of snapshot: a supersedes relation necessarily points at a claim
+          // that is no longer current, and a snapshot that excluded it could never
+          // match the very relation being asserted.
           const row = this.relations.find(
-            (relation) => relation.rel === expectation.kind && relationMatches(claims, relation, expectation),
+            (relation) => relation.rel === expectation.kind && relationMatches(this.claims, relation, expectation),
           );
           if (!row) {
             const detected = (this.decisionFor(entry, expectation)?.conflicts ?? []).some(
@@ -2289,12 +2293,60 @@ const RELATION_REASON_CODE: Readonly<Record<string, string>> = {
   derived_from: REASON_CODES.CONFLICT_NONE,
 };
 
-function relationMatches(claims: readonly ClaimRow[], relation: RelationRow, expectation: { readonly kind: string; readonly against_object?: unknown }): boolean {
-  const from = claims.find((claim) => claim.claim_id === relation.from_claim);
-  const to = claims.find((claim) => claim.claim_id === relation.to_claim);
+/**
+ * Does a persisted relation connect the two claims the fixture names?
+ *
+ * Matched by proposition rather than by claim id, and in both directions. Two
+ * reasons: a fixture names a claim by its subject/predicate/object because it
+ * cannot know an id it did not write, and a relation's direction is an
+ * implementation choice — `A supersedes B` and `B superseded-by A` are the same
+ * fact. A duplicate observation is the degenerate case where both endpoints share a
+ * proposition, so both orders have to be accepted or the fixture can never match.
+ */
+function relationMatches(
+  claims: readonly ClaimRow[],
+  relation: RelationRow,
+  expectation: {
+    readonly kind: string;
+    readonly subject?: string;
+    readonly predicate?: string;
+    readonly object?: unknown;
+    readonly against_subject?: string;
+    readonly against_predicate?: string;
+    readonly against_object?: unknown;
+  },
+): boolean {
+  const byId = new Map(claims.map((claim) => [claim.claim_id, claim]));
+  const from = byId.get(relation.from_claim);
+  const to = byId.get(relation.to_claim);
   if (!from || !to) return false;
-  if (expectation.against_object !== undefined && !objectsEqual(to.object, expectation.against_object)) return false;
-  return true;
+
+  const wantedFrom = {
+    ...(expectation.subject !== undefined ? { subject: expectation.subject } : {}),
+    ...(expectation.predicate !== undefined ? { predicate: expectation.predicate } : {}),
+    ...(expectation.object !== undefined ? { object: expectation.object } : {}),
+  };
+  const wantedTo = {
+    ...(expectation.against_subject !== undefined
+      ? { subject: expectation.against_subject }
+      : expectation.subject !== undefined
+        ? { subject: expectation.subject }
+        : {}),
+    ...(expectation.against_predicate !== undefined
+      ? { predicate: expectation.against_predicate }
+      : expectation.predicate !== undefined
+        ? { predicate: expectation.predicate }
+        : {}),
+    ...(expectation.against_object !== undefined
+      ? { object: expectation.against_object }
+      : expectation.object !== undefined
+        ? { object: expectation.object }
+        : {}),
+  };
+
+  const forward = matchesClaim(from, wantedFrom) && matchesClaim(to, wantedTo);
+  const reversed = matchesClaim(to, wantedFrom) && matchesClaim(from, wantedTo);
+  return forward || reversed;
 }
 
 function matchesClaim(claim: ClaimRow, match: { subject?: string; predicate?: string; object?: unknown; kind?: string; status?: string }): boolean {

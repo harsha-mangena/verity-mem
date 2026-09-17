@@ -378,15 +378,27 @@ describe("running fixtures against the real database", () => {
     );
   });
 
-  it("produces the same decision set for the same fixture run twice", async () => {
+  it("produces the same decision set on an independent second run", async () => {
     const report = loadFixtures({ root: FIXTURES, filter: "05_contradiction" });
     const fixture = report.files[0];
     assert.ok(fixture);
+    // Two runners, not two calls on one: each runner owns a fresh tenant because the
+    // ledger is append-only, and a second run inside the same tenant would inherit
+    // the first run's rows rather than re-derive them.
     const first = await runner.run(fixture);
-    const second = await runner.run(fixture);
-    const render = (run: FixtureRunResult) =>
-      run.decisions.map((decision) => `${decision.line_id}|${decision.outcome}|${[...decision.reason_codes].sort().join("+")}`);
-    assert.deepEqual(render(second), render(first), "the gate must be a function of its inputs");
+    const other = new FixtureRunner({ seed: 1 });
+    try {
+      const second = await other.run(fixture);
+      const render = (run: FixtureRunResult) =>
+        run.decisions.map(
+          (decision) =>
+            `${decision.line_id}|${decision.outcome}|${[...decision.reason_codes].sort().join("+")}`,
+        );
+      assert.ok(first.decisions.length > 0, "the fixture must produce a decision to compare");
+      assert.deepEqual(render(second), render(first), "the gate must be a function of its inputs");
+    } finally {
+      await other.close();
+    }
   });
 
   it("runs the ten conformance traces and reports the unimplemented requirements", async () => {
@@ -400,13 +412,18 @@ describe("running fixtures against the real database", () => {
         `${trace.trace_id} produced no check at all`,
       );
     }
-    // CONF-04 declares a contradicting relation as an unimplemented outcome; it must
-    // be reported as such rather than silently dropped or counted as a pass.
-    const conf04 = conformance.traces.find((trace) => trace.trace_id === "CONF-04");
-    assert.ok(conf04);
-    assert.ok((conf04.unimplemented.length ?? 0) > 0, "CONF-04 must record its unmet requirement");
-    for (const check of conf04.unimplemented) {
-      assert.notEqual(check.status, "pass");
+    // Traces that declare a requirement this build cannot meet must report it as an
+    // outstanding gap rather than dropping it or counting it as a pass. CONF-04 is
+    // the contradiction the gate detects but does not persist; CONF-05 is the
+    // supersession an operator performs explicitly without a relation row.
+    for (const traceId of ["CONF-04", "CONF-05"]) {
+      const trace = conformance.traces.find((entry) => entry.trace_id === traceId);
+      assert.ok(trace, `${traceId} must exist`);
+      assert.ok((trace.unimplemented.length ?? 0) > 0, `${traceId} must record its unmet requirement`);
+      for (const check of trace.unimplemented) {
+        assert.notEqual(check.status, "pass", `${traceId} must not report an unimplemented requirement as passing`);
+      }
     }
+    assert.equal(conformance.traces_failed, 0, "every required conformance check must hold");
   });
 });

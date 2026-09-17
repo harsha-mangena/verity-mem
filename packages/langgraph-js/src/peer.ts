@@ -119,14 +119,21 @@ async function probeSpecifier(specifier: string): Promise<PeerProbe> {
       };
     }
     const prototype = (candidate as { prototype?: Record<string, unknown> }).prototype;
-    const namespaced = typeof prototype?.["batch"] === "function" && typeof prototype?.["search"] === "function";
+    // `batch` is abstract in LangGraph's BaseStore, so it is absent from the prototype
+    // at runtime; `search` and `listNamespaces` are implemented there. They are the
+    // discriminator between the namespaced store and the string-keyed one.
+    const namespaced =
+      typeof prototype?.["search"] === "function" && typeof prototype?.["listNamespaces"] === "function";
+    const stringKeyed = typeof prototype?.["mget"] === "function" && typeof prototype?.["mset"] === "function";
     return {
       specifier,
       found: true,
       namespaced,
       detail: namespaced
-        ? "exports a namespaced BaseStore (batch + search); use it where instanceof is required"
-        : "exports a BaseStore without batch/search; its interface is string-keyed, use the langchain-core entry point",
+        ? "exports a namespaced BaseStore (get/search/put/delete/listNamespaces); use it where instanceof is required"
+        : stringKeyed
+          ? "exports a string-keyed BaseStore (mget/mset/mdelete/yieldKeys); use the langchain-core entry point"
+          : "exports a BaseStore whose interface is neither namespaced nor string-keyed",
     };
   } catch (error) {
     return {

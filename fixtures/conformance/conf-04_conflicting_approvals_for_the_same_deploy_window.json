@@ -28,7 +28,7 @@
             "release_planning"
           ]
         },
-        "occurred_at": "2026-09-20T08:30:00Z",
+        "occurred_at": "2026-09-10T08:30:00Z",
         "content": "The payments deploy window is 02:00 UTC."
       },
       "candidate": {
@@ -60,7 +60,7 @@
             "release_planning"
           ]
         },
-        "occurred_at": "2026-09-20T08:35:00Z",
+        "occurred_at": "2026-09-10T08:35:00Z",
         "content": "The payments deploy window is 04:00 UTC."
       },
       "candidate": {

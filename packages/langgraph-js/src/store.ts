@@ -430,6 +430,15 @@ export class ClaimBackedStore {
       }
     }
     if (failures.length > 0) {
+      // A single-operation batch is how every convenience method calls in — the peer's
+      // wrappers all send exactly one operation — so wrapping that failure in an
+      // AggregateError would replace a typed refusal with an untyped envelope for no
+      // gain. Multi-operation batches keep the envelope, because there the index and
+      // the partial-application count are the information the caller needs.
+      const first = failures[0];
+      if (failures.length === 1 && operations.length === 1 && first !== undefined) {
+        throw first.error;
+      }
       const detail = failures
         .map((failure) => `#${failure.index} (${operationKind(operations[failure.index])}): ${describe(failure.error)}`)
         .join("; ");
@@ -669,12 +678,24 @@ export function writeScopeOf(scope: StoreScope): {
   };
 }
 
-/** Whether a claim's own scope is contained by the namespace that asked for it. */
+/**
+ * Whether a claim's own scope satisfies the namespace that asked for it.
+ *
+ * Matching is per dimension and a dimension the namespace does not name is a wildcard,
+ * which is the rule `ScopeSelector` already documents: a null dimension means "any".
+ * Getting this backwards — requiring the claim to name every dimension the namespace
+ * omits — would make `get(prefix, item.key)` fail for an item that `search(prefix)`
+ * just returned, which is the kind of inconsistency that teaches callers to ignore the
+ * namespace entirely.
+ *
+ * A dimension the namespace *does* name must match exactly, including when the claim's
+ * value is null: a tenant-wide claim is not an item in a user's namespace.
+ */
 function claimWithinScope(claim: ClaimRecord, scope: StoreScope): boolean {
   for (const dimension of BOUND_DIMENSIONS) {
-    const claimValue = claim.scope[dimension];
-    if (claimValue === null || claimValue === undefined) continue;
-    if (scope[dimension] !== claimValue) return false;
+    const wanted = scope[dimension];
+    if (wanted === undefined) continue;
+    if (claim.scope[dimension] !== wanted) return false;
   }
   return scope.purpose.every((purpose) => claim.scope.purpose.includes(purpose));
 }

@@ -95,6 +95,13 @@ export class VerityMemStore extends BaseStore {
     }
 
     if (failures.length > 0) {
+      // The peer's own wrappers send exactly one operation, so a single-operation
+      // failure is rethrown as itself: wrapping it would replace a typed refusal with
+      // an untyped envelope on every `search`, `get` and `delete` call.
+      const first = failures[0];
+      if (failures.length === 1 && operations.length === 1 && first !== undefined) {
+        throw first.error;
+      }
       const detail = failures
         .map((failure) => `#${failure.index}: ${failure.error instanceof Error ? failure.error.message : String(failure.error)}`)
         .join("; ");

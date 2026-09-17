@@ -28,7 +28,7 @@
             "release_planning"
           ]
         },
-        "occurred_at": "2026-09-20T09:00:00Z",
+        "occurred_at": "2026-09-10T09:00:00Z",
         "content": "Build 9102 is failed."
       },
       "candidate": {
@@ -60,7 +60,7 @@
             "release_planning"
           ]
         },
-        "occurred_at": "2026-09-20T09:20:00Z",
+        "occurred_at": "2026-09-10T09:20:00Z",
         "content": "Re-run confirms build 9102 is failed."
       },
       "candidate": {

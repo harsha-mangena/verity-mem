@@ -29,7 +29,7 @@
             "release_planning"
           ]
         },
-        "occurred_at": "2026-09-20T08:40:00Z",
+        "occurred_at": "2026-09-10T08:40:00Z",
         "content": "Release config: the payments build is java-21."
       },
       "candidate": {
@@ -76,7 +76,7 @@
             "release_planning"
           ]
         },
-        "occurred_at": "2026-09-20T09:10:00Z",
+        "occurred_at": "2026-09-10T09:10:00Z",
         "content": "Release config: the payments build is java-23."
       },
       "candidate": {
@@ -106,13 +106,16 @@
       }
     ],
     "accepted_claims": 1,
-    "superseded_claims": 1,
+    "superseded_claims": 1
+  },
+  "unimplemented_outcome": {
     "relations": [
       {
         "from": "service:payments|build|java-23",
         "to": "service:payments|build|java-21",
         "rel": "supersedes"
       }
-    ]
+    ],
+    "because": "The supersession here is performed by an explicit operator decision, which is honest but is not the same thing as the gate discovering it: no claim_relations row is written, so a reader of the relation graph cannot see why the old claim stopped being current. A build that accepts the second claim and records the supersession itself would satisfy this."
   }
 }

@@ -387,8 +387,10 @@ describe("namespace mapping: explicit dimensions only", () => {
   it("refuses an unnamed dimension, a missing tenant, a missing purpose and an unbound scope", () => {
     const codec = createNamespaceCodec();
     assert.throws(
-      () => codec.toScope(["acme", "payments", "alice", "x", "y", "release_planning"]),
-      (error: unknown) => error instanceof NamespaceMappingError && error.code === "positional_length_mismatch",
+      // A typo in a dimension name is the failure mode this catches: "tenent:acme"
+      // looks explicit, and is not.
+      () => codec.toScope(["tenent:acme", "user:alice", "purpose:release_planning"]),
+      (error: unknown) => error instanceof NamespaceMappingError && error.code === "opaque_segment",
     );
     assert.throws(
       () => codec.toScope(["project:payments", "user:alice", "purpose:release_planning"]),
@@ -707,7 +709,11 @@ describe("ClaimBackedStore over the REST surface", () => {
     const store = new ClaimBackedStore({ client: harness.client });
 
     const results = await store.batch([
-      { type: "search", namespacePrefix: ["tenant:acme", "user:alice", "purpose:release_planning"] },
+      {
+        type: "search",
+        namespacePrefix: ["tenant:acme", "user:alice", "purpose:release_planning"],
+        filter: { query: "deploy" },
+      },
       { type: "put", namespace: ["tenant:acme", "user:alice", "purpose:release_planning"], key: "k", value: { v: 1 } },
       { type: "get", namespace: ["tenant:acme", "user:alice", "purpose:release_planning"], key: CLAIM_ID },
     ] as const);
@@ -1143,7 +1149,7 @@ describe("the optional LangChain peer", () => {
     // A search without a query is refused: VerityMem search is an authorized
     // retrieval, not a scan, and the peer's default options carry no query.
     await assert.rejects(() => store.search(namespace), StoreOperationRefusedError);
-    assert.deepEqual(harness.requests, [], "a refused search must not reach the network");
+    assert.equal(harness.requests.length, 0, "a refused search must not reach the network");
 
     const items = await store.search(namespace, { query: "deploy window", limit: 5 });
     assert.equal(harness.requests[0]?.path, "/v1/query");
@@ -1162,14 +1168,7 @@ describe("the optional LangChain peer", () => {
     assert.equal(harness.requests.length, 2, "a refusal must not become a request");
 
     // Per-item index configuration would be lost at the next projection rebuild.
-    await assert.rejects(
-      () => store.put(namespace, "k", { v: 1 }, ["value"]),
-      (error: unknown) => {
-        assert.ok(error instanceof AggregateError);
-        assert.ok(error.errors[0] instanceof StoreOperationRefusedError);
-        return true;
-      },
-    );
+    await assert.rejects(() => store.put(namespace, "k", { v: 1 }, ["value"]), StoreOperationRefusedError);
 
     // A namespace that does not name its dimensions never reaches the peer.
     await assert.rejects(

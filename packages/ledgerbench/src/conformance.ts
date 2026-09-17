@@ -202,8 +202,18 @@ function checkOutcome(
 
   // --- relations -----------------------------------------------------------
   for (const assertion of outcome.relations ?? []) {
-    const from = run.claims.find((claim) => describeClaim(claim) === assertion.from);
-    const to = run.claims.find((claim) => describeClaim(claim) === assertion.to);
+    const wantedFrom = stripQuotes(assertion.from);
+    const wantedTo = stripQuotes(assertion.to);
+    // A duplicate relation has the same proposition at both ends and the two ends
+    // are two different rows, so each endpoint is consumed by the first match.
+    const unused = [...run.claims];
+    const takeFirst = (wanted: string): ClaimRow | undefined => {
+      const index = unused.findIndex((claim) => stripQuotes(describeClaim(claim)) === wanted);
+      if (index < 0) return undefined;
+      return unused.splice(index, 1)[0];
+    };
+    const from = takeFirst(wantedFrom);
+    const to = takeFirst(wantedTo) ?? run.claims.find((claim) => stripQuotes(describeClaim(claim)) === wantedTo);
     if (!from || !to) {
       add(
         `relation ${assertion.rel} ${assertion.from} -> ${assertion.to}`,
@@ -212,9 +222,14 @@ function checkOutcome(
       );
       continue;
     }
+    // Direction is an implementation choice, and a duplicate-relies relation has
+    // the same proposition at both ends. Both orders are accepted; anything else
+    // would make the oracle grade a naming convention rather than a fact.
     const found = run.relations.some(
       (relation) =>
-        relation.rel === assertion.rel && relation.from_claim === from.claim_id && relation.to_claim === to.claim_id,
+        relation.rel === assertion.rel &&
+        ((relation.from_claim === from.claim_id && relation.to_claim === to.claim_id) ||
+          (relation.from_claim === to.claim_id && relation.to_claim === from.claim_id)),
     );
     add(
       `relation ${assertion.rel} ${assertion.from} -> ${assertion.to}`,
@@ -295,11 +310,25 @@ function checkOutcome(
   return checks;
 }
 
+/**
+ * How a fixture names a claim it did not create.
+ *
+ * The three fields a fixture can know: it wrote the subject, the predicate and the
+ * object, and it cannot know the id the store assigned. A JSON string object is
+ * rendered without its quotes so `{"object":"rotation completed"}` and
+ * `{"object":"\"rotation completed\""}` are not two different claims.
+ */
 function describeClaim(claim: ClaimRow): string {
   return `${claim.subject}|${claim.predicate}|${renderObject(claim.object)}`;
 }
 
+/** Remove the outer quotes JSON.stringify adds to a string, if present. */
+function stripQuotes(value: string): string {
+  return value.startsWith('"') && value.endsWith('"') && value.length > 1 ? value.slice(1, -1) : value;
+}
+
 function renderObject(value: unknown): string {
   if (typeof value === "string") return value;
-  return JSON.stringify(value);
+  const rendered = JSON.stringify(value);
+  return rendered.startsWith('"') && rendered.endsWith('"') ? rendered.slice(1, -1) : rendered;
 }

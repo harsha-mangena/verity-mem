@@ -26,9 +26,10 @@ import type { Clock, LedgerReceipt } from "@veritymem/ledger";
 import { readClaim } from "@veritymem/claims";
 import { evaluateAction, forget, type ForgetManifest } from "@veritymem/retrieval";
 import { compose, correctClaim, type ComposeResult, type RetrievalDependencies } from "@veritymem/retrieval";
-import { HashEmbeddingBackend } from "@veritymem/retrieval";
+import type { HashEmbeddingBackend } from "@veritymem/retrieval";
 import {
   PROJECT_PURPOSES,
+  createEmbeddings,
   counts,
   decisionsSince,
   readEvidence,
@@ -205,10 +206,15 @@ export interface VerdictShape {
 }
 
 export interface RunOptions {
-  /** Injected so the same scenario can run through the worker process or in-process. */
   readonly driver: WorkerDriver;
-  /** Deterministic hash embedder id, recorded for the reader. */
-  readonly embeddingModelId: string;
+  /**
+   * The embedding backend the *driver* writes projections with.
+   *
+   * Passed in rather than constructed here so the two sides cannot diverge: the
+   * reader uses this same instance, and the model id it reports is what the dense
+   * channel matches on.
+   */
+  readonly embeddings: HashEmbeddingBackend;
   /** Called after every step, so the narrative streams instead of printing at the end. */
   readonly onStep?: (step: StepResult) => void;
   /** Policy version the run's decisions carry, read back from the database. */
@@ -237,10 +243,15 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     options.onStep?.(step);
   };
 
+  // One embedding backend for the whole run, and `driver` must be built with it.
+  // The dense channel filters on `claim_embeddings.model_id`, so a reader whose
+  // backend reports a different id than the writer's silently retrieves nothing —
+  // see `createEmbeddings` in world.ts.
+  const embeddings = options.embeddings;
   const deps: RetrievalDependencies = {
     db: world.db,
     ledger: world.ledger,
-    embeddings: new HashEmbeddingBackend({ dimensions: 1024, modelId: options.embeddingModelId }),
+    embeddings,
     ids: world.ids,
     clock: world.clock,
     policyVersion: DEFAULT_COMMIT_POLICY.version,

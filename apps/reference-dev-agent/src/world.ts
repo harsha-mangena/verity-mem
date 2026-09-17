@@ -30,6 +30,21 @@ import { createOutboxRunner } from "../../worker/src/outbox-runner.ts";
 /** Purposes the reference project writes and reads under. */
 export const PROJECT_PURPOSES = ["release_planning"] as const;
 
+/**
+ * The embedding backend, built once per run and shared by the projection writer and
+ * the retrieval reader.
+ *
+ * This is not tidiness. `denseChannel` filters on `claim_embeddings.model_id`, so a
+ * reader whose backend reports a different model id than the writer's retrieves
+ * **nothing at all** — no error, no warning, an empty packet that looks exactly like
+ * an authorization denial. The hash backend appends its dimension count to whatever
+ * model id it is given, so passing `model_id` on one side and `modelId` + dimensions
+ * on the other is enough to produce that silent split. One instance, one id.
+ */
+export function createEmbeddings(): HashEmbeddingBackend {
+  return new HashEmbeddingBackend({ dimensions: 1024, modelId: "hash-ngram-v1-1024" });
+}
+
 export interface World {
   readonly db: Db;
   readonly ledger: Ledger;
@@ -95,10 +110,10 @@ export interface WorkerDriver {
  * The worker's own code path: the processors from `buildProcessors`, driven by the
  * runner `apps/worker/src/main.ts` uses.
  */
-export function createRunnerDriver(world: World): WorkerDriver {
+export function createRunnerDriver(world: World, embeddings: HashEmbeddingBackend = createEmbeddings()): WorkerDriver {
   const runner = createOutboxRunner({
     db: world.db,
-    processors: buildProcessors(world),
+    processors: buildProcessors(world, embeddings),
     tenantIds: [world.tenantId],
     batchSize: 25,
   });
@@ -130,10 +145,10 @@ export function createRunnerDriver(world: World): WorkerDriver {
  * the cycle wrapper. Having both makes that distinction observable instead of
  * guessed.
  */
-export function createClaimLoopDriver(world: World): WorkerDriver {
+export function createClaimLoopDriver(world: World, embeddings: HashEmbeddingBackend = createEmbeddings()): WorkerDriver {
   const loop = createClaimLoop({
     db: world.db,
-    processors: buildProcessors(world),
+    processors: buildProcessors(world, embeddings),
     actor: "reference-dev-agent:worker",
   });
 
@@ -170,7 +185,11 @@ export function createClaimLoopDriver(world: World): WorkerDriver {
  * The pipeline records "no model extractor configured; deterministic extraction
  * only" on every event, so the run does not pretend otherwise.
  */
-export function buildProcessors(world: World, modelExtractor: Extractor | null = null): OutboxProcessor[] {
+export function buildProcessors(
+  world: World,
+  embeddings: HashEmbeddingBackend,
+  modelExtractor: Extractor | null = null,
+): OutboxProcessor[] {
   const pipeline = new IngestPipeline({
     db: world.db,
     ledger: world.ledger,
@@ -195,8 +214,9 @@ export function buildProcessors(world: World, modelExtractor: Extractor | null =
     },
     // The projection processor comes from `@veritymem/retrieval` unchanged. Only
     // accepted claims reach it, because the ingest pipeline enqueues `project.claim`
-    // only for a decision that produced a claim.
-    createProjectionProcessor({ db: world.db, embeddings: new HashEmbeddingBackend({ dimensions: 1024 }) }),
+    // only for a decision that produced a claim. It shares the caller's embedding
+    // instance, so its `model_id` cannot differ from the reader's.
+    createProjectionProcessor({ db: world.db, embeddings }),
   ];
 }
 
