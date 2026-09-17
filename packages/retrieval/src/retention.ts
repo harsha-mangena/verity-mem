@@ -14,7 +14,7 @@
  * recorded about this subject", which is precisely the question a regulator asks.
  */
 import { REASON_CODES, type RetentionJob, type RetentionMode } from "@veritymem/contracts";
-import type { Clock, Db, IdGenerator, Ledger, QueryExecutor } from "@veritymem/ledger";
+import type { BlobStore, Clock, Db, IdGenerator, Ledger, QueryExecutor } from "@veritymem/ledger";
 import { toPublicId } from "@veritymem/ledger";
 import { deindexClaim } from "./projections.ts";
 
@@ -36,6 +36,7 @@ export interface ForgetRequest {
 export interface RetentionDependencies {
   readonly db: Db;
   readonly ledger: Ledger;
+  readonly blobs: BlobStore;
   readonly ids: IdGenerator;
   readonly clock: Clock;
 }
@@ -57,11 +58,40 @@ export interface StoreOutcome {
   readonly method: string;
 }
 
+/**
+ * What happened to the out-of-line blob objects, in three separate counts.
+ *
+ * The assessment's requirement is exact: "Separate references removed, blob objects
+ * deleted and blob objects retained in the manifest," and "The manifest never counts a
+ * detached reference as a deleted blob object."
+ *
+ * The distinction is not bookkeeping. A content-addressed store deduplicates, so clearing
+ * one event's `payload_ref` removes a reference while the object stays live for whoever
+ * else shares those exact bytes. Reporting that as a deletion would be a false claim of
+ * erasure, and deleting the object would be silent data loss for the other holder. Both
+ * are avoided only by counting the three things separately.
+ */
+export interface BlobOutcome {
+  /** Refs cleared from events by this job. Each was one row's pointer to an object. */
+  readonly references_removed: number;
+  /** Objects verified absent from the physical store after the job. */
+  readonly objects_deleted: number;
+  /** Objects still present because another live row references the same bytes. */
+  readonly objects_retained_shared: number;
+  /** Objects still present for any other reason, which is a failure to report. */
+  readonly objects_retained_other: number;
+  /** False when the configured store cannot physically delete. */
+  readonly store_supports_deletion: boolean;
+  readonly refs_deleted: readonly string[];
+  readonly refs_retained_shared: readonly string[];
+}
+
 export interface ForgetManifest {
   readonly job_id: string;
   readonly mode: RetentionMode;
   readonly reason: string;
   readonly stores: readonly StoreOutcome[];
+  readonly blobs: BlobOutcome;
   readonly claims_affected: number;
   readonly events_redacted: number;
   readonly started_at: string;
@@ -132,6 +162,9 @@ async function runForget(
   const stores: StoreOutcome[] = [];
   const tenantId = request.tenant_id;
 
+  /** Content-addressed refs the erased events pointed at, captured before they are cleared. */
+  let affectedRefs: { rows: { payload_ref: string }[] } = { rows: [] };
+
   const scopeFilter = {
     project: selector.project ?? null,
     user: selector.user ?? null,
@@ -187,6 +220,17 @@ async function runForget(
 
   // ---- Phase 1: scrub ----------------------------------------------------
   if (mode === "erase" || mode === "redact" || mode === "export_then_erase") {
+    // Captured *before* the UPDATE below, which is the only moment these refs exist. An
+    // earlier version read them afterwards and always got an empty list, so the reclamation
+    // step had nothing to reclaim and the manifest reported zero references removed while
+    // the objects sat on disk.
+    affectedRefs = await executor.query<{ payload_ref: string }>(
+      `SELECT DISTINCT payload_ref
+         FROM events
+        WHERE event_id = ANY($1::uuid[]) AND payload_ref IS NOT NULL`,
+      [affectedEvents.rows.map((row) => row.event_id)],
+    );
+
     const redacted = await executor.query(
       `UPDATE events
           SET payload = NULL,
@@ -200,13 +244,6 @@ async function runForget(
       store: "events.payload",
       rows_affected: redacted.rowCount ?? 0,
       method: "payload and payload_ref cleared, redacted_at set; row and hash chain preserved",
-    });
-    stores.push({
-      store: "events.blobs",
-      rows_affected: affectedEvents.rows.filter((row) => row.has_payload).length,
-      method:
-        "content-addressed blobs are shared by digest and are reclaimed by the storage operator; " +
-        "the ledger no longer references them, so no live span can resolve to them",
     });
   }
 
@@ -293,6 +330,23 @@ async function runForget(
       "survive so an audit can still see that a query happened",
   });
 
+  // ---- Blob reclamation --------------------------------------------------
+  //
+  // Reference-counted, and the count is taken *after* the UPDATE above cleared the
+  // erased events' pointers. So an object is deleted only when no live row still
+  // references those exact bytes — which is the difference between erasing one subject's
+  // data and destroying another's.
+  const blobOutcome = await reclaimBlobs(dependencies.blobs, executor, affectedRefs.rows.map((r) => r.payload_ref));
+
+  stores.push({
+    store: "events.blobs",
+    rows_affected: blobOutcome.references_removed,
+    method:
+      `references cleared, then ${blobOutcome.objects_deleted} object(s) deleted and ` +
+      `${blobOutcome.objects_retained_shared} retained as still referenced by another live row; ` +
+      `each deletion verified absent in the physical store rather than assumed`,
+  });
+
   // ---- Phase 2: scan -----------------------------------------------------
   const residualScan: { store: string; matches: number }[] = [];
   let residualMatches = 0;
@@ -347,6 +401,30 @@ async function runForget(
     [tenantId, selector.user ?? selector.subject ?? null],
   );
 
+  // The physical store is scanned by asking it what it holds, not by asking the database
+  // whether it still points at anything. An earlier version of this job scanned only
+  // database references, which proves the database was updated and says nothing about the
+  // disk.
+  if (dependencies.blobs.supportsDeletion) {
+    const present = new Set(await dependencies.blobs.sweep());
+    const survivors = [...blobOutcome.refs_deleted].filter((ref) => present.has(ref));
+    residualScan.push({ store: "blobs.physical", matches: survivors.length });
+    residualMatches += survivors.length;
+  } else {
+    // A store that cannot delete cannot be verified. Reported as residual rather than
+    // skipped, because "we could not check" and "we checked and found nothing" must never
+    // render the same way.
+    residualScan.push({
+      store: "blobs.physical",
+      matches: blobOutcome.references_removed,
+    });
+    residualMatches += blobOutcome.references_removed;
+    notes.push(
+      "the configured blob store cannot physically delete, so its objects are counted as " +
+        "residual. A verified erase is not possible against an append-only store.",
+    );
+  }
+
   await scan(
     "query_traces",
     `SELECT count(*)::int AS matches
@@ -374,6 +452,7 @@ async function runForget(
     mode,
     reason: request.reason,
     stores,
+    blobs: blobOutcome,
     claims_affected: revokedCount,
     events_redacted: affectedEvents.rows.length,
     started_at: startedAt,
@@ -527,3 +606,83 @@ function toIso(value: Date | string): string {
 }
 
 export { REASON_CODES };
+
+/**
+ * Delete the blob objects an erasure detached, but only those nothing else references.
+ *
+ * The reference count is a query against `events` taken *after* the erased rows' pointers
+ * were cleared, so a ref still appearing in that result is live for somebody else. That is
+ * the whole safety property: a content-addressed store deduplicates, so two events with
+ * identical payloads share one object, and deleting on the first detach would destroy the
+ * second event's evidence while reporting a successful erasure.
+ *
+ * Deletion is verified rather than issued: `BlobStore.delete` returns whether the object is
+ * absent afterwards, and only a `true` is counted as deleted. An object that survives a
+ * delete call is `retained_other`, which is a failure the manifest reports instead of
+ * rounding away — because the one thing an erasure job must never do is claim success it
+ * cannot demonstrate.
+ */
+export async function reclaimBlobs(
+  blobs: BlobStore,
+  executor: QueryExecutor,
+  refs: readonly string[],
+): Promise<BlobOutcome> {
+  const unique = [...new Set(refs)];
+  if (unique.length === 0) {
+    return {
+      references_removed: 0,
+      objects_deleted: 0,
+      objects_retained_shared: 0,
+      objects_retained_other: 0,
+      store_supports_deletion: blobs.supportsDeletion,
+      refs_deleted: [],
+      refs_retained_shared: [],
+    };
+  }
+
+  if (!blobs.supportsDeletion) {
+    return {
+      references_removed: unique.length,
+      objects_deleted: 0,
+      objects_retained_shared: 0,
+      objects_retained_other: unique.length,
+      store_supports_deletion: false,
+      refs_deleted: [],
+      refs_retained_shared: [],
+    };
+  }
+
+  // Live references, counted after the payload clear. `payload_ref` is unindexed, so this
+  // is a scan; it runs once per erasure rather than once per ref.
+  const live = await executor.query<{ payload_ref: string }>(
+    `SELECT DISTINCT payload_ref FROM events WHERE payload_ref = ANY($1::text[])`,
+    [unique],
+  );
+  const stillReferenced = new Set(live.rows.map((row) => row.payload_ref));
+
+  const deleted: string[] = [];
+  const retainedShared: string[] = [];
+  let retainedOther = 0;
+
+  for (const ref of unique) {
+    if (stillReferenced.has(ref)) {
+      retainedShared.push(ref);
+      continue;
+    }
+    if (await blobs.delete(ref)) {
+      deleted.push(ref);
+    } else {
+      retainedOther += 1;
+    }
+  }
+
+  return {
+    references_removed: unique.length,
+    objects_deleted: deleted.length,
+    objects_retained_shared: retainedShared.length,
+    objects_retained_other: retainedOther,
+    store_supports_deletion: true,
+    refs_deleted: deleted,
+    refs_retained_shared: retainedShared,
+  };
+}

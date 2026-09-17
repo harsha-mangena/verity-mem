@@ -1,13 +1,32 @@
 /**
  * Content-addressed blob storage for evidence payloads too large to inline.
  *
- * The interface is small on purpose. Evidence bytes are write-once, read-many,
- * and addressed by their own SHA-256, so there is no update path and no delete
- * path here: retention erasure mutates the ledger row, and blob reclamation is a
- * separate operator task that must never be able to make a live span dangle.
+ * Evidence bytes are write-once, read-many, and addressed by their own SHA-256, so there
+ * is no update path. There *is* now a delete path, and adding it required being precise
+ * about what it means.
+ *
+ * **Why deletion is part of the contract.** The MVP specification requires a retention
+ * manifest covering live ledger payloads, blobs, claims, embeddings, full-text indexes and
+ * cache state. A job cannot report complete live-store erasure while the bytes it
+ * detached are still on disk, and the missing-blocks assessment correctly calls that a
+ * P0: "the manifest never counts a detached reference as a deleted blob object."
+ *
+ * **Why it is deletion by object, not by reference.** A content-addressed store
+ * deduplicates: two events with identical payloads share one object. So clearing an
+ * event's `payload_ref` removes a *reference*, and the object may still be live for
+ * another event. Deleting on the first reference would silently break a second tenant's
+ * or a second event's evidence, which is a data-loss bug wearing an erasure costume. The
+ * caller therefore asks "is this object still referenced by any live row?" and the store
+ * is only asked to delete objects that are not.
+ *
+ * **Why it reports what happened.** `delete` returns whether the object is *verified
+ * absent* afterwards, not whether a delete was issued. An erasure job that reports success
+ * because it called a delete is exactly the self-graded claim this project refuses, and
+ * `sweep` exists so the residual scan can ask the physical backend directly rather than
+ * trusting its own earlier call.
  */
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { canonicalize } from "./canonical.ts";
 
@@ -17,7 +36,40 @@ export interface BlobStore {
   /** Fetch bytes by ref. Returns null when the blob is absent. */
   get(ref: string): Promise<Buffer | null>;
   exists(ref: string): Promise<boolean>;
+  /**
+   * Remove the object at `ref`, and report whether it is *verified absent* afterwards.
+   *
+   * Returns `true` when the object no longer exists — including when it never did, since
+   * "absent" is the postcondition and an already-absent object satisfies it. Returns
+   * `false` when the object survives, which is the answer an erasure job must not round
+   * up. A store that cannot delete at all throws `BlobDeletionUnsupportedError` rather
+   * than returning `false`, so an append-only deployment is a configuration error rather
+   * than a silently failing erasure.
+   */
+  delete(ref: string): Promise<boolean>;
+  /**
+   * Enumerate the refs this store physically holds, for a residual scan.
+   *
+   * The scan must interrogate the backend rather than re-read the ledger's own references:
+   * asking the database whether it still points at a blob tells you about the database,
+   * not about the disk.
+   */
+  sweep(): Promise<readonly string[]>;
   readonly kind: string;
+  /** False for a store that cannot physically remove objects, such as an archive bucket. */
+  readonly supportsDeletion: boolean;
+}
+
+/** Raised when a deletion is requested from a store that cannot perform one. */
+export class BlobDeletionUnsupportedError extends Error {
+  constructor(kind: string) {
+    super(
+      `the ${kind} blob store does not support deletion. A retention job cannot report a ` +
+        `verified erase against it: configure a store that can delete, or declare the ` +
+        `store as archive-only and accept that the manifest will report it as retained.`,
+    );
+    this.name = "BlobDeletionUnsupportedError";
+  }
 }
 
 export function sha256Hex(bytes: Buffer | string): string {
@@ -91,6 +143,55 @@ export class FilesystemBlobStore implements BlobStore {
   async exists(ref: string): Promise<boolean> {
     return (await this.get(ref)) !== null;
   }
+
+  readonly supportsDeletion = true;
+
+  /**
+   * Unlink the object, then verify it is gone by re-reading the path.
+   *
+   * The verification is the point: a delete that succeeded from the filesystem's point of
+   * view and left the bytes reachable through another path is the failure mode an erasure
+   * job has to detect, and re-`stat`ing the canonical path is what detects it.
+   */
+  async delete(ref: string): Promise<boolean> {
+    const digestHex = refToDigest(ref);
+    if (!digestHex) return true;
+    try {
+      await unlink(this.pathFor(digestHex));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    try {
+      await stat(this.pathFor(digestHex));
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
+  /** Every object the store physically holds, as content-addressed refs. */
+  async sweep(): Promise<readonly string[]> {
+    const refs: string[] = [];
+    const walk = async (dir: string): Promise<void> => {
+      let entries;
+      try {
+        entries = await readdir(dir, { withFileTypes: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+      for (const entry of entries) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(full);
+        } else if (/^[0-9a-f]{64}$/.test(entry.name)) {
+          refs.push(contentAddressedRef(entry.name));
+        }
+      }
+    };
+    await walk(this.root);
+    return refs.sort();
+  }
 }
 
 /** In-memory store for tests and for the borrow-checker style replay harness. */
@@ -114,6 +215,19 @@ export class MemoryBlobStore implements BlobStore {
   async exists(ref: string): Promise<boolean> {
     const digestHex = refToDigest(ref);
     return digestHex !== null && this.blobs.has(digestHex);
+  }
+
+  readonly supportsDeletion = true;
+
+  async delete(ref: string): Promise<boolean> {
+    const digestHex = refToDigest(ref);
+    if (!digestHex) return true;
+    this.blobs.delete(digestHex);
+    return !this.blobs.has(digestHex);
+  }
+
+  async sweep(): Promise<readonly string[]> {
+    return [...this.blobs.keys()].map(contentAddressedRef).sort();
   }
 }
 

@@ -518,7 +518,7 @@ describe("forgetting", () => {
 
   it("erases a subject's payload and proves it with a residual scan", async () => {
     const result = await forget(
-      { db: h.ctx.db, ledger: h.ctx.ledger, ids: systemIds, clock: fixedClock("2026-09-17T13:00:00Z") },
+      { db: h.ctx.db, ledger: h.ctx.ledger, blobs: h.ctx.blobs, ids: systemIds, clock: fixedClock("2026-09-17T13:00:00Z") },
       {
         tenant_id: h.tenantId,
         tenant_slug: h.tenantSlug,

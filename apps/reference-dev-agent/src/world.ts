@@ -47,6 +47,14 @@ export function createEmbeddings(): HashEmbeddingBackend {
 export interface World {
   readonly db: Db;
   readonly ledger: Ledger;
+  /**
+   * The store the ledger writes to.
+   *
+   * Exposed so retention reclaims from the same store the payloads went into. A caller that
+   * supplied a different store could detach every reference, delete nothing, and still see a
+   * residual scan come back clean against the empty store it handed over.
+   */
+  readonly blobs: FilesystemBlobStore;
   readonly ids: IdGenerator;
   readonly clock: Clock;
   readonly tenantSlug: string;
@@ -71,15 +79,17 @@ export function createWorld(options: WorldOptions): World {
     max: 6,
     applicationName: "veritymem-reference-dev-agent",
   });
+  const blobs = new FilesystemBlobStore(options.blobDir);
   const ledger = new Ledger({
     db,
-    blobs: new FilesystemBlobStore(options.blobDir),
+    blobs,
     clock: options.clock,
     ids: options.ids,
   });
   return {
     db,
     ledger,
+    blobs,
     ids: options.ids,
     clock: options.clock,
     tenantSlug: options.tenantSlug,

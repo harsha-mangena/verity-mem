@@ -243,9 +243,9 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
         ...(body.mode !== undefined ? { mode: body.mode } : {}),
       };
 
-      const outcome = await forget({ db: deps.db, ledger: deps.ledger, ids: deps.ids, clock: deps.clock }, request1);
+      const outcome = await forget({ db: deps.db, ledger: deps.ledger, blobs: deps.blobs, ids: deps.ids, clock: deps.clock }, request1);
       const job = await readRetentionJob(
-        { db: deps.db, ledger: deps.ledger, ids: deps.ids, clock: deps.clock },
+        { db: deps.db, ledger: deps.ledger, blobs: deps.blobs, ids: deps.ids, clock: deps.clock },
         context.tenantId,
         outcome.job_id,
       );
@@ -281,7 +281,7 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
       const context = tenantFromCredential({ identity: caller, what: "GET /v1/forget" });
 
       const job = await readRetentionJob(
-        { db: deps.db, ledger: deps.ledger, ids: deps.ids, clock: deps.clock },
+        { db: deps.db, ledger: deps.ledger, blobs: deps.blobs, ids: deps.ids, clock: deps.clock },
         context.tenantId,
         params.job_id,
       );

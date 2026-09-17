@@ -706,7 +706,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     user: alice,
   });
   await correctClaim(
-    { db: world.db, ledger: world.ledger, ids: world.ids, clock: world.clock },
+    { db: world.db, ledger: world.ledger, blobs: world.blobs, ids: world.ids, clock: world.clock },
     {
       tenant_id: world.tenantId,
       principal: `user:${alice}`,
@@ -762,7 +762,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
   });
   const contractorWrites = await drainAndWindow(world, driver, contractorEvent.watermark);
   const retention = await forget(
-    { db: world.db, ledger: world.ledger, ids: world.ids, clock: world.clock },
+    { db: world.db, ledger: world.ledger, blobs: world.blobs, ids: world.ids, clock: world.clock },
     {
       tenant_id: world.tenantId,
       tenant_slug: world.tenantSlug,
