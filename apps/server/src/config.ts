@@ -200,21 +200,3 @@ export function buildDeps(options: BuildDepsOptions): ServerDeps {
     policy: options.config.commitPolicy,
   };
 }
-
-/**
- * The tenant a write is attributed to.
- *
- * Exported so the rule lives in exactly one place: a token-bound tenant wins, and a
- * body that names a different tenant is refused rather than merged. The `undefined`
- * case is the interesting one — a tenant-less token may still act, but only on the
- * tenant it names explicitly, and the caller of this function is responsible for
- * having rejected the request when neither is present.
- */
-export function effectiveTenant(input: {
-  readonly tokenTenant: string | null;
-  readonly requestTenant: string | undefined;
-}): { tenant: string; tenantId: string } | null {
-  const tenant = input.tokenTenant ?? input.requestTenant ?? null;
-  if (tenant === null || tenant.length === 0) return null;
-  return { tenant, tenantId: resolveTenantId(tenant) };
-}

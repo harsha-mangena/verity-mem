@@ -21,7 +21,7 @@
 import { type Static, Type } from "@sinclair/typebox";
 import { ClaimCandidateSchema, ClaimRecordSchema, DecisionSchema, RetentionJobSchema } from "./claim.ts";
 import { EvidenceSpanSchema } from "./event.ts";
-import { ActionGateVerdictSchema, MemoryPacketSchema } from "./packet.ts";
+import { ActionGateVerdictSchema, MemoryPacketSchema, QueryRequestSchema } from "./packet.ts";
 import {
   CandidateIdSchema,
   ClaimIdSchema,
@@ -275,6 +275,21 @@ export const ContextComposeResponseSchema = Type.Object(
   { $id: "ContextComposeResponse", additionalProperties: false },
 );
 export type ContextComposeResponse = Static<typeof ContextComposeResponseSchema>;
+
+/**
+ * The `/v1/context/compose` request body.
+ *
+ * Structurally identical to `QueryRequestSchema` and declared separately rather than
+ * aliased, because the two are the same request *today* and the contract should not
+ * promise they always will be: composition may grow a prose-length or
+ * citation-style option, and a `$ref` from one endpoint to the other would make that
+ * a breaking change to `/v1/query`.
+ */
+export const ContextComposeRequestSchema = Type.Object(
+  QueryRequestSchema.properties,
+  { $id: "ContextComposeRequest", additionalProperties: false },
+);
+export type ContextComposeRequest = Static<typeof ContextComposeRequestSchema>;
 
 // ---------------------------------------------------------------------------
 // Action gate

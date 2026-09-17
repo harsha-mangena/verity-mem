@@ -9,3 +9,9 @@ coverage/
 .tsbuildinfo
 *.tsbuildinfo
 .veritymem/
+
+# Python (offline eval harness only)
+python/evals/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

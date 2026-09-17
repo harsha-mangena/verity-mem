@@ -5,6 +5,7 @@
   "trace_id": "CONF-05",
   "title": "Correcting a stored fact through a recorded supersession",
   "adversary": "destructive overwrite",
+  "ground_truth": "by_construction",
   "notes": null,
   "requires": [
     "commit",
@@ -14,6 +15,7 @@
   "rationale": "Nothing is deleted. The old claim keeps its row, its evidence and its decision, and stops being current.",
   "inputs": [
     {
+      "expect": [],
       "line_id": "e1",
       "action": "append_event",
       "event": {
@@ -45,6 +47,7 @@
       }
     },
     {
+      "expect": [],
       "line_id": "r1",
       "action": "resolve_claim",
       "target": {
@@ -59,6 +62,7 @@
       ]
     },
     {
+      "expect": [],
       "line_id": "e2",
       "action": "append_event",
       "event": {

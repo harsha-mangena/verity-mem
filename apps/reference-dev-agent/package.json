@@ -7,8 +7,12 @@
   "license": "Apache-2.0",
   "main": "./src/main.ts",
   "dependencies": {
+    "@veritymem/claims": "workspace:*",
     "@veritymem/contracts": "workspace:*",
+    "@veritymem/gate": "workspace:*",
     "@veritymem/ledger": "workspace:*",
-    "@veritymem/sdk-ts": "workspace:*"
+    "@veritymem/model-adapters": "workspace:*",
+    "@veritymem/policy": "workspace:*",
+    "@veritymem/retrieval": "workspace:*"
   }
 }

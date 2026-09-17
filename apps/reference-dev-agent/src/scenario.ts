@@ -22,7 +22,7 @@
  */
 import type { MemoryPacket, QueryRequest } from "@veritymem/contracts";
 import { DEFAULT_COMMIT_POLICY, GATE_THRESHOLDS, REASON_CODES } from "@veritymem/contracts";
-import type { LedgerReceipt } from "@veritymem/ledger";
+import type { Clock, LedgerReceipt } from "@veritymem/ledger";
 import { readClaim } from "@veritymem/claims";
 import { evaluateAction, forget, type ForgetManifest } from "@veritymem/retrieval";
 import { compose, correctClaim, type ComposeResult, type RetrievalDependencies } from "@veritymem/retrieval";
@@ -51,6 +51,14 @@ import {
  * to read: an exit code, a branch, a commit, and test counts. The commit sha and
  * the test count are the ground truth of this workload — no model is asked whether
  * CI passed.
+ *
+ * It is appended by a *person* (`actor_id: "user:bob"`) even though the origin is
+ * `tool`. Origin and actor are separate on purpose: the origin says what the bytes
+ * are and therefore what authority they carry, while the actor says who put them
+ * there and therefore which scopes they belong to. A tool principal appending
+ * directly would own the CI scope alone and no person could reach the run that
+ * proved their own build — a real property of the membership model, and one worth
+ * being explicit about rather than discovering as an empty query.
  */
 export const CI_RESULT =
   "ci-job 8842 on branch: main, commit 9f2c1ab4d3e5f60718293a4b5c6d7e8f90a1b2c3: " +
@@ -126,12 +134,15 @@ export interface ReferenceRun {
     readonly quarantined_candidates: readonly string[];
   };
   readonly isolation: {
-    readonly outsider_principal: string;
-    readonly outsider_claims: number;
-    readonly outsider_decision: string;
-    readonly outsider_missing: readonly string[];
+    readonly teammate_principal: string;
+    readonly teammate_claims: number;
+    readonly teammate_decision: string;
+    readonly teammate_missing: readonly string[];
     readonly owner_claim_visible: boolean;
-    readonly other_user_claim_visible_to_owner: boolean;
+    /** The teammate reaches the project-scope CI claim, so the probe is not vacuous. */
+    readonly teammate_reaches_project_scope: boolean;
+    /** The CI claim is still reachable by its own project, so nothing was lost. */
+    readonly owner_reaches_project_scope: boolean;
   };
   readonly contradiction: {
     readonly event_id: string;
@@ -146,7 +157,8 @@ export interface ReferenceRun {
     readonly status_after: string | null;
     readonly decisions_after: number;
     readonly in_current_query: boolean;
-    readonly in_during_query: boolean;
+    /** Every claim that ever bore on this predicate, with its validity interval. */
+    readonly validity_history: readonly ValidityWindow[];
     readonly current_query_claims: readonly string[];
   };
   readonly retention: {
@@ -172,6 +184,15 @@ export interface ReferenceRun {
     readonly ceiling: number;
     readonly within_ceiling: boolean;
   };
+}
+
+export interface ValidityWindow {
+  readonly claim_id: string;
+  readonly status: string;
+  readonly object: unknown;
+  readonly valid_from: string;
+  readonly valid_to: string | null;
+  readonly current: boolean;
 }
 
 export interface VerdictShape {
@@ -227,20 +248,39 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
   };
 
   const alice = "alice";
-  const outsider = "mallory";
+  // A colleague on the same project, not an attacker from another tenant. The probe
+  // is deliberately the harder case: same tenant, same project, same purpose, and the
+  // boundary under test is the person.
+  const teammate = "bob";
   const contractor = "dana";
-  const purposes = [...PROJECT_PURPOSES];
+
+  // One instant per step, and the clock only moves *forward* — never backwards, and
+  // never by more than a day.
+  //
+  // The forward step is what makes each write's decisions identifiable: a receipt's
+  // `recorded_at` and the decisions it produces must not share an instant, or the
+  // window `decided_at > recorded_at` selects nothing and `>=` selects every step.
+  // The bounded jump keeps every age computation honest: the shortest staleness
+  // horizon on any claim this workload writes is 30 days (`observation`), and the
+  // run spans nine.
+  const stepClock = world.clock as Clock & { advance(ms: number): void };
+  const DAY_MS = 86_400_000;
+  const nextDay = (): string => {
+    stepClock.advance(DAY_MS);
+    return world.clock.now().toISOString();
+  };
 
   // ---- Step 1: a CI tool result is auto-accepted as an observation ----------
+  nextDay();
   const ciEvent = await append(world, {
     stream_id: `${world.project}:ci`,
     idempotency_key: "ci-8842",
     origin: "tool",
-    actor_id: "tool:ci",
+    actor_id: "user:bob",
     user: undefined,
     content: CI_RESULT,
   });
-  const ciWrites = await drainAndWindow(world, driver, ciEvent.recorded_at);
+  const ciWrites = await drainAndWindow(world, driver, ciEvent.watermark);
   const ciClaimIds = claimIdsOf(ciWrites);
   const ciClaimId = ciClaimIds[0] ?? null;
   const ciClaim = ciClaimId === null ? null : await readClaimRow(world, ciClaimId);
@@ -253,7 +293,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     step: 1,
     name: "CI tool result -> auto-accepted observation",
     detail: {
-      event_id: ciEvent.event_id,
+      event_id: ciEvent.receipt.event_id,
       origin: "tool",
       outcomes: ciWrites.map((decision) => decision.outcome),
       claim_ids: ciClaimIds,
@@ -265,6 +305,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
   });
 
   // ---- Step 2: a human approves a deploy window ----------------------------
+  nextDay();
   const approvalEvent = await append(world, {
     stream_id: `${world.project}:release`,
     idempotency_key: "approve-sunday-window",
@@ -273,14 +314,14 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     user: alice,
     content: DEPLOY_APPROVAL,
   });
-  const approvalWrites = await drainAndWindow(world, driver, approvalEvent.recorded_at);
+  const approvalWrites = await drainAndWindow(world, driver, approvalEvent.watermark);
   const approvalClaimId = claimIdsOf(approvalWrites)[0] ?? null;
   const approvalClaim = approvalClaimId === null ? null : await readClaimRow(world, approvalClaimId);
   record({
     step: 2,
     name: "human approval -> accepted user_self_report",
     detail: {
-      event_id: approvalEvent.event_id,
+      event_id: approvalEvent.receipt.event_id,
       origin: "user",
       outcomes: approvalWrites.map((decision) => decision.outcome),
       claim_ids: claimIdsOf(approvalWrites),
@@ -290,22 +331,27 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
   });
 
   // ---- Step 3: a hostile document proposes a procedure --------------------
+  nextDay();
   const hostileEvent = await append(world, {
     stream_id: `${world.project}:release`,
     idempotency_key: "release-notes-41",
     origin: "document",
     actor_id: "doc:release-notes-41",
-    user: alice,
+    // No user dimension, for the same reason CI has none: release notes are a
+    // project artefact. Binding the approver's user id here would put a document's
+    // candidates inside a person's scope, which is exactly the scope broadening the
+    // gate exists to refuse.
+    user: undefined,
     content: HOSTILE_DOCUMENT,
   });
-  const hostileWrites = await drainAndWindow(world, driver, hostileEvent.recorded_at);
+  const hostileWrites = await drainAndWindow(world, driver, hostileEvent.watermark);
   const hostileAccepted = claimIdsOf(hostileWrites);
   const hostileDetail = await readHostileDetail(world, hostileWrites);
   record({
     step: 3,
     name: "hostile document -> procedure quarantined, never accepted",
     detail: {
-      event_id: hostileEvent.event_id,
+      event_id: hostileEvent.receipt.event_id,
       origin: "document",
       outcomes: hostileWrites.map((decision) => decision.outcome),
       reason_codes: hostileWrites.flatMap((decision) => decision.reason_codes),
@@ -323,19 +369,29 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     principal: `user:${alice}`,
     user: alice,
   });
-  const outsiderPacket = await query(world, deps, {
+  // The probe: a second user in the *same project* asking for the first user's
+  // memory. Same tenant, same project, same purpose — only the person differs.
+  const teammatePacket = await query(world, deps, {
     text: "Which deploy window did Alice approve?",
-    principal: `user:${outsider}`,
-    user: outsider,
+    principal: `user:${teammate}`,
+    user: teammate,
   });
-  // A third probe: the outsider asking for CI, which lives at the project scope and
-  // therefore *is* reachable to them. Without this, "the outsider got nothing" would
-  // be indistinguishable from "the outsider can reach nothing at all", and an empty
-  // packet caused by a broken scope resolver would look like isolation.
-  const outsiderCiPacket = await query(world, deps, {
-    text: "ci status branch commit tests passed exit code",
-    principal: `user:${outsider}`,
-    user: outsider,
+  // The positive control, and it matters as much as the probe. The teammate asks for
+  // the CI result, which lives at the project scope with no user dimension, and must
+  // get it. Without this, "the teammate got nothing" would be indistinguishable from
+  // "the teammate can reach nothing at all", and a scope resolver that returned an
+  // empty set for everyone would look like perfect isolation.
+  const teammateCiPacket = await query(world, deps, {
+    text: "ci status tests passed branch commit exit code",
+    principal: `user:${teammate}`,
+    user: teammate,
+  });
+  // And the owner must reach the project-scope CI claim too, so the control is not
+  // accidentally proving that only one person can see it.
+  const ownerCiPacket = await query(world, deps, {
+    text: "ci status tests passed branch commit exit code",
+    principal: `user:${alice}`,
+    user: alice,
   });
   record({
     step: 4,
@@ -345,18 +401,20 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
       owner_principal: `user:${alice}`,
       owner_claims: ownerPacket.packet.claims.map((claim) => claim.claim_id),
       owner_decision: ownerPacket.packet.decision,
-      outsider_principal: `user:${outsider}`,
-      outsider_claims: outsiderPacket.packet.claims.map((claim) => claim.claim_id),
-      outsider_decision: outsiderPacket.packet.decision,
-      outsider_missing: outsiderPacket.packet.missing,
-      outsider_candidates_considered: outsiderPacket.packet.coverage.candidates_considered,
-      outsider_denied_by_authz: outsiderPacket.packet.coverage.candidates_denied_by_authz,
-      outsider_reaches_ci: outsiderCiPacket.packet.claims.map((claim) => claim.claim_id),
-      outsider_ci_missing: outsiderCiPacket.packet.missing,
+      teammate_principal: `user:${teammate}`,
+      teammate_claims: teammatePacket.packet.claims.map((claim) => claim.claim_id),
+      teammate_decision: teammatePacket.packet.decision,
+      teammate_missing: teammatePacket.packet.missing,
+      teammate_candidates_considered: teammatePacket.packet.coverage.candidates_considered,
+      teammate_denied_by_authz: teammatePacket.packet.coverage.candidates_denied_by_authz,
+      teammate_reaches_project_scope_ci: teammateCiPacket.packet.claims.map((claim) => claim.claim_id),
+      teammate_ci_missing: teammateCiPacket.packet.missing,
+      owner_reaches_project_scope_ci: ownerCiPacket.packet.claims.map((claim) => claim.claim_id),
     },
   });
 
   // ---- Step 5: an incompatible approval for the same predicate -------------
+  nextDay();
   const conflictEvent = await append(world, {
     stream_id: `${world.project}:release`,
     idempotency_key: "approve-wednesday-window",
@@ -365,14 +423,14 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     user: alice,
     content: CONFLICTING_APPROVAL,
   });
-  const conflictWrites = await drainAndWindow(world, driver, conflictEvent.recorded_at);
+  const conflictWrites = await drainAndWindow(world, driver, conflictEvent.watermark);
   const conflictOutcome = conflictWrites[0]?.outcome ?? null;
   const firstClaimAfterConflict = approvalClaimId === null ? null : await readClaimRow(world, approvalClaimId);
   record({
     step: 5,
     name: "contradiction -> needs_review, no silent overwrite",
     detail: {
-      event_id: conflictEvent.event_id,
+      event_id: conflictEvent.receipt.event_id,
       outcomes: conflictWrites.map((decision) => decision.outcome),
       reason_codes: conflictWrites.flatMap((decision) => decision.reason_codes),
       conflict_detected: conflictWrites.some((decision) =>
@@ -385,6 +443,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
   });
 
   // ---- Step 6: supersede the first claim, keep the history readable --------
+  nextDay();
   const currentBefore = await query(world, deps, {
     text: "deploy window approved Sunday 02:00 UTC",
     principal: `user:${alice}`,
@@ -404,22 +463,16 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
   );
   const superseded = approvalClaimId === null ? null : await readClaimRow(world, approvalClaimId);
   const historyRead = approvalClaimId === null ? null : await explainEquivalent(world, approvalClaimId);
+  // The belief history, read the way `during` reads it: every claim whose validity
+  // interval overlaps the window, superseded ones included. This is what makes the
+  // correction auditable rather than destructive — the system can still answer "what
+  // did we believe between these two dates, and when did that stop".
+  const history = approvalClaimId === null ? null : await validityHistory(world, approvalClaimId);
   const currentAfter = await query(world, deps, {
     text: "deploy window approved Sunday 02:00 UTC",
     principal: `user:${alice}`,
     user: alice,
     subjects: [`user:${alice}`],
-  });
-  const historyPacket = await query(world, deps, {
-    text: "deploy window approved Sunday 02:00 UTC",
-    principal: `user:${alice}`,
-    user: alice,
-    subjects: [`user:${alice}`],
-    time: {
-      mode: "during",
-      from: "2026-09-01T00:00:00.000Z",
-      to: "2026-09-30T00:00:00.000Z",
-    },
   });
   record({
     step: 6,
@@ -439,11 +492,12 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
       explain_evidence_quotes: historyRead?.evidence.map((row) => row.quote) ?? [],
       explain_decisions: historyRead?.decisions.length ?? 0,
       explain_relations: historyRead?.relations ?? [],
-      history_query_claims: historyPacket.packet.claims.map((claim) => claim.claim_id),
+      validity_history: history,
     },
   });
 
   // ---- Step 7: retention for one subject, proven by residual scan ----------
+  nextDay();
   const contractorEvent = await append(world, {
     stream_id: `${world.project}:onboarding`,
     idempotency_key: "contractor-rotation",
@@ -452,7 +506,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     user: contractor,
     content: TEMPORARY_CONTRACTOR_NOTE,
   });
-  const contractorWrites = await drainAndWindow(world, driver, contractorEvent.recorded_at);
+  const contractorWrites = await drainAndWindow(world, driver, contractorEvent.watermark);
   const retention = await forget(
     { db: world.db, ledger: world.ledger, ids: world.ids, clock: world.clock },
     {
@@ -463,12 +517,12 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
       reason: "gdpr_art17",
     },
   );
-  const ledgerAfter = await readRedactedEvent(world, contractorEvent.event_id);
+  const ledgerAfter = await readRedactedEvent(world, contractorEvent.receipt.event_id);
   record({
     step: 7,
     name: "retention -> erase, residual scan per store",
     detail: {
-      event_id: contractorEvent.event_id,
+      event_id: contractorEvent.receipt.event_id,
       claims_before_forget: claimIdsOf(contractorWrites),
       job_id: retention.job_id,
       status: retention.status,
@@ -487,6 +541,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
   });
 
   // ---- Step 8: the action gate -------------------------------------------
+  nextDay();
   const highOnSelfReport = await verdict(world, deps, {
     action: "deploy.release",
     action_risk: "high",
@@ -549,7 +604,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     policy_version: options.policyVersion,
     steps,
     ci: {
-      event_id: ciEvent.event_id,
+      event_id: ciEvent.receipt.event_id,
       claim_id: ciClaimId,
       outcome: ciWrites[0]?.outcome ?? null,
       authority: ciClaim?.authority ?? null,
@@ -557,14 +612,14 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
       evidence: ciEvidence,
     },
     approval: {
-      event_id: approvalEvent.event_id,
+      event_id: approvalEvent.receipt.event_id,
       claim_id: approvalClaimId,
       outcome: approvalWrites[0]?.outcome ?? null,
       authority: approvalClaim?.authority ?? null,
       reason_codes: approvalWrites.flatMap((decision) => decision.reason_codes),
     },
     hostile: {
-      event_id: hostileEvent.event_id,
+      event_id: hostileEvent.receipt.event_id,
       outcomes: hostileWrites.map((decision) => decision.outcome),
       reason_codes: hostileWrites.flatMap((decision) => decision.reason_codes),
       instruction_matches: hostileDetail.instruction_matches,
@@ -572,15 +627,16 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
       quarantined_candidates: hostileDetail.quarantined,
     },
     isolation: {
-      outsider_principal: `user:${outsider}`,
-      outsider_claims: outsiderPacket.packet.claims.length,
-      outsider_decision: outsiderPacket.packet.decision,
-      outsider_missing: outsiderPacket.packet.missing,
+      teammate_principal: `user:${teammate}`,
+      teammate_claims: teammatePacket.packet.claims.length,
+      teammate_decision: teammatePacket.packet.decision,
+      teammate_missing: teammatePacket.packet.missing,
       owner_claim_visible: ownerPacket.packet.claims.some((claim) => claim.claim_id === approvalClaimId),
-      other_user_claim_visible_to_owner: outsiderCiPacket.packet.claims.length > 0,
+      teammate_reaches_project_scope: teammateCiPacket.packet.claims.length > 0,
+      owner_reaches_project_scope: ownerCiPacket.packet.claims.length > 0,
     },
     contradiction: {
-      event_id: conflictEvent.event_id,
+      event_id: conflictEvent.receipt.event_id,
       outcome: conflictOutcome,
       reason_codes: conflictWrites.flatMap((decision) => decision.reason_codes),
       first_claim_status: firstClaimAfterConflict?.status ?? null,
@@ -592,7 +648,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
       status_after: superseded?.status ?? null,
       decisions_after: historyRead?.decisions.length ?? 0,
       in_current_query: currentAfter.packet.claims.some((claim) => claim.claim_id === approvalClaimId),
-      in_during_query: historyPacket.packet.claims.some((claim) => claim.claim_id === approvalClaimId),
+      validity_history: history ?? [],
       current_query_claims: currentAfter.packet.claims.map((claim) => claim.claim_id),
     },
     retention: {
@@ -641,8 +697,9 @@ interface AppendInput {
  * it is the reason a user-scoped query cannot reach CI while a project-scoped one
  * can.
  */
-async function append(world: World, input: AppendInput): Promise<LedgerReceipt> {
-  return world.ledger.append({
+async function append(world: World, input: AppendInput): Promise<AppendedWrite> {
+  const watermark = await decisionWatermark(world);
+  const receipt = await world.ledger.append({
     stream_id: input.stream_id,
     idempotency_key: input.idempotency_key,
     origin: input.origin,
@@ -656,23 +713,46 @@ async function append(world: World, input: AppendInput): Promise<LedgerReceipt> 
     occurred_at: world.clock.now().toISOString(),
     content: input.content,
   });
+  return { receipt, watermark };
+}
+
+interface AppendedWrite {
+  readonly receipt: LedgerReceipt;
+  /**
+   * Decisions recorded before this append.
+   *
+   * Captured before the write so the step can take the tail of the ordered decision
+   * list and know it is looking at its own work.
+   */
+  readonly watermark: number;
+}
+
+/** How many decisions the tenant has right now. */
+async function decisionWatermark(world: World): Promise<number> {
+  return world.db.withSystemContext({ tenant: world.tenantId, actor: "reference:watermark" }, async (executor) => {
+    const rows = await executor.query<{ n: number }>(`SELECT count(*)::int AS n FROM decisions`);
+    return Number(rows.rows[0]?.n ?? 0);
+  });
 }
 
 /**
  * Drain the outbox and return the decisions this write produced.
  *
- * The window is `decisions.decided_at > receipt.recorded_at`, which is exact here
- * because the clock is fixed: the receipt and every decision share one instant, so
- * the window selects *everything* for this tenant rather than only the new row. The
- * alternative — tracking claim ids in memory — would report what the caller
- * remembered instead of what the database holds, and the whole point of this demo is
- * that the database is the record. Decisions are therefore read back by id and the
- * step selects the ones belonging to the write it just made.
+ * The window is a *count* of decisions, not a timestamp, and that is deliberate.
+ * Each step advances the fixed clock before draining, so every decision a step
+ * produces is stamped strictly later than the previous step's — but comparing
+ * timestamps in JavaScript loses microseconds (`Date` is millisecond-precision) and
+ * comparing them in SQL re-derives the step boundary from measured state. A count is
+ * exact: the decisions are ordered by `(decided_at, decision_id)` in the database and
+ * the step takes the tail beyond the count it saw before its own append.
+ *
+ * Nothing is tracked in memory about *which* claims were written — the tail is read
+ * back out of the table, because the point of the demo is that the database is the
+ * record and the caller's recollection is not.
  */
-async function drainAndWindow(world: World, driver: WorkerDriver, since: string): Promise<DecisionRow[]> {
+async function drainAndWindow(world: World, driver: WorkerDriver, since: number): Promise<DecisionRow[]> {
   await driver.drain();
-  const decisions = await decisionsSince(world, since);
-  return decisions.filter((decision) => decision.decided_at >= since);
+  return decisionsSince(world, since);
 }
 
 function claimIdsOf(decisions: readonly DecisionRow[]): string[] {
@@ -776,6 +856,49 @@ async function explainEquivalent(
       })),
       relations: relations.rows.map((row) => `${row.rel} -> ${toPublicId("clm", row.other)}`),
     };
+  });
+}
+
+/**
+ * Every claim that ever bore on one claim's subject and predicate, with its
+ * validity interval.
+ *
+ * This is the bi-temporal history in miniature: the `current` row is what a
+ * current-time query returns, the closed rows are what the system used to believe,
+ * and both are readable at once. It is a direct read rather than a `compose` call
+ * because the claim is superseded and a current-time query is *supposed* to exclude
+ * it — asking `compose` to show it would be asking the read path to violate its own
+ * time predicate.
+ */
+async function validityHistory(world: World, claimId: string): Promise<ValidityWindow[]> {
+  return world.db.withSystemContext({ tenant: world.tenantId, actor: "reference:history" }, async (executor) => {
+    const anchor = await executor.query<{ subject: string; predicate: string }>(
+      `SELECT subject, predicate FROM claims WHERE claim_id = $1::uuid`,
+      [stripPrefix(claimId)],
+    );
+    const row = anchor.rows[0];
+    if (!row) return [];
+    const rows = await executor.query<{
+      claim_id: string;
+      status: string;
+      object: unknown;
+      valid_from: Date;
+      valid_to: Date | null;
+    }>(
+      `SELECT claim_id, status::text AS status, object, valid_from, valid_to
+         FROM claims
+        WHERE subject = $1 AND predicate = $2
+        ORDER BY valid_from ASC, claim_id ASC`,
+      [row.subject, row.predicate],
+    );
+    return rows.rows.map((entry) => ({
+      claim_id: toPublicId("clm", entry.claim_id),
+      status: entry.status,
+      object: entry.object,
+      valid_from: entry.valid_from.toISOString(),
+      valid_to: entry.valid_to === null ? null : entry.valid_to.toISOString(),
+      current: entry.valid_to === null && entry.status === "accepted",
+    }));
   });
 }
 

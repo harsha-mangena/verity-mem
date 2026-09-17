@@ -280,7 +280,14 @@ export function toEventRecord(
     readonly content_hash: string;
     readonly prev_hash: string | null;
     readonly chained: boolean;
-    readonly sensitivity: EventRecord["sensitivity"];
+    /**
+     * Widened to `string` rather than the contract's union on purpose: the ledger
+     * types this column as `string` because the database owns the vocabulary, and
+     * narrowing it here would be a cast pretending to be a type. The one place that
+     * matters is the response body, where the schema validator refuses an unlisted
+     * value before it leaves the process.
+     */
+    readonly sensitivity: string;
     readonly media_type: string;
     readonly byte_length: number;
     readonly redacted_at: string | null;

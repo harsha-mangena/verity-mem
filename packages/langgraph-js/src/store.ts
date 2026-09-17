@@ -675,6 +675,22 @@ function itemFromClaim(claim: ClaimRecord, codec: NamespaceCodec, tenant: string
   };
 }
 
+/**
+ * Map a packet claim to a store item.
+ *
+ * Exported because the recall node already holds a packet and must not issue a second
+ * query just to obtain items in the store's shape — a second read would also be a
+ * second authorization decision, and the packet the caller renders and the items the
+ * caller gates on have to come from one read.
+ */
+export function storeItemFromPacketClaim(
+  claim: PacketClaim,
+  tenant: string,
+  codec: NamespaceCodec = createNamespaceCodec(),
+): StoreItem {
+  return itemFromPacketClaim(claim, codec, tenant);
+}
+
 function itemFromPacketClaim(claim: PacketClaim, codec: NamespaceCodec, tenant: string): StoreItem {
   const namespace = codec.toNamespace({
     tenant,

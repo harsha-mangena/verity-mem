@@ -5,6 +5,7 @@
   "trace_id": "CONF-10",
   "title": "Erase one subject and prove the deletion by scan",
   "adversary": "unproven deletion",
+  "ground_truth": "by_construction",
   "notes": null,
   "requires": [
     "deletion"
@@ -12,6 +13,7 @@
   "rationale": "Zero is only meaningful if something actually scanned for it. The row surviving proves the ledger still testifies that the event existed.",
   "inputs": [
     {
+      "expect": [],
       "line_id": "e1",
       "action": "append_event",
       "event": {
@@ -44,6 +46,7 @@
       }
     },
     {
+      "expect": [],
       "line_id": "d1",
       "action": "erase_subject",
       "subject_or_scope": {

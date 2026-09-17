@@ -416,14 +416,17 @@ async function handleQuery(
   const time = buildTimeSpec(args);
   if (typeof time === "string") return { ok: false, code: "invalid_arguments", message: time };
 
+  const safeTime: TimeSpec | undefined = time;
+  const safeKinds: QueryRequest["kinds"] | undefined = args.kinds === undefined ? undefined : (args.kinds as QueryRequest["kinds"]);
+  const safeSubjects: string[] | undefined = args.subjects;
   const request: QueryRequest = {
     query: args.query,
     scope: mergeScope(context.session, args.scope),
     purpose: args.purpose ?? requirePurpose(context),
-    ...(time === undefined ? {} : { time }),
+    ...(safeTime === undefined ? {} : { time: safeTime }),
     ...(args.action_risk === undefined ? {} : { action_risk: args.action_risk }),
-    ...(args.kinds === undefined ? {} : { kinds: args.kinds as QueryRequest["kinds"] }),
-    ...(args.subjects === undefined ? {} : { subjects: args.subjects }),
+    ...(safeKinds === undefined ? {} : { kinds: safeKinds }),
+    ...(safeSubjects === undefined ? {} : { subjects: safeSubjects }),
     limit: Math.min(args.limit ?? 12, 50),
   };
 

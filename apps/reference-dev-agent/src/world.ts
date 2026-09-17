@@ -339,8 +339,17 @@ export interface DecisionRow {
   readonly decided_at: string;
 }
 
-/** Decisions recorded after `since`, oldest first — how a scenario windows one write. */
-export async function decisionsSince(world: World, since: string): Promise<DecisionRow[]> {
+/**
+ * The decisions recorded after the first `offset` ones, in decision order.
+ *
+ * An offset rather than a timestamp, because the scenario must be able to say
+ * exactly which decisions its own write produced: a timestamp comparison loses
+ * microseconds through `Date`, and re-deriving a boundary from measured times is how
+ * a demo starts reporting a neighbouring step's work as its own. The order is
+ * `(decided_at, decision_id)`, which is stable because `decided_at` is stamped from
+ * the injected clock and the id breaks any tie within one instant.
+ */
+export async function decisionsSince(world: World, offset: number): Promise<DecisionRow[]> {
   return world.db.withSystemContext({ tenant: world.tenantId, actor: "reference:decisions" }, async (executor) => {
     const rows = await executor.query<{
       decision_id: string;
@@ -354,9 +363,9 @@ export async function decisionsSince(world: World, since: string): Promise<Decis
       `SELECT decision_id, claim_id, candidate_id, outcome::text AS outcome, reason_codes,
               policy_version, decided_at
          FROM decisions
-        WHERE decided_at > $1::timestamptz
-        ORDER BY decided_at ASC, decision_id ASC`,
-      [since],
+        ORDER BY decided_at ASC, decision_id ASC
+        OFFSET $1`,
+      [offset],
     );
     return rows.rows.map((row) => ({
       decision_id: toPublicId("dec", row.decision_id),

@@ -147,6 +147,12 @@ export async function handleRequest(
   // is what this transport wants. Passing `undefined` explicitly is rejected under
   // `exactOptionalPropertyTypes`, and the distinction is real — a generator would
   // create a session this handler has already decided not to keep.
+  //
+  // The cast at the `connect` call below is forced by the SDK's own typings: its
+  // concrete transport classes model optional callbacks as
+  // `(() => void) | undefined`, which `exactOptionalPropertyTypes` refuses where
+  // its `Transport` interface declares `onclose?: () => void`. The alternative
+  // would be to weaken this repository's compiler settings for a dependency.
   const transport = new StreamableHTTPServerTransport();
   const handle = createVerityMemServer({
     backend: options.backend,
@@ -155,7 +161,7 @@ export async function handleRequest(
   });
 
   try {
-    await handle.server.connect(transport);
+    await handle.server.connect(transport as unknown as Parameters<typeof handle.server.connect>[0]);
     // The transport owns the response from here. It is not closed on `finish`:
     // the SDK writes an SSE stream for notifications before the POST response
     // completes, and closing underneath it truncates that stream. The SDK's own

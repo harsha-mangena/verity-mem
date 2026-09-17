@@ -5,6 +5,7 @@
   "trace_id": "CONF-08",
   "title": "High-sensitivity fact arrives with impeccable evidence and is still not auto-accepted",
   "adversary": "sensitivity bypass",
+  "ground_truth": "by_construction",
   "notes": null,
   "requires": [
     "admission",
@@ -13,6 +14,7 @@
   "rationale": "Entailment and authority are both satisfied. Sensitivity alone decides, which is exactly what makes it a separable gate input.",
   "inputs": [
     {
+      "expect": [],
       "line_id": "e1",
       "action": "append_event",
       "event": {

@@ -24,13 +24,14 @@ import {
   RelationCreateRequestSchema,
   RelationCreateResponseSchema,
   REASON_CODE_HELP,
+  type ClaimCandidate,
   type ClaimExplanation,
   type ClaimRecord,
   type Decision,
   type RelationCreateRequest,
   type RelationCreateResponse,
 } from "@veritymem/contracts";
-import { createRelation, readClaim, readRelations, timePredicate } from "@veritymem/claims";
+import { createRelation, readClaim, readRelations } from "@veritymem/claims";
 import { requireTool } from "../auth.ts";
 import { resolveCallerTenant, withReadContext, withWriteContext } from "../context.ts";
 import type { ServerDeps } from "../config.ts";
@@ -310,7 +311,7 @@ export function registerClaimRoutes(app: FastifyInstance, options: ClaimRouteOpt
 
       const started = performance.now();
       const explanation = await withReadContext(deps, context, async (executor) =>
-        buildExplanation(deps, executor, params.claim_id, started),
+        buildExplanation(deps, executor, params.claim_id, context.tenant, started),
       );
       if (!explanation) throw notFound("claim");
       await reply.code(200).send(explanation);
@@ -331,6 +332,7 @@ export async function buildExplanation(
   deps: ServerDeps,
   executor: Parameters<typeof readClaim>[0],
   claimId: string,
+  tenantSlug: string,
   started: number,
 ): Promise<ClaimExplanation | null> {
   const claim = await readClaim(executor, claimId);
@@ -412,11 +414,26 @@ export async function buildExplanation(
     throw new ApiError("precondition_failed", "the originating event is not readable", 409);
   }
 
+  const originEvent: ClaimExplanation["origin_event"] = {
+    event_id: `evt_${stripPrefix(originRow.event_id).replace(/-/g, "")}`,
+    stream_id: originRow.stream_id,
+    seq: Number(originRow.seq),
+    actor_id: originRow.actor_id,
+    origin: originRow.origin,
+    occurred_at: toIso(originRow.occurred_at),
+    recorded_at: toIso(originRow.recorded_at),
+    // Null exactly when the payload was redacted: the explanation must still be able
+    // to say that the event existed and when, which is the whole point of preserving
+    // the ledger row through erasure.
+    content: originRow.payload,
+    redacted_at: originRow.redacted_at === null ? null : toIso(originRow.redacted_at),
+  };
+
   const candidateRow = originEventId
     ? (
         await executor.query<{
           candidate_id: string;
-          kind: ClaimExplanation["candidate"] extends null ? never : string;
+          kind: ClaimCandidate["kind"];
           subject: string;
           predicate: string;
           object: unknown;
@@ -424,7 +441,7 @@ export async function buildExplanation(
           model_version: string | null;
           prompt_version: string | null;
           confidence: number | null;
-          state: string;
+          state: ClaimCandidate["state"];
           created_at: Date | string;
           requested_scope: string;
           scope_id: string;
@@ -449,6 +466,17 @@ export async function buildExplanation(
         )
       ).rows[0] ?? null
     : null;
+
+  const candidateSpans = candidateRow
+    ? await executor.query<{ span_id: string; role: "supports" | "refutes" }>(
+        `SELECT s.span_id, ce.role
+           FROM candidate_evidence ce
+           JOIN evidence_spans s ON s.span_id = ce.span_id
+          WHERE ce.candidate_id = $1::uuid
+          ORDER BY s.start_off ASC`,
+        [stripPrefix(candidateRow.candidate_id)],
+      )
+    : { rows: [] as { span_id: string; role: "supports" | "refutes" }[] };
 
   const projectionRows = await executor.query<{
     projection: string;
@@ -478,20 +506,7 @@ export async function buildExplanation(
   return {
     claim_id: record.claim_id,
     claim: record,
-    origin_event: {
-      event_id: `evt_${stripPrefix(originRow.event_id).replace(/-/g, "")}`,
-      stream_id: originRow.stream_id,
-      seq: Number(originRow.seq),
-      actor_id: originRow.actor_id,
-      origin: originRow.origin,
-      occurred_at: toIso(originRow.occurred_at),
-      recorded_at: toIso(originRow.recorded_at),
-      // Null exactly when the payload was redacted: the explanation must still be
-      // able to say that the event existed and when, which is the whole point of
-      // preserving the ledger row through erasure.
-      content: originRow.payload,
-      redacted_at: originRow.redacted_at === null ? null : toIso(originRow.redacted_at),
-    },
+    origin_event: originEvent,
     spans: (evidence.get(claimId)?.refs ?? []).map((ref) => ({
       span_id: ref.span_id,
       role: ref.role,
@@ -506,9 +521,11 @@ export async function buildExplanation(
     candidate: candidateRow
       ? {
           candidate_id: `cnd_${stripPrefix(candidateRow.candidate_id).replace(/-/g, "")}`,
-          tenant: deps.config ? claimsTenantOf(claim.tenant_id) : claimsTenantOf(claim.tenant_id),
-          source_event_id: `evt_${stripPrefix(originEventId ?? "").replace(/-/g, "")}`,
-          kind: candidateRow.kind as ClaimExplanation["candidate"] extends null ? never : never,
+          // The tenant slug the caller presented. The claim row stores the UUID, and
+          // the slug is what the API surface uses everywhere.
+          tenant: tenantSlug,
+          source_event_id: originEvent.event_id,
+          kind: candidateRow.kind,
           subject: candidateRow.subject,
           predicate: candidateRow.predicate,
           object: candidateRow.object,
@@ -524,11 +541,11 @@ export async function buildExplanation(
           model_version: candidateRow.model_version,
           prompt_version: candidateRow.prompt_version,
           confidence: candidateRow.confidence,
-          state: candidateRow.state as never,
+          state: candidateRow.state,
           created_at: toIso(candidateRow.created_at),
-          evidence: (evidence.get(claimId)?.refs ?? []).map((ref) => ({
-            span_id: ref.span_id,
-            role: ref.role,
+          evidence: candidateSpans.rows.map((span) => ({
+            span_id: `spn_${stripPrefix(span.span_id).replace(/-/g, "")}`,
+            role: span.role,
           })),
         }
       : null,
@@ -556,13 +573,7 @@ export async function buildExplanation(
   };
 }
 
-/** The tenant UUID a claim belongs to, formatted. Kept separate so its purpose is obvious. */
-function claimsTenantOf(tenantId: string): string {
-  return formatUuid(tenantId);
-}
-
 function toIso(value: Date | string): string {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
 }
 
-export { timePredicate, digestHex };

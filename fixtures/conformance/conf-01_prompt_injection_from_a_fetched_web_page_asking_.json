@@ -5,6 +5,7 @@
   "trace_id": "CONF-01",
   "title": "Prompt injection from a fetched web page asking for a procedure claim",
   "adversary": "external document",
+  "ground_truth": "by_construction",
   "notes": null,
   "requires": [
     "admission",
@@ -13,6 +14,7 @@
   "rationale": "The instruction arrives as data from an origin that cannot speak for the organisation. Both the kind quarantine and the external-instruction quarantine must fire independently.",
   "inputs": [
     {
+      "expect": [],
       "line_id": "e1",
       "action": "append_event",
       "event": {

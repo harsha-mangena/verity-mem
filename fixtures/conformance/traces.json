@@ -14,6 +14,7 @@
       ],
       "inputs": [
         {
+          "expect": [],
           "line_id": "e1",
           "action": "append_event",
           "event": {
@@ -74,6 +75,7 @@
       ],
       "inputs": [
         {
+          "expect": [],
           "line_id": "e1",
           "action": "append_event",
           "event": {
@@ -136,6 +138,7 @@
       ],
       "inputs": [
         {
+          "expect": [],
           "line_id": "e1",
           "action": "append_event",
           "event": {
@@ -202,6 +205,7 @@
       ],
       "inputs": [
         {
+          "expect": [],
           "line_id": "e1",
           "action": "append_event",
           "event": {
@@ -233,6 +237,7 @@
           }
         },
         {
+          "expect": [],
           "line_id": "e2",
           "action": "append_event",
           "event": {
@@ -281,8 +286,7 @@
             ]
           }
         ],
-        "accepted_claims": 1,
-        "contradicting_relations": 1
+        "accepted_claims": 1
       },
       "rationale": "The second claim must not silently replace the first. Unresolved alternatives are preserved, never collapsed into one latest truth."
     },
@@ -297,6 +301,7 @@
       ],
       "inputs": [
         {
+          "expect": [],
           "line_id": "e1",
           "action": "append_event",
           "event": {
@@ -328,6 +333,7 @@
           }
         },
         {
+          "expect": [],
           "line_id": "r1",
           "action": "resolve_claim",
           "target": {
@@ -342,6 +348,7 @@
           ]
         },
         {
+          "expect": [],
           "line_id": "e2",
           "action": "append_event",
           "event": {
@@ -406,6 +413,7 @@
       ],
       "inputs": [
         {
+          "expect": [],
           "line_id": "e1",
           "action": "append_event",
           "event": {
@@ -465,6 +473,7 @@
       ],
       "inputs": [
         {
+          "expect": [],
           "line_id": "e1",
           "action": "append_event",
           "event": {
@@ -496,6 +505,7 @@
           }
         },
         {
+          "expect": [],
           "line_id": "e2",
           "action": "append_event",
           "event": {
@@ -560,6 +570,7 @@
       ],
       "inputs": [
         {
+          "expect": [],
           "line_id": "e1",
           "action": "append_event",
           "event": {
@@ -620,6 +631,7 @@
       ],
       "inputs": [
         {
+          "expect": [],
           "line_id": "e1",
           "action": "append_event",
           "event": {
@@ -652,6 +664,7 @@
           }
         },
         {
+          "expect": [],
           "line_id": "r1",
           "action": "resolve_claim",
           "target": {
@@ -691,6 +704,7 @@
       ],
       "inputs": [
         {
+          "expect": [],
           "line_id": "e1",
           "action": "append_event",
           "event": {
@@ -723,6 +737,7 @@
           }
         },
         {
+          "expect": [],
           "line_id": "d1",
           "action": "erase_subject",
           "subject_or_scope": {

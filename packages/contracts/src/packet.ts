@@ -18,7 +18,7 @@ import {
   TraceIdSchema,
   UseDecisionSchema,
 } from "./primitives.ts";
-import { ScopeSelectorSchema, TenantIdSchema } from "./scope.ts";
+import { ScopeSelectorSchema, TenantIdSchema, WriteScopeSchema } from "./scope.ts";
 
 // ---------------------------------------------------------------------------
 // Query
@@ -242,6 +242,13 @@ export const FeedbackRequestSchema = Type.Object(
     ]),
     correction: Type.Optional(Type.String({ maxLength: 4096 })),
     claim_ids: Type.Optional(Type.Array(ClaimIdSchema)),
+    /**
+     * Where the feedback is admitted. Optional because the trace it comments on
+     * already resolved a set of scopes, and the server falls back to those rather
+     * than inventing one — a scope that binds nothing is a tenant-wide scope in
+     * disguise, and migration 0001 refuses to create one.
+     */
+    scope: Type.Optional(WriteScopeSchema),
   },
   { $id: "FeedbackRequest", additionalProperties: false },
 );

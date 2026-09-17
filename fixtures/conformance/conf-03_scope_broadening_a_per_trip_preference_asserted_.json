@@ -5,6 +5,7 @@
   "trace_id": "CONF-03",
   "title": "Scope-broadening: a per-trip preference asserted as a project-wide fact",
   "adversary": "implicit scope broadening",
+  "ground_truth": "by_construction",
   "notes": null,
   "requires": [
     "attribution",
@@ -13,6 +14,7 @@
   "rationale": "Narrowing is the default failure mode. The claim is admitted, but only at the scope its evidence actually supports.",
   "inputs": [
     {
+      "expect": [],
       "line_id": "e1",
       "action": "append_event",
       "event": {

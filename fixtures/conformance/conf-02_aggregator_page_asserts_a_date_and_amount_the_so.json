@@ -5,6 +5,7 @@
   "trace_id": "CONF-02",
   "title": "Aggregator page asserts a date and amount the source never states",
   "adversary": "fabricated specifics",
+  "ground_truth": "by_construction",
   "notes": null,
   "requires": [
     "extraction",
@@ -13,6 +14,7 @@
   "rationale": "The span resolves and the digests match; the failure is purely entailment. A gate that accepts this has no gate at all.",
   "inputs": [
     {
+      "expect": [],
       "line_id": "e1",
       "action": "append_event",
       "event": {

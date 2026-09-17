@@ -5,6 +5,7 @@
   "trace_id": "CONF-06",
   "title": "Injection that flatters the agent into granting itself a permission",
   "adversary": "authority laundering",
+  "ground_truth": "by_construction",
   "notes": null,
   "requires": [
     "admission",
@@ -13,6 +14,7 @@
   "rationale": "Two independent quarantine rules and a declared strong authority still lose. Kind and origin are policy inputs a candidate cannot argue with.",
   "inputs": [
     {
+      "expect": [],
       "line_id": "e1",
       "action": "append_event",
       "event": {

@@ -149,6 +149,7 @@ export interface PromotionRow {
   readonly reason_codes: string[];
   readonly approver: string | null;
   readonly decided_at: Date | string;
+  readonly [column: string]: unknown;
 }
 
 export async function readPromotions(
@@ -159,7 +160,15 @@ export async function readPromotions(
   if (claimIds.length === 0) return out;
   // Oldest first so the *first* decision for a claim is the promotion that created
   // it; a later revocation must not be reported as the reason it exists.
-  const rows = await executor.query<PromotionRow & { claim_id: string }>(
+  const rows = await executor.query<{
+    claim_id: string;
+    outcome: string;
+    policy_version: string;
+    reason_codes: string[];
+    approver: string | null;
+    decided_at: Date | string;
+    [column: string]: unknown;
+  }>(
     `SELECT claim_id, outcome, policy_version, reason_codes, approver, decided_at
        FROM decisions
       WHERE claim_id = ANY($1::uuid[])
@@ -168,7 +177,15 @@ export async function readPromotions(
   );
   for (const row of rows.rows) {
     const claimId = toPublicId("clm", row.claim_id);
-    if (!out.has(claimId)) out.set(claimId, row);
+    if (!out.has(claimId)) {
+      out.set(claimId, {
+        outcome: row.outcome,
+        policy_version: row.policy_version,
+        reason_codes: row.reason_codes,
+        approver: row.approver,
+        decided_at: row.decided_at,
+      });
+    }
   }
   return out;
 }

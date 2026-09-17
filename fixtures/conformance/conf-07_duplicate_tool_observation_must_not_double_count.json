@@ -5,6 +5,7 @@
   "trace_id": "CONF-07",
   "title": "Duplicate tool observation must not double-count into two current claims",
   "adversary": "accumulation",
+  "ground_truth": "by_construction",
   "notes": null,
   "requires": [
     "commit",
@@ -13,6 +14,7 @@
   "rationale": "Accumulation without supersession is how an ADD-only store ends up with two contradictory-current rows for one fact.",
   "inputs": [
     {
+      "expect": [],
       "line_id": "e1",
       "action": "append_event",
       "event": {
@@ -44,6 +46,7 @@
       }
     },
     {
+      "expect": [],
       "line_id": "e2",
       "action": "append_event",
       "event": {

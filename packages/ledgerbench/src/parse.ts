@@ -1063,6 +1063,16 @@ export function parseConformanceDocument(path: string, text: string): Conformanc
 
 const FIXTURE_DIRS: readonly Suite[] = ["ledgerbench", "poisoning", "deletion"];
 
+/**
+ * The published index of the ten conformance traces.
+ *
+ * Constants are evaluated where they are declared, so this one lives above the
+ * discovery function that reads it: a `const` declared after a function that runs
+ * during module evaluation is a temporal-dead-zone error that only appears when the
+ * function is called, which is the least convenient time to find it.
+ */
+const CONFORMANCE_INDEX_FILE_NAME = "traces.json";
+
 export interface LoadOptions {
   /** Repository `fixtures/` directory. */
   readonly root: string;
@@ -1100,7 +1110,7 @@ export function loadFixtures(options: LoadOptions): FixtureLoadReport {
       try {
         if (name.endsWith(".jsonl")) {
           files.push(parseFixtureFile(path));
-        } else if (name.endsWith(".json") && name !== CONFORMANCE_INDEX_FILE) {
+        } else if (name.endsWith(".json") && name !== CONFORMANCE_INDEX_FILE_NAME) {
           // The individual trace documents are loaded so each trace has its own
           // file; the index would otherwise be parsed as an extra, malformed trace.
           const trace = parseConformanceDocument(path, readFileSync(path, "utf8"));
@@ -1140,17 +1150,89 @@ export function loadFixtures(options: LoadOptions): FixtureLoadReport {
  * trace, so it is skipped by name. The index exists so a replay oracle can be
  * pointed at the whole set without globbing.
  */
-export const CONFORMANCE_INDEX_FILE = "traces.json";
-
 export function loadConformanceTraces(root: string): { traces: ConformanceTrace[]; failures: FixtureLoadReport["failures"] } {
   const traces: ConformanceTrace[] = [];
   const failures: { file: string; line: number; code: string; message: string }[] = [];
   const dir = join(root, "conformance");
+  const seen = new Set<string>();
+
   for (const name of readdirSync(dir).sort()) {
-    if (!name.endsWith(".json") || name === CONFORMANCE_INDEX_FILE) continue;
+    if (!name.endsWith(".json")) continue;
     const path = join(dir, name);
+    let raw: unknown;
     try {
-      traces.push(parseConformanceDocument(path, readFileSync(path, "utf8")));
+      raw = JSON.parse(readFileSync(path, "utf8"));
+    } catch (error) {
+      failures.push({ file: path, line: 1, code: "io", message: (error as Error).message });
+      continue;
+    }
+
+    // Both arrangements are supported, and the file's own shape decides which it
+    // is: a document with a `trace_id` is one trace, and a document with a
+    // `traces` array is an index that names others. Deciding by filename would
+    // mean a suite that renamed its index file silently loaded nothing — which is
+    // exactly the failure this loader originally had, reporting ten missing traces
+    // while ten valid trace files sat next to it.
+    const isIndex =
+      raw !== null &&
+      typeof raw === "object" &&
+      Array.isArray((raw as { traces?: unknown }).traces) &&
+      !("trace_id" in (raw as object));
+
+    if (isIndex) {
+      for (const entry of (raw as { traces: unknown[] }).traces) {
+        if (entry === null || typeof entry !== "object") {
+          failures.push({
+            file: path,
+            line: 1,
+            code: "malformed_index_entry",
+            message: `${path}: an entry in the trace index is not an object`,
+          });
+          continue;
+        }
+        const candidate = entry as Record<string, unknown>;
+        const fileRef = typeof candidate["file"] === "string" ? candidate["file"] : null;
+        if (fileRef === null) {
+          // An inline trace object is parsed directly so an index may embed its
+          // traces as well as name them.
+          try {
+            const trace = parseConformanceDocument(path, JSON.stringify(entry));
+            if (!seen.has(trace.trace_id)) {
+              seen.add(trace.trace_id);
+              traces.push(trace);
+            }
+          } catch (error) {
+            const failure =
+              error instanceof FixtureParseError
+                ? { file: error.file, line: error.line, code: error.code, message: error.message }
+                : { file: path, line: 1, code: "io", message: (error as Error).message };
+            failures.push(failure);
+          }
+          continue;
+        }
+        const referenced = join(dir, fileRef);
+        try {
+          const trace = parseConformanceDocument(referenced, readFileSync(referenced, "utf8"));
+          if (!seen.has(trace.trace_id)) {
+            seen.add(trace.trace_id);
+            traces.push(trace);
+          }
+        } catch (error) {
+          const failure =
+            error instanceof FixtureParseError
+              ? { file: error.file, line: error.line, code: error.code, message: error.message }
+              : { file: referenced, line: 1, code: "io", message: (error as Error).message };
+          failures.push(failure);
+        }
+      }
+      continue;
+    }
+
+    try {
+      const trace = parseConformanceDocument(path, readFileSync(path, "utf8"));
+      if (seen.has(trace.trace_id)) continue;
+      seen.add(trace.trace_id);
+      traces.push(trace);
     } catch (error) {
       const failure =
         error instanceof FixtureParseError
@@ -1159,6 +1241,8 @@ export function loadConformanceTraces(root: string): { traces: ConformanceTrace[
       failures.push(failure);
     }
   }
+
+  traces.sort((left, right) => left.trace_id.localeCompare(right.trace_id));
   return { traces, failures };
 }
 

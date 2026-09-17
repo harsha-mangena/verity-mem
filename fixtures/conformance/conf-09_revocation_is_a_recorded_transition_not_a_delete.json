@@ -5,6 +5,7 @@
   "trace_id": "CONF-09",
   "title": "Revocation is a recorded transition, not a delete",
   "adversary": "history destruction",
+  "ground_truth": "by_construction",
   "notes": null,
   "requires": [
     "commit",
@@ -13,6 +14,7 @@
   "rationale": "The row survives with its evidence; only status and valid_to change. A system that deletes on revoke cannot explain what it used to believe.",
   "inputs": [
     {
+      "expect": [],
       "line_id": "e1",
       "action": "append_event",
       "event": {
@@ -45,6 +47,7 @@
       }
     },
     {
+      "expect": [],
       "line_id": "r1",
       "action": "resolve_claim",
       "target": {
