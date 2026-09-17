@@ -148,6 +148,22 @@ step "3. Typecheck"
 pnpm exec tsc --noEmit -p tsconfig.json || fail "typecheck reported errors"
 
 # ---------------------------------------------------------------------------
+step "3b. Workflow validity"
+# ---------------------------------------------------------------------------
+# The CI workflow is the one artifact this script cannot execute -- it needs a GitHub
+# runner -- so it is the artifact most likely to rot unnoticed. `actionlint` statically
+# validates what a runner would reject outright: expression contexts, action inputs,
+# `needs` graph shape, and it shellchecks every `run:` block. It found a real defect the
+# first time it ran: `name: acceptance (node ${{ env.NODE_VERSION }} ...)` is invalid,
+# because `env` is not an available context in a job's `name`, and an invalid workflow is
+# not a job that fails -- it is a workflow that never loads.
+#
+# A missing actionlint is a failure, like every other missing tool here: a check that
+# silently does not run is the failure mode this script exists to prevent.
+require actionlint
+actionlint || fail "actionlint reported problems in .github/workflows"
+
+# ---------------------------------------------------------------------------
 step "4. Test suite (packages and applications)"
 # ---------------------------------------------------------------------------
 # Serial, because the suite writes to a shared append-only ledger. The root

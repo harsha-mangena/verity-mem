@@ -50,12 +50,19 @@ env:
   NODE_VERSION: "22.18.0"
   PNPM_VERSION: "9.15.9"
   PYTHON_VERSION: "3.12"
+  # Pinned so a new actionlint release cannot change the verdict without a commit here.
+  ACTIONLINT_VERSION: "1.7.12"
   DATABASE_URL: "postgres://veritymem_app:veritymem_app@127.0.0.1:55432/veritymem"
   MIGRATION_DATABASE_URL: "postgres://verity:verity@127.0.0.1:55432/veritymem"
 
 jobs:
   acceptance:
-    name: acceptance (node ${{ env.NODE_VERSION }}, pg17 + pgvector 0.8.6)
+    # `env` is not an available context in a job's `name` — only `github`, `inputs`,
+    # `matrix`, `needs`, `strategy` and `vars` are — so interpolating `env.NODE_VERSION`
+    # here made the whole workflow invalid rather than merely mislabelled. The values are
+    # written out and `actionlint` checks the file; `scripts/verify.sh` asserts the real
+    # versions at run time, which is what actually holds them together.
+    name: acceptance (node 22.18.0, pg17 + pgvector 0.8.6)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 
@@ -80,6 +87,17 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile -r
+
+      # `scripts/verify.sh` refuses to skip a step, and its workflow-lint step needs
+      # actionlint. Fetching the pinned release here (rather than delegating to a
+      # third-party action) keeps the tool version in this file where a reader can see it.
+      - name: Install actionlint
+        run: |
+          curl --fail --silent --show-error --location \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            | tar --extract --gzip --to-stdout actionlint > /usr/local/bin/actionlint
+          chmod +x /usr/local/bin/actionlint
+          actionlint -version
 
       # A hosted runner is clean, but `down -v` makes the job idempotent on a self-hosted
       # runner too, where a leftover `veritymem-postgres` from an earlier run would

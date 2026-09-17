@@ -98,13 +98,28 @@ work on a held-out corpus, not a code change, and it is not done.
   same subject and predicate produce `contradicts` and therefore review. That is what
   keeps `unsafe_auto_accept_rate` at zero and it is also part of why review burden
   exceeds its ceiling.
-- **Review burden is above its ceiling.** On the default lexical gate the acceptance
-  run reports 10.0% of 40 non-adversarial writes needing review against a 2% ceiling;
-  with the ONNX verifier provisioned the figure is 6.5% of 31. Neither number is a
-  production workload, and the target fails either way. Review burden is also
-  computed per decision rather than per fixture: classifying it per fixture let a
-  single adversarial fixture exclude that fixture's ordinary writes from the
-  denominator, which reported 0.0% and was wrong.
+- **The review-burden target is measured on fixture writes, not a reference
+  workload.** The specification's target is "under 2% of writes on the reference
+  workload". On the default lexical gate the corpus's `ordinary` population — strong
+  evidence, no conflict, no privileged kind, no sensitivity, no external instruction,
+  which is the class the ceiling is defined over — measures **0 of 37 writes (0.0%)**,
+  stable across seeds 1-3. It is tempting to report that as the target met. It is not:
+  the ordinary population is fixture writes chosen to exercise the gate, not a sample of
+  a deployed agent's traffic, so the number bounds the gate's behaviour on these
+  fixtures and cannot establish a bound on a production workload. The target is
+  therefore split in two: `review_burden` passes on its own population, and
+  `reference_workload_burden` is `not_measured` for want of a reference workload. The
+  suite exits non-zero either way.
+- **Every review in the corpus is a control firing.** Of 48 decisions, 11 need review:
+  7 adversarial, 3 contradicting, 1 high-sensitivity, and **0 ordinary**. The 22.9%
+  headline rate is therefore not evidence of miscalibration, and an earlier revision
+  that compared a `non_adversarial` denominator (10.0% of 40, which folds the 3
+  contradicting writes in) made a correctly working gate look broken. Both numbers are
+  published beside the target, and `ledgerbench.test.ts` asserts the safety limits on
+  every seed so that reaching a lower rate by reviewing less fails rather than passes.
+  Review burden is also computed per decision rather than per fixture: classifying it
+  per fixture let a single adversarial fixture exclude that fixture's ordinary writes
+  from the denominator, which reported 0.0% and was wrong.
 - **`reviewBurdenCeiling` has no reader in library code.** It is configuration that
   documents an intent no code enforces.
 - **A run that was scored without a pinned model digest cannot claim
@@ -128,9 +143,21 @@ work on a held-out corpus, not a code change, and it is not done.
 ## Environment
 
 - **The acceptance workflow has not been executed on GitHub.** `.github/workflows/acceptance.yml`
-  was rewritten to bring up the database from `deploy/compose/docker-compose.yml`,
-  because a `services:` block cannot pass postmaster arguments and `scripts/verify.sh`
-  asserts against the Compose-managed container by name. That workflow has still never
-  run on a runner. The commands inside it are the ones `scripts/verify.sh` runs locally,
-  and each step was validated by hand against a real Compose stack — but "the CI job is
-  green" is not a claim this repository can make yet.
+  brought the database up from a `services:` block until it was rewritten to use
+  `deploy/compose/docker-compose.yml`: a `services:` block cannot pass postmaster
+  arguments (the runner hands `options` to `docker create` ahead of the image, so
+  `-c shared_preload_libraries=...` is parsed by the Docker CLI as `--cpu-shares`), and
+  `scripts/verify.sh` asserts against the Compose-managed container by name.
+
+  What *is* established: the file passes `actionlint` 1.7.12 with no findings, which is
+  now step 3b of `scripts/verify.sh` rather than an ad-hoc check, and the assertion SQL
+  and Compose bring-up were each executed by hand against a real stack. `actionlint`
+  immediately found a defect no local run could have: `name: acceptance (node ${{
+  env.NODE_VERSION }} ...)` is invalid because `env` is not an available context in a
+  job's `name`, and an invalid workflow is not a job that fails — it is a workflow that
+  never loads.
+
+  What is *not* established: that a runner completes the job. Scheduling, the service
+  container network, `pnpm install --frozen-lockfile` against a clean checkout and the
+  artifact upload have never run anywhere. **"The CI job is green" is not a claim this
+  repository can make.**
