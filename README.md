@@ -50,12 +50,18 @@ pnpm install -r
 pnpm db:up          # PostgreSQL 17 + pgvector on 127.0.0.1:55432
 pnpm migrate        # apply migrations
 pnpm typecheck
-pnpm test           # 82 tests against the real database
+pnpm test           # 280 tests against the real database
 ```
 
 Copy `.env.example` to `.env` to change any default. The server, MCP server and
 reference workload each have their own README; the end-to-end demonstration of the
 whole thesis is `pnpm demo`.
+
+**Installing it — including as a container — is documented in [INSTALL.md](INSTALL.md).**
+That file also states what each installation path does *not* give you, which matters more
+than the instructions: the entailment weights are not shipped, the packages are not on a
+registry, and retention verifies the live stores a deployment declares rather than its
+backups.
 
 ## Repository
 
@@ -120,6 +126,29 @@ extra steps.
 
 `docs/threat-model.md` lists what is still open, including several things that are
 deliberately not solved in v0.1. `SECURITY.md` covers disclosure.
+
+## What is verified, and how
+
+Two commands, and neither is a claim you have to take on trust:
+
+```bash
+bash scripts/verify.sh          # the acceptance check; writes reports/ and exits non-zero on failure
+node scripts/fetch-model.mjs    # provisions the production entailment verifier
+```
+
+`scripts/verify.sh` pins and asserts Node, PostgreSQL, pgvector and Python versions, runs
+migrations, typechecks, runs 280 tests plus the offline Python harness, exercises the
+reference workload end to end, drives the HTTP surface over a real socket, and writes a
+summary naming the exact commit and every version it ran against. A missing tool is a
+failure rather than a skip, and the benchmark's exit code is the gate — a partial pass that
+looks like a pass is worse than no check.
+
+**The production entailment verifier is optional and its absence is loud.** The
+DeBERTa-v3 MNLI weights are 233 MB and are not committed, so a fresh checkout runs with the
+lexical stand-in, which every decision records as such. Provision the real verifier with
+`node scripts/fetch-model.mjs`; with `GATE_ENTAILMENT_BACKEND=onnx` set and the assets
+missing or unpinned, the server and worker **refuse to start** rather than quietly weaken to
+token overlap. `verify.sh` reports which of the two states you are in.
 
 ## Licence
 

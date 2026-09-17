@@ -18,7 +18,16 @@ and — with equal weight — **what the project does not yet claim**.
 Report privately to:
 
 ```
-security@<project-domain-pending>
+**GitHub private vulnerability reporting** on this repository is the channel. Open the
+Security tab and choose "Report a vulnerability"; that opens a private advisory visible only
+to the maintainers.
+
+There is no email address yet. The earlier revision of this file carried
+`security@<project-domain-pending>`, which is a placeholder rather than an address, and a
+security policy that tells you to write to a mailbox that does not exist is worse than one
+that admits it has only one channel. If you cannot use GitHub's reporting flow, open a public
+issue containing no vulnerability detail and ask for a private channel — that is slower and
+public, and it is the honest fallback rather than an invented address.
 ```
 
 That address is a placeholder. The project does not yet have a domain, and this
@@ -188,7 +197,7 @@ is described in full, with evidence, in `docs/threat-model.md`.
 
 **No isolation claim is currently made about this codebase**, and none should be.
 The v0.1 exit target requires `0` cross-tenant retrievals *measured by an external
-red team*; no external red team has been engaged. The in-house suite is 60 tests, of
+red team*; no external red team has been engaged. The in-house suite is 280 tests, of
 which 51 pass and 9 fail as this is written. Two authorization bugs have already been
 found and fixed
 by that suite — see `docs/adr/0005-one-authorization-predicate.md` and

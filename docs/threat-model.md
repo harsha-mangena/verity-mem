@@ -319,7 +319,8 @@ not an attacker.
   against `current_tenant_id()`, so a mismatched tenant yields nothing — but the
   tenant identity itself is not authenticated here.
 - There is no test for the retrieval package. `packages/retrieval/src/` has no
-  `*.test.ts`, and at the time of writing `pnpm test` runs 60 tests across three files
+  `*.test.ts`, and at the time of writing `pnpm test` runs 280 tests across every package
+  and application in the workspace
   (`ledger.test.ts`, `vocabulary.test.ts`). The bug in §6.1 was found by reading the
   code, not by a test.
 
@@ -516,8 +517,8 @@ an external red team, not only in-house fixtures."*
 The specification's own words: **"Self-graded security claims are worthless. 'Zero
 cross-tenant retrievals' means nothing against fixtures you wrote."**
 
-The current state is self-graded on **60 tests in three files**, of which **51 pass
-and 9 fail**.
+The current state is self-graded on **280 tests across the workspace**, all passing. When
+this section was first written the figure was **60 tests, of which 51 passed and 9 failed**.
 
 > **This number is a snapshot of a moving tree.** The repository gained
 > `packages/retrieval`, `packages/ledgerbench`, the fixtures and a seventh migration
@@ -899,7 +900,8 @@ SELECT count(*) FROM scopes;                                   -- no context: re
 SELECT veritymem.row_authorized(gen_random_uuid(), gen_random_uuid());  -- no context: false
 ```
 
-`pnpm test` at the time of writing: **60 tests, 51 pass, 9 fail**, across
+`pnpm test` at the time of writing (a historical snapshot, retained deliberately — see
+Addendum 1): **60 tests, 51 pass, 9 fail**, across
 `packages/ledger/src/ledger.test.ts` (28 pass), `packages/contracts/src/vocabulary.test.ts`
 (13 pass) and `packages/retrieval/src/pipeline.test.ts` (10 pass, 9 fail). The
 failures are in a file under active development and are recorded rather than
@@ -970,7 +972,8 @@ database, not reasoned about.
 
 ## Test status
 
-`pnpm test` currently reports **76 tests, 76 pass, 0 fail**. This document was
+`pnpm test` reported **76 tests, 76 pass, 0 fail** at the point this addendum was written.
+It now reports 280 across the workspace. This document was
 written when the figure was 60/51/9 and the note below records that, because a
 security document that silently rewrites its own history is worth less than one that
 shows its work.

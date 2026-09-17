@@ -945,8 +945,9 @@ Every enforcement claim in this document was checked against a running PostgreSQ
 
 ### 12.1 Test suite state
 
-`pnpm test` against the same instance currently reports **60 tests, 51 pass, 9
-fail**. The failures are in `packages/retrieval/src/pipeline.test.ts` (a new file
+`pnpm test` against the same instance reported **60 tests, 51 pass, 9 fail** when this
+document was written. It now reports **280 tests, all passing**, across every package and
+application in the workspace. The failures are in `packages/retrieval/src/pipeline.test.ts` (a new file
 under active development) and one is worth recording here because it is a data-model
 observation rather than a retrieval bug:
 

@@ -37,6 +37,7 @@ import {
   CommitGate,
   LexicalEntailmentBackend,
   defaultAuthorityFor,
+  renderStatement,
   type CandidateForGate,
   type EntailmentBackend,
 } from "@veritymem/gate";
@@ -69,21 +70,16 @@ import {
   type ResolveOutcome,
 } from "./types.ts";
 
-/**
- * One shared lexical backend for the whole process.
+/*
+ * The entailment backend the benchmark runs with.
  *
- * Constructing a backend per fixture would be harmless but would also make it easy
- * to swap in a different one by accident; a single lazily-created instance keeps
- * the benchmark's gate input identical across every fixture in a run.
+ * Resolved once per process by `cli.ts` and handed to the runner, rather than chosen
+ * inside `run()`: the choice changes every number in the report, so it belongs to the
+ * run's configuration and has to be recorded in the manifest. The default remains the
+ * lexical stand-in, because a benchmark that silently reached for a 233 MB model would
+ * fail on a checkout that has not provisioned one, and "the gate could not run" must be
+ * a statement in the report rather than an empty result.
  */
-let lexicalBackend: EntailmentBackend | null = null;
-
-function getLexicalBackend(): EntailmentBackend {
-  if (lexicalBackend === null) {
-    lexicalBackend = new LexicalEntailmentBackend({ floor: GATE_THRESHOLDS.lexicalEntailmentFloor });
-  }
-  return lexicalBackend;
-}
 
 // ---------------------------------------------------------------------------
 // Public result shapes
@@ -313,6 +309,15 @@ export interface FixtureRunnerOptions {
   readonly seed?: number;
   readonly clockStart?: string;
   readonly log?: (message: string) => void;
+  /**
+   * The entailment backend every gate evaluation and every composition score uses.
+   *
+   * Optional so the runner can still be constructed in a test that has no model assets,
+   * in which case the caller supplies the lexical stand-in explicitly. There is no
+   * silent fallback inside the runner: which verifier scored the run is a property of
+   * the run, and it is published in the manifest.
+   */
+  readonly entailment?: EntailmentBackend;
 }
 
 // ---------------------------------------------------------------------------
@@ -432,12 +437,22 @@ export class FixtureRunner {
     const ids = seededIds(idSeed);
     const blobs = new MemoryBlobStore();
     const ledger = new Ledger({ db, blobs, clock, ids });
+    const entailment = this.options.entailment ?? new LexicalEntailmentBackend({
+      floor: GATE_THRESHOLDS.lexicalEntailmentFloor,
+    });
     const gate = new CommitGate({
       db,
       ledger,
       ids,
       clock,
-      entailment: defaultEntailment(),
+      entailment,
+    });
+    // One embedder per runner instance rather than per fixture: the model id is part of
+    // the projection's identity, and two instances with different dimensions would
+    // silently query projections written by the other.
+    const embeddings = new HashEmbeddingBackend({
+      dimensions: loadEnv().embedding.dimensions,
+      modelId: loadEnv().embedding.modelId,
     });
 
     const state = new RunState(
@@ -455,6 +470,9 @@ export class FixtureRunner {
         db,
         clock,
         ids,
+        embeddings,
+        entailment,
+        entailmentName: entailment.name,
       },
       blobs,
     );
@@ -520,23 +538,6 @@ export class FixtureRunner {
   }
 }
 
-/**
- * The entailment backend the benchmark runs with, recorded on every decision.
- *
- * It is the real `LexicalEntailmentBackend` from `@veritymem/gate`, obtained
- * through the module's own factory rather than reimplemented: a benchmark that
- * carried its own copy of the thing it measures would drift, and the drift would
- * be invisible.
- *
- * `lexical` is the honest choice for the default suite — deterministic, no model
- * artefact, and every fixture in the repository was written against it. A run with
- * a different backend produces different numbers, which is why the backend name
- * travels with the result.
- */
-function defaultEntailment(): EntailmentBackend {
-  return getLexicalBackend();
-}
-
 // ---------------------------------------------------------------------------
 // Run state: one instance per fixture
 // ---------------------------------------------------------------------------
@@ -564,6 +565,24 @@ interface RunStateDeps {
   readonly db: Db;
   readonly clock: ReturnType<typeof fixedClock>;
   readonly ids: ReturnType<typeof seededIds>;
+  /**
+   * The embedding projection the read path queries.
+   *
+   * One instance for the whole run, matching the server's default `HashEmbeddingBackend`.
+   * The model id is part of the projection's identity, so a per-query instance with a
+   * different dimension count would silently query a projection written by another model
+   * and return nothing.
+   */
+  readonly embeddings: HashEmbeddingBackend;
+  /**
+   * The entailment backend's name, recorded on packets and used by composition scoring.
+   *
+   * A name rather than the backend itself because the packet's `gate_backend` field is a
+   * provenance string, and a scoring pass that used a *different* backend than the run
+   * would produce a citation-support number that does not describe the artifact.
+   */
+  readonly entailment: EntailmentBackend;
+  readonly entailmentName: string;
 }
 
 class RunState {
@@ -652,6 +671,15 @@ class RunState {
   /** True once the run knows which tenant its rows live in. */
   get resolvedTenantId(): string {
     return this.tenantId;
+  }
+
+  /** The run's embedding projection, shared by every query so the model id cannot drift. */
+  private get embeddings(): HashEmbeddingBackend {
+    return this.deps.embeddings;
+  }
+
+  private get entailment(): EntailmentBackend {
+    return this.deps.entailment;
   }
 
   get lineResults(): readonly LineResult[] {
@@ -968,6 +996,271 @@ class RunState {
     }
   }
 
+  /**
+   * Run the read path a line declared: its queries, then its action-gate checks.
+   *
+   * Returns the failures instead of throwing, because the line's own assertions still
+   * have to be evaluated against the state the failure left behind — a query that could
+   * not be issued is a result about the read path, and discarding the line's write-path
+   * assertions because of it would hide a second, independent problem.
+   */
+  private async executeReadPath(entry: FixtureBodyLine): Promise<{ failures: readonly string[] }> {
+    const failures: string[] = [];
+    try {
+      await this.runDeclaredQueries(entry);
+    } catch (error) {
+      failures.push(`query execution raised: ${(error as Error).message}`);
+    }
+    try {
+      await this.runDeclaredActions(entry);
+    } catch (error) {
+      failures.push(`action-gate execution raised: ${(error as Error).message}`);
+    }
+    return { failures };
+  }
+
+  /**
+   * Issue every query the line declared, after the line's own assertions ran.
+   *
+   * After, not before: a query is a read of the state the line produced, and issuing
+   * it first would measure the state before the write the fixture is about. Assertions
+   * that need the packet (`expect_missing`, `expect_abstain`) run afterwards, against
+   * these outcomes.
+   */
+  private async runDeclaredQueries(entry: FixtureBodyLine): Promise<void> {
+    if (entry.kind !== "append_event" && entry.kind !== "resolve_claim") return;
+    for (const query of entry.query ?? []) {
+      const outcome = await this.runQuery(entry.line_id, query);
+      this.queryOutcomes.push(outcome);
+      this.packetByLine.set(entry.line_id, outcome);
+    }
+  }
+
+  /**
+   * Run one declared query through the real composer.
+   *
+   * Three things are worth stating, because the obvious alternative to each was wrong:
+   *
+   *  - **The tenant is the run's own tenant uuid, not the fixture's label.** Scopes and
+   *    claims live under the id the ledger derived; a query issued against the label
+   *    would authorize against a partition that holds nothing and report a working read
+   *    path as an empty one. The `tenant` a fixture declares is a label for its own
+   *    scopes and has to resolve to the same partition, so a disagreement is recorded
+   *    as a defect instead of becoming a zero.
+   *  - **The principal is the fixture's, and it reaches nothing on its own.** Reach
+   *    comes from `principal_scopes` and from live grants, and the benchmark writes
+   *    neither on a fixture's behalf. A fixture that forgets its `create_grant` line
+   *    gets zero authorized scopes, which is the correct answer and is why the
+   *    unauthorized-candidate metric exists next to it.
+   *  - **The embedding backend is the hash projection**, matching the server default.
+   *    A hosted embedder would make the run non-reproducible and would put a model call
+   *    on the read path the specification says must have none.
+   */
+  private async runQuery(lineId: string, query: FixtureQuery): Promise<QueryOutcome> {
+    const purpose = query.purpose;
+    const defects: string[] = [];
+
+    // The fixture's declared tenant is a label for its own scopes. A label that is not
+    // the one this fixture wrote under would authorize against a different partition, so
+    // the disagreement is recorded instead of presenting as an empty read path.
+    if (query.tenant !== undefined && query.tenant !== this.deps.tenantSlug) {
+      defects.push(
+        `query declares tenant ${JSON.stringify(query.tenant)} but this run's events were written under ` +
+          `${JSON.stringify(this.deps.tenantSlug)}; every scope in this run resolves to one partition, so the ` +
+          `declared label is unused. Declare the fixture's own tenant or omit it.`,
+      );
+    }
+
+    const declared: ComposeResult = await compose(
+      {
+        db: this.deps.db,
+        ledger: this.deps.ledger,
+        embeddings: this.embeddings,
+        ids: this.deps.ids,
+        clock: this.deps.clock,
+        gateBackend: this.deps.entailmentName,
+      },
+      {
+        tenant_id: this.tenantId,
+        query: query.query,
+        scope: {
+          ...(query.project !== undefined ? { project: query.project } : {}),
+          ...(query.user !== undefined ? { user: query.user } : {}),
+          ...(query.agent !== undefined ? { agent: query.agent } : {}),
+          ...(query.session !== undefined ? { session: query.session } : {}),
+        },
+        purpose,
+        ...(query.limit !== undefined ? { limit: query.limit } : {}),
+      },
+      { principal: query.principal },
+    );
+
+    const returned = await this.describeReturned(declared.packet);
+    const outcome: QueryOutcome = {
+      query_id: declared.packet.trace_id,
+      fixture_id: this.deps.fixture.header.fixture_id,
+      line_id: lineId,
+      text: query.query,
+      principal: query.principal,
+      purpose,
+      has_answer: query.has_answer ?? null,
+      limit: query.limit ?? 12,
+      decision: declared.packet.decision,
+      decision_reason_codes: [...declared.packet.decision_reason_codes],
+      returned,
+      missing: [...declared.packet.missing],
+      candidates_considered: declared.packet.coverage.candidates_considered,
+      candidates_denied_by_authz: declared.packet.coverage.candidates_denied_by_authz,
+      channels_used: [...declared.packet.coverage.channels_used],
+      plan_denied_dimensions: [...declared.plan.denied_dimensions],
+      latency_ms: declared.packet.latency_ms,
+      relevant: matchGroups(returned, query.relevance),
+      stale: matchGroups(returned, query.stale),
+      absent: matchGroups(returned, query.absent),
+      defects,
+    };
+    return outcome;
+  }
+  /**
+   * Reduce the packet's claims to the shape the stages score, re-verifying support.
+   *
+   * Composition's question is whether a returned claim's own evidence entails it, and
+   * the answer has to come from the production verifier rather than from the packet,
+   * whose `entailment` field records digest resolution. A claim whose evidence is gone
+   * or whose digest broke gets `null` rather than a verdict, because "there was nothing
+   * to check" is not "the check passed".
+   */
+  private async describeReturned(packet: MemoryPacket): Promise<ReturnedClaimRecord[]> {
+    const out: ReturnedClaimRecord[] = [];
+    for (const claim of packet.claims) {
+      const resolvable = claim.evidence.filter((entry) => entry.digest_ok && entry.quote !== null);
+      let entailment: string | null = null;
+      let score: number | null = null;
+      let backend: string | null = null;
+      if (resolvable.length > 0) {
+        const premise = resolvable.map((entry) => entry.quote ?? "").join("\n");
+        const verdict = await this.deps.entailment.entails({
+          premise,
+          hypothesis: renderStatement(claim.statement.subject, claim.statement.predicate, claim.statement.object),
+          proposition: renderStatement("", claim.statement.predicate, claim.statement.object),
+        });
+        entailment = verdict.result;
+        score = verdict.score;
+        backend = verdict.backend;
+      }
+      out.push({
+        claim_id: claim.claim_id,
+        kind: claim.kind,
+        statement: {
+          subject: claim.statement.subject,
+          predicate: claim.statement.predicate,
+          object: claim.statement.object,
+        },
+        status: claim.status,
+        use: claim.use,
+        use_reason_codes: [...claim.use_reason_codes],
+        evidence_count: claim.evidence.length,
+        resolvable_evidence: resolvable.length,
+        entailment,
+        entailment_score: score,
+        entailment_backend: backend,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Evaluate every action the line declared, after the line's own assertions ran.
+   *
+   * The gate is given claim *ids*, resolved here from the fixture's proposition
+   * matches, because the request contract takes ids and deliberately refuses a packet.
+   * A named claim that does not exist is recorded as a defect rather than dropped: the
+   * gate would refuse the action, the fixture would look satisfied, and the reason it
+   * was refused would be that nothing was ever built.
+   */
+  private async runDeclaredActions(entry: FixtureBodyLine): Promise<void> {
+    for (const expectation of entry.expect) {
+      if (expectation.type !== "expect_action_gate") continue;
+      const resolved = this.resolveClaimIds(expectation.claims);
+      const defects: string[] = [];
+      if (resolved.ids.length === 0) {
+        defects.push(
+          `none of the ${expectation.claims.length} declared claim(s) resolve to a claim row; the gate ` +
+            `would refuse the action because it was asked about claims that do not exist, which is not the ` +
+            `same result as refusing it on the evidence`,
+        );
+      }
+      const request: ActionGateRequest = {
+        action: expectation.action,
+        action_risk: expectation.action_risk,
+        // The run's own tenant uuid. `evaluateAction` re-derives reach from this value,
+        // so a label here would authorize against a partition that holds none of the
+        // claims the fixture just wrote and the gate would refuse for the wrong reason.
+        scope: { tenant: this.tenantId },
+        purpose: expectation.purpose,
+        // A placeholder id is supplied when nothing resolved so the gate is still called
+        // and its refusal is recorded with the defect that explains it. An empty array
+        // would be rejected by the contract before the gate ran.
+        claim_ids:
+          resolved.ids.length > 0 ? resolved.ids : [toPublicId("clm", "00000000-0000-4000-8000-000000000000")],
+      };
+      const verdict = await evaluateAction(
+        {
+          db: this.deps.db,
+          ledger: this.deps.ledger,
+          embeddings: this.embeddings,
+          clock: this.deps.clock,
+        },
+        request,
+        { principal: this.actionPrincipal(entry) },
+      );
+      this.actionGateOutcomes.push({
+        fixture_id: this.deps.fixture.header.fixture_id,
+        line_id: entry.line_id,
+        action: expectation.action,
+        action_risk: expectation.action_risk,
+        verdict: verdict.allowed ? "allow" : "block",
+        allowed: verdict.allowed,
+        reason_codes: [...verdict.reason_codes],
+        claims_resolved: resolved.ids.length,
+        claims_declared: expectation.claims.length,
+        defects,
+      });
+    }
+  }
+
+  /**
+   * The principal an action is evaluated as.
+   *
+   * The fixture's own first declared query principal when it has one, otherwise the
+   * actor of the line's event. There is no synthetic operator account, because the
+   * action gate's whole point is that reach is derived from server-side membership and
+   * grants; inventing a principal with blanket reach would measure a gate that ships to
+   * nobody.
+   */
+  private actionPrincipal(entry: FixtureBodyLine): string {
+    if (entry.kind === "append_event" || entry.kind === "resolve_claim") {
+      const first = entry.query?.[0];
+      if (first) return first.principal;
+    }
+    if (entry.kind === "append_event") return entry.event.actor_id;
+    return "ledgerbench:operator";
+  }
+
+  /** Resolve proposition matches to public claim ids, over every claim the run holds. */
+  private resolveClaimIds(matches: readonly FixtureRelevance[]): { ids: string[]; matched: boolean[] } {
+    const ids: string[] = [];
+    const matched: boolean[] = [];
+    for (const match of matches) {
+      const hit = this.claims.filter((claim) => claimMatchesRecord(claim, match));
+      const live = hit.filter((claim) => claim.status === "accepted" && claim.valid_to === null);
+      const chosen = live.length > 0 ? live : hit;
+      matched.push(chosen.length > 0);
+      for (const claim of chosen) if (!ids.includes(claim.claim_id)) ids.push(claim.claim_id);
+    }
+    return { ids, matched };
+  }
+
   // ---- append_event ------------------------------------------------------
 
   private async runAppend(entry: Extract<FixtureBodyLine, { kind: "append_event" }>): Promise<void> {
@@ -1023,6 +1316,7 @@ class RunState {
       // Assertions read the store, not the gate's return value: the question is
       // always "what does the system now hold", and only a read answers it.
       await this.refreshClaims();
+      const readPath = await this.executeReadPath(entry);
       for (const expectation of entry.expect) {
         assertions.push(await this.checkExpectation(entry, expectation, assertions.length));
       }
@@ -1031,10 +1325,11 @@ class RunState {
         line: entry.line,
         line_id: entry.line_id,
         kind: entry.kind,
-        outcome: "ok",
+        outcome: readPath.failures.length > 0 ? "error" : "ok",
         event_id: receipt.event_id,
         seq: receipt.seq,
         ...(candidateId !== undefined ? { candidate_id: candidateId } : {}),
+        ...(readPath.failures.length > 0 ? { error: readPath.failures.join("; ") } : {}),
         assertions,
       });
     } catch (error) {
@@ -1377,6 +1672,7 @@ class RunState {
         this.decisionLine.set(decisionId, entry.line_id);
       });
       await this.refreshClaims();
+      const readPath = await this.executeReadPath(entry);
       for (const expectation of entry.expect) {
         assertions.push(await this.checkExpectation(entry, expectation, assertions.length));
       }
@@ -1385,7 +1681,8 @@ class RunState {
         line: entry.line,
         line_id: entry.line_id,
         kind: entry.kind,
-        outcome: "ok",
+        outcome: readPath.failures.length > 0 ? "error" : "ok",
+        ...(readPath.failures.length > 0 ? { error: readPath.failures.join("; ") } : {}),
         assertions,
       });
     } catch (error) {
@@ -1465,6 +1762,7 @@ class RunState {
 
       await this.refreshClaims();
       this.ledgerRowCount = await this.countEvents();
+      const readPath = await this.executeReadPath(entry);
       for (const expectation of entry.expect) {
         assertions.push(await this.checkExpectation(entry, expectation, assertions.length));
       }
@@ -1473,7 +1771,8 @@ class RunState {
         line: entry.line,
         line_id: entry.line_id,
         kind: entry.kind,
-        outcome: "ok",
+        outcome: readPath.failures.length > 0 ? "error" : "ok",
+        ...(readPath.failures.length > 0 ? { error: readPath.failures.join("; ") } : {}),
         assertions,
       });
     } catch (error) {
@@ -1702,7 +2001,7 @@ class RunState {
     try {
       switch (expectation.type) {
         case "expect_claim": {
-          const matches = claims.filter((claim) => matchesClaim(claim, expectation));
+          const matches = claims.filter((claim) => matchesProposition(claim, expectation));
           const live = matches.filter((claim) => claim.status === "accepted" && claim.valid_to === null);
           if (live.length === 0) {
             return {
@@ -1731,7 +2030,7 @@ class RunState {
         case "expect_no_claim": {
           const scopeFilter = expectation.type === "expect_no_claim" ? expectation.scope : undefined;
           const matches = claims.filter((claim) => {
-            if (!matchesClaim(claim, expectation)) return false;
+            if (!matchesProposition(claim, expectation)) return false;
             if (scopeFilter !== undefined && !scopeMatches(claim, scopeFilter)) return false;
             if (claim.status === "rejected") return false;
             // Without an explicit status, "no claim" means "nothing currently
@@ -1881,7 +2180,7 @@ class RunState {
           };
         }
         case "expect_revoked": {
-          const matches = claims.filter((claim) => matchesClaim(claim, expectation));
+          const matches = claims.filter((claim) => matchesProposition(claim, expectation));
           const revoked = matches.filter((claim) => claim.status === "revoked");
           if (revoked.length === 0) {
             return {
@@ -1900,7 +2199,7 @@ class RunState {
           };
         }
         case "expect_superseded": {
-          const matches = claims.filter((claim) => matchesClaim(claim, expectation));
+          const matches = claims.filter((claim) => matchesProposition(claim, expectation));
           const superseded = matches.filter((claim) => claim.status === "superseded");
           if (superseded.length === 0) {
             return {
@@ -2043,7 +2342,7 @@ class RunState {
           };
         }
         case "expect_unverifiable_claim": {
-          const matches = claims.filter((claim) => matchesClaim(claim, expectation));
+          const matches = claims.filter((claim) => matchesProposition(claim, expectation));
           if (matches.length === 0) {
             return {
               expectation: expectation.type,
@@ -2090,13 +2389,134 @@ class RunState {
           };
         }
         case "expect_missing": {
+          const packet = this.packetByLine.get(entry.line_id);
+          if (!packet) {
+            return {
+              expectation: expectation.type,
+              status: "fail",
+              detail:
+                `no packet was produced for ${label}: the line declares a query, so a packet should exist. ` +
+                `Treating its absence as a pass is how a read-path assertion silently stops running.`,
+            };
+          }
+          if (packet.missing.length === 0) {
+            return {
+              expectation: expectation.type,
+              status: "fail",
+              detail:
+                `the packet for ${JSON.stringify(packet.text)} reported no gaps. Considered ` +
+                `${packet.candidates_considered} candidate(s) and returned ${packet.returned.length}; a packet ` +
+                `that accounts for everything it did not find has an empty missing array, and this one did not ` +
+                `reach that state.`,
+            };
+          }
+          if (expectation.contains !== undefined) {
+            const needle = expectation.contains.toLowerCase();
+            const hit = packet.missing.find((text) => text.toLowerCase().includes(needle));
+            if (hit === undefined) {
+              return {
+                expectation: expectation.type,
+                status: "fail",
+                detail:
+                  `no gap entry contains ${JSON.stringify(expectation.contains)}. The packet reported: ` +
+                  packet.missing.map((text) => JSON.stringify(text)).join("; "),
+              };
+            }
+            return { expectation: expectation.type, status: "pass", detail: `missing contains ${JSON.stringify(expectation.contains)}` };
+          }
           return {
             expectation: expectation.type,
-            status: "not_evaluated",
-            detail:
-              `cannot be evaluated: no MemoryPacket composer exists, so "missing" cannot be produced. ` +
-              `The expectation is retained so it becomes a real assertion the moment retrieval lands.`,
-            blocked_by: "retrieval.packet",
+            status: "pass",
+            detail: `packet reports ${packet.missing.length} gap(s): ${packet.missing.join(" | ")}`,
+          };
+        }
+        case "expect_abstain": {
+          const packet = this.packetByLine.get(entry.line_id);
+          if (!packet) {
+            return {
+              expectation: expectation.type,
+              status: "fail",
+              detail: `no packet was produced for ${label}, so there is nothing to abstain`,
+            };
+          }
+          const signal = expectation.signal ?? "no_usable_claim";
+          const abstained = packetAbstains(packet, signal);
+          if (!abstained) {
+            const usable = packet.returned.filter((claim) => claim.use === "use").length;
+            return {
+              expectation: expectation.type,
+              status: "fail",
+              detail:
+                `the packet did not abstain under the ${signal} signal: decision ${packet.decision}, ` +
+                `${packet.returned.length} claim(s) returned of which ${usable} are usable, ` +
+                `${packet.missing.length} gap entry/entries`,
+            };
+          }
+          if (expectation.contains !== undefined) {
+            const needle = expectation.contains.toLowerCase();
+            const hit = packet.missing.find((text) => text.toLowerCase().includes(needle));
+            if (hit === undefined) {
+              return {
+                expectation: expectation.type,
+                status: "fail",
+                detail:
+                  `the packet abstained (${signal}) but no gap entry explains why in the terms the fixture ` +
+                  `asked for: wanted ${JSON.stringify(expectation.contains)}, got ` +
+                  `${packet.missing.map((text) => JSON.stringify(text)).join("; ") || "nothing"}`,
+              };
+            }
+          }
+          return {
+            expectation: expectation.type,
+            status: "pass",
+            detail: `abstained under ${signal} (decision ${packet.decision}, ${packet.missing.length} gap entry/entries)`,
+          };
+        }
+        case "expect_action_gate": {
+          const record = this.actionRecordFor(entry.line_id, expectation.action, expectation.claims.length);
+          if (!record) {
+            return {
+              expectation: expectation.type,
+              status: "fail",
+              detail: `no action-gate verdict was recorded for ${label}; the gate cannot be graded on silence`,
+            };
+          }
+          if (record.claims_resolved === 0) {
+            return {
+              expectation: expectation.type,
+              status: "fail",
+              detail:
+                `the gate was asked about 0 of the ${record.claims_declared} declared claim(s) because none ` +
+                `resolved to a claim row, so its refusal is an unknown-claim refusal rather than a judgement ` +
+                `about the evidence`,
+            };
+          }
+          if (record.verdict !== expectation.verdict) {
+            return {
+              expectation: expectation.type,
+              status: "fail",
+              detail:
+                `the gate returned ${record.verdict} for ${JSON.stringify(expectation.action)} at ` +
+                `${expectation.action_risk} risk, expected ${expectation.verdict} ` +
+                `(reason codes: ${record.reason_codes.join(", ") || "none"})`,
+            };
+          }
+          const missing = (expectation.must_include ?? []).filter((code) => !record.reason_codes.includes(code));
+          const present = (expectation.must_exclude ?? []).filter((code) => record.reason_codes.includes(code));
+          if (missing.length > 0 || present.length > 0) {
+            return {
+              expectation: expectation.type,
+              status: "fail",
+              detail:
+                `${missing.length > 0 ? `missing reason code(s) ${missing.join(", ")}; ` : ""}` +
+                `${present.length > 0 ? `forbidden reason code(s) present ${present.join(", ")}; ` : ""}` +
+                `observed: ${record.reason_codes.join(", ")}`,
+            };
+          }
+          return {
+            expectation: expectation.type,
+            status: "pass",
+            detail: `${record.verdict} over ${record.claims_resolved} claim(s): ${record.reason_codes.join(", ")}`,
           };
         }
       }
@@ -2107,6 +2527,20 @@ class RunState {
         detail: `expectation evaluation raised: ${(error as Error).message}`,
       };
     }
+  }
+
+  /**
+   * The action-gate verdict that belongs to an assertion.
+   *
+   * Matched by the line it was declared on and the action name, not by position: a line
+   * may declare several actions, and a positional match would grade one action's fixture
+   * against another action's verdict the moment an action was inserted above it.
+   */
+  private actionRecordFor(lineId: string, action: string, declaredClaims: number): ActionGateRecord | undefined {
+    return this.actionGateOutcomes.find(
+      (record) =>
+        record.line_id === lineId && record.action === action && record.claims_declared === declaredClaims,
+    );
   }
 
   private decisionFor(entry: FixtureBodyLine, expectation: Expectation): DecisionRecord | undefined {
@@ -2459,12 +2893,91 @@ function relationMatches(
         : {}),
   };
 
-  const forward = matchesClaim(from, wantedFrom) && matchesClaim(to, wantedTo);
-  const reversed = matchesClaim(to, wantedFrom) && matchesClaim(from, wantedTo);
+  const forward = matchesProposition(from, wantedFrom) && matchesProposition(to, wantedTo);
+  const reversed = matchesProposition(to, wantedFrom) && matchesProposition(from, wantedTo);
   return forward || reversed;
 }
 
-function matchesClaim(claim: ClaimRow, match: { subject?: string; predicate?: string; object?: unknown; kind?: string; status?: string }): boolean {
+/**
+ * Did the packet decline to answer?
+ *
+ * The single definition of abstention the assertion and the abstention stage both use,
+ * so a fixture cannot pass an assertion under one reading and be scored under another.
+ * The evidence is the packet's own per-claim `use` decision rather than the runner's
+ * opinion about relevance: "the packet told the caller not to act on any of this" is a
+ * property of the packet, and it is what a caller experiences as an abstention.
+ *
+ * Two signals, and both are reported by the abstention stage:
+ *
+ *  - `no_usable_claim` — no returned claim carries `use: "use"`. Covers the empty
+ *    packet and the packet that returned claims only so the caller can see they were
+ *    refused.
+ *  - `clarify` — the packet-level decision is `clarify`, which excludes the
+ *    show-the-refusals case. Stricter, and the wrong choice for a fixture asserting that
+ *    redacted evidence must not be presented as actionable.
+ */
+export function packetAbstains(packet: QueryOutcome, signal: "no_usable_claim" | "clarify"): boolean {
+  if (signal === "clarify") return packet.decision === "clarify";
+  return packet.returned.every((claim) => claim.use !== "use");
+}
+
+/**
+ * Which returned claims each declared matcher matched, with the fixture's reason.
+ *
+ * A matcher that matched nothing is kept with an empty `claim_ids` rather than dropped:
+ * recall is computed over the declared set, and a matcher that silently disappeared
+ * would inflate the rate by shrinking its own denominator.
+ */
+export function matchGroups(
+  returned: readonly ReturnedClaimRecord[],
+  matches: readonly FixtureRelevance[] | undefined,
+): QueryMatchHit[] {
+  if (matches === undefined) return [];
+  return matches.map((match) => ({
+    reason: match.reason,
+    claim_ids: returned.filter((claim) => claimRecordMatches(claim, match)).map((claim) => claim.claim_id),
+  }));
+}
+
+/**
+ * Does a claim the packet returned satisfy a fixture's matcher?
+ *
+ * Reads the packet's own shape rather than a `ClaimRow`, because the two carry the same
+ * proposition under different keys: a claim row has `subject`/`predicate`/`object` at the
+ * top level, and a packet claim nests them under `statement`. A matcher that read one
+ * shape and was handed the other would match on `kind` alone and quietly return every
+ * claim of that kind.
+ */
+export function claimRecordMatches(claim: ReturnedClaimRecord, match: FixtureRelevance): boolean {
+  return matchesProposition(
+    {
+      subject: claim.statement.subject,
+      predicate: claim.statement.predicate,
+      object: claim.statement.object,
+      kind: claim.kind,
+      status: claim.status,
+    },
+    match,
+  );
+}
+
+/** Resolve proposition matches to the claims a run currently holds. */
+export function claimMatchesRecord(claim: ClaimRow, match: FixtureRelevance): boolean {
+  return matchesProposition(claim, match);
+}
+
+/**
+ * Does a proposition satisfy a fixture's matcher?
+ *
+ * The one matcher both a `ClaimRow` and a packet claim go through, so a claim cannot
+ * match as a claim row and fail to match as a packet claim (or the reverse). Absent
+ * fields are wildcards; `object` compares canonically because JSONB does not preserve
+ * key order and a fixture author should not have to know that.
+ */
+export function matchesProposition(
+  claim: { subject?: string; predicate?: string; object?: unknown; kind?: string; status?: string },
+  match: { subject?: string; predicate?: string; object?: unknown; kind?: string; status?: string },
+): boolean {
   if (match.subject !== undefined && claim.subject !== match.subject) return false;
   if (match.predicate !== undefined && claim.predicate !== match.predicate) return false;
   if (match.kind !== undefined && claim.kind !== match.kind) return false;
@@ -2472,6 +2985,7 @@ function matchesClaim(claim: ClaimRow, match: { subject?: string; predicate?: st
   if (match.object !== undefined && !objectsEqual(claim.object, match.object)) return false;
   return true;
 }
+
 
 /**
  * Compare a stored JSONB object with a fixture literal.

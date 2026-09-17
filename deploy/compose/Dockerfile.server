@@ -1,0 +1,68 @@
+# VerityMem server image.
+#
+# The workspace packages are private and versioned 0.1.0 in lockstep, which is the right
+# posture for a pre-release monorepo: nothing is on a registry, so nothing can drift from
+# the commit it was built at. The consequence is that "install VerityMem" needs a documented
+# path that does not start with importing TypeScript source, and for a server that path is a
+# container built from a pinned commit.
+#
+# Two decisions worth stating:
+#
+#   * **The build does not run the model download.** The entailment weights are 233 MB and
+#     are not in the image, so a container started with GATE_ENTAILMENT_BACKEND=onnx and no
+#     mount fails at startup — which is the intended behaviour (the gate refuses to run
+#     rather than weakening to token overlap). Mount `.veritymem/models` to provision it.
+#   * **No build step.** The workspace runs TypeScript directly under Node's type stripping,
+#     which is how every test and every app in this repository already runs. Adding a compile
+#     step for the image alone would mean shipping a build that no test exercises.
+FROM node:22.18.0-bookworm-slim
+
+# The version the acceptance run pins and asserts. Installed explicitly rather than taken
+# from whatever the base image happens to carry.
+RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
+
+WORKDIR /app
+
+# Manifests first, so a source-only change does not invalidate the dependency layer.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json ./
+COPY apps/server/package.json apps/server/
+COPY apps/worker/package.json apps/worker/
+COPY apps/reference-dev-agent/package.json apps/reference-dev-agent/
+COPY packages/contracts/package.json packages/contracts/
+COPY packages/ledger/package.json packages/ledger/
+COPY packages/gate/package.json packages/gate/
+COPY packages/policy/package.json packages/policy/
+COPY packages/claims/package.json packages/claims/
+COPY packages/retrieval/package.json packages/retrieval/
+COPY packages/model-adapters/package.json packages/model-adapters/
+COPY packages/mcp-server/package.json packages/mcp-server/
+COPY packages/sdk-ts/package.json packages/sdk-ts/
+COPY packages/langgraph-js/package.json packages/langgraph-js/
+COPY packages/ledgerbench/package.json packages/ledgerbench/
+COPY packages/testkit/package.json packages/testkit/
+
+# `--frozen-lockfile` is the point of this layer: the image is built from the lockfile in the
+# commit, so two builds of the same commit resolve the same tree or fail.
+RUN pnpm install --frozen-lockfile -r
+
+COPY migrations ./migrations
+COPY scripts ./scripts
+COPY packages ./packages
+COPY apps ./apps
+COPY deploy ./deploy
+
+# Runs as the unprivileged `node` user that the base image already provides. Nothing in this
+# image needs root, and the server holds a credential.
+USER node
+
+ENV NODE_ENV=production
+ENV HOST=0.0.0.0
+ENV PORT=8787
+EXPOSE 8787
+
+# The readiness endpoint is the healthcheck rather than a TCP probe: a process that is
+# listening while its database is unreachable is not ready, and a TCP probe would call it up.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/readyz').then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "--experimental-strip-types", "apps/server/src/main.ts"]
