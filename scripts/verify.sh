@@ -76,7 +76,12 @@ step "4. The test suite"
 # ---------------------------------------------------------------------------
 # Serial, because the suite writes to a shared append-only ledger and parallel files
 # contend on it. The count is printed so a shrinking suite is visible.
-pnpm test 2>&1 | tee /tmp/veritymem-tests.txt || fail "the test suite failed"
+# The root `pnpm test` script covers packages only; the app test suites (the HTTP
+# surface and the reference workload) run here so a green package suite cannot stand in
+# for a broken application.
+node --experimental-strip-types --test --test-concurrency=1 \
+  "packages/*/src/**/*.test.ts" "apps/*/src/**/*.test.ts" 2>&1 | tee /tmp/veritymem-tests.txt \
+  || fail "the test suite failed"
 grep -E '^ℹ (tests|pass|fail)' /tmp/veritymem-tests.txt || true
 if grep -qE '^ℹ fail [1-9]' /tmp/veritymem-tests.txt; then
   fail "the test suite reported failures"

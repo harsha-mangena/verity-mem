@@ -32,7 +32,7 @@ import { requireTool } from "../auth.ts";
 import { resolveCallerTenant, tenantFromCredential, withReadContext } from "../context.ts";
 import type { ServerDeps } from "../config.ts";
 import { notFound } from "../errors.ts";
-import { formatUuid, stripPrefix } from "../views.ts";
+import { formatUuid, requireId, stripPrefix } from "../views.ts";
 
 export interface FeedbackRouteOptions {
   readonly deps: ServerDeps;
@@ -56,6 +56,7 @@ export function registerFeedbackRoutes(app: FastifyInstance, options: FeedbackRo
     async (request, reply) => {
       const caller = requireTool(request, "memory.feedback");
       const body = request.body as FeedbackRequest;
+      requireId(body.trace_id, "qry", "trace_id");
       const context = tenantFromCredential({ identity: caller, what: "POST /v1/feedback" });
 
       const trace = await withReadContext(deps, context, async (executor) => {

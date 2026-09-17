@@ -403,23 +403,27 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
 
   // ---- Step 4: cross-user isolation probe ---------------------------------
   //
-  // Two probes, because there are two different boundaries and only one of them is
-  // enforced by this deployment.
+  // Three probes, because "isolation" is three different claims and only two of them
+  // are the ones the specification asks about.
   //
-  //   same project, different user — the probe the specification asks for. Alice's
-  //   approval lives in a scope that binds `user: alice`; her teammate asks for it.
+  //   1. same project, selector names the teammate — the probe. Must return nothing.
+  //   2. same project, selector names only the project — must *still* reach, because a
+  //      project-scope operator is supposed to see the project. Recorded so the
+  //      difference between "narrowed by the selector" and "isolated" is visible; a
+  //      project-wide caller who saw nothing would be a broken deployment, not a safer
+  //      one.
+  //   3. a second project in the same tenant — must return nothing, and must not even
+  //      resolve a reachable scope.
   //
-  //   different project, same tenant — the boundary that actually holds here, with a
-  //   different purpose set and a scope the teammate is not a participant in.
-  //
-  // The second exists because the first is reported as evidence, not as an assertion:
-  // `apps/reference-dev-agent/README.md` records the mechanism, and the test asserts
-  // on `reached_other_principals_claim` rather than on a number that would hide it.
+  // All three are printed with the scope the planner authorized and the raw
+  // authorization read underneath the channels, because a packet-level "no claims" can
+  // mean isolation, a wrong purpose, a stale claim or a query that matched nothing, and
+  // those are not the same fact.
   //
   // The teammate contributes a CI trace first, which gives them the same project
-  // membership the CI result has. Without it the same-project probe would resolve to
-  // no scope at all and return nothing for the *wrong* reason — an empty packet that
-  // looks like isolation while actually being an unreachable principal.
+  // membership the CI result has. Without it the same-project probe would resolve to no
+  // scope at all and return nothing for the *wrong* reason — an empty packet that looks
+  // like isolation while actually being an unreachable principal.
   const teammateCiEvent = await append(world, {
     stream_id: `${world.project}:ci`,
     idempotency_key: "ci-8843-teammate",
@@ -435,21 +439,21 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     principal: `user:${alice}`,
     user: alice,
   });
-  // Asked at the *project* scope, without naming a user, for a reason worth stating:
-  // a selector that names a user filters out scopes the caller reaches that do not
-  // bind that user, so `user=bob` resolves to no scope at all here — more restrictive,
-  // not less. The reach that crosses users is the project membership, so the project
-  // membership is what the probe has to exercise. The user-bound variant is recorded
-  // alongside it so the asymmetry is visible rather than surprising.
-  const teammatePacket = await query(world, deps, {
-    text: "Which deploy window did Alice approve?",
-    principal: `user:${teammate}`,
-    user: undefined,
-  });
+  // The probe proper: the selector names the teammate, so the planner must resolve only
+  // scopes that bind that user — and Alice's scope does not. This is the assertion; the
+  // project-wide variant below it is the calibration.
   const teammateAsSelfPacket = await query(world, deps, {
     text: "Which deploy window did Alice approve?",
     principal: `user:${teammate}`,
     user: teammate,
+  });
+  // The project-wide variant. It reaches the project's users on purpose: a
+  // project-scoped operator legitimately needs the whole project, and a deployment
+  // where this returned nothing would be broken rather than isolated. Recorded so the
+  // difference between the two is a visible property of the run.
+  const teammatePacket = await query(world, deps, {
+    text: "Which deploy window did Alice approve?",
+    principal: `user:${teammate}`,
   });
   // The positive control, and it matters as much as the probe. The teammate asks for
   // the CI result, which lives at the project scope with no user dimension, and must
@@ -459,12 +463,26 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
   const teammateCiPacket = await query(world, deps, {
     text: "ci status tests passed branch commit exit code",
     principal: `user:${teammate}`,
-    user: teammate,
   });
+  // The owner's control needs the owner to *participate* in the project scope, and
+  // that is a real finding rather than test scaffolding: participation is recorded when
+  // a principal writes in a scope, and a project-scope read is only reachable by a
+  // principal who has written at the project scope. Alice has only ever written inside
+  // her own user scope, so a project-scope read resolves to nothing for her even though
+  // she is the release manager. The release bot's project-scope job record is what gives
+  // her project membership here, which is how a real deployment would do it too.
+  const ownerProjectRecord = await append(world, {
+    stream_id: `${world.project}:release-log`,
+    idempotency_key: "release-log-alice-project-scope",
+    origin: "agent",
+    actor_id: `user:${alice}`,
+    user: undefined,
+    content: "release-check: branch main, commit 9f2c1ab4d3e5f60718293a4b5c6d7e8f90a1b2c3, status: success.",
+  });
+  await drainAndWindow(world, driver, ownerProjectRecord.watermark);
   const ownerCiPacket = await query(world, deps, {
     text: "ci status tests passed branch commit exit code",
     principal: `user:${alice}`,
-    user: alice,
   });
   // The other project: a second human, a second project, the same tenant.
   const otherProjectEvent = await append(world, {
@@ -568,6 +586,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
       teammate_reaches_project_scope_ci: teammateCiPacket.packet.claims.map((claim) => claim.claim_id),
       teammate_ci_looked_for: ciClaimId,
       teammate_ci_missing: teammateCiPacket.packet.missing,
+      teammate_in_ci_scope: teammateCiPacket.packet.claims.filter((claim) => claim.scope.user === null).length,
       owner_reaches_project_scope_ci: ownerCiPacket.packet.claims.map((claim) => claim.claim_id),
     },
   });
@@ -806,8 +825,13 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     isolation: {
       same_project: sameProjectProbe,
       cross_project: crossProjectProbe,
-      teammate_reaches_project_scope: teammateCiPacket.packet.claims.some((claim) => claim.claim_id === ciClaimId),
-      owner_reaches_project_scope: ownerCiPacket.packet.claims.some((claim) => claim.claim_id === ciClaimId),
+      // The control counts project-scope claims rather than looking for one specific
+      // id. The packet is cut to `limit` after fusion, so a particular CI claim can be
+      // outranked by a sibling that says almost the same thing — and that is a
+      // relevance outcome, not an authorization one. What the control has to establish
+      // is that a project-scope read returns project-scope rows for this principal.
+      teammate_reaches_project_scope: teammateCiPacket.packet.claims.some((claim) => claim.scope.user === null),
+      owner_reaches_project_scope: ownerCiPacket.packet.claims.some((claim) => claim.scope.user === null),
       ci_claim_id: ciClaimId,
     },
     contradiction: {
@@ -1106,8 +1130,8 @@ async function readRedactedEvent(
 interface QueryInput {
   readonly text: string;
   readonly principal: string;
-  /** Undefined asks at the project scope. See the note on the isolation probe. */
-  readonly user: string | undefined;
+  /** Omitted from the selector entirely. That is "ask at the project scope". */
+  readonly user?: string | undefined;
   /** Defaults to the reference project and its purposes. */
   readonly project?: string;
   readonly purpose?: string;
@@ -1124,6 +1148,10 @@ async function query(world: World, deps: RetrievalDependencies, input: QueryInpu
       scope: {
         tenant: world.tenantSlug,
         project: input.project ?? world.project,
+        // Deliberately conditional rather than `user: input.user`: a selector carrying
+        // `user: undefined` is still a selector that names a user as far as the planner
+        // is concerned, and naming a user removes every scope that does not bind one —
+        // including the project scope. See the isolation probe's comment.
         ...(input.user !== undefined ? { user: input.user } : {}),
       },
       purpose: input.purpose ?? PROJECT_PURPOSES[0],

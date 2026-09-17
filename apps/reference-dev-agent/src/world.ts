@@ -24,7 +24,6 @@ import { DEFAULT_COMMIT_POLICY } from "@veritymem/contracts";
 import { CommitGate, LexicalEntailmentBackend } from "@veritymem/gate";
 import { DETERMINISTIC_EXTRACTORS, IngestPipeline, type Extractor } from "@veritymem/model-adapters";
 import { HashEmbeddingBackend, createProjectionProcessor } from "@veritymem/retrieval";
-import { createClaimLoop } from "../../worker/src/claim-loop.ts";
 import { createOutboxRunner } from "../../worker/src/outbox-runner.ts";
 
 /** Purposes the reference project writes and reads under. */
@@ -127,40 +126,6 @@ export function createRunnerDriver(world: World, embeddings: HashEmbeddingBacken
       for (let index = 0; index < 50; index += 1) {
         cycles += 1;
         const summary = await runner.runCycle();
-        claimed += summary.claimed;
-        completed += summary.completed;
-        failed += summary.failed;
-        if (summary.claimed === 0) break;
-      }
-      return { claimed, completed, failed, cycles };
-    },
-  };
-}
-
-/**
- * The same processors through the bare claim loop, with no cycle wrapper.
- *
- * Kept because it is the smaller surface: a failure here is in the claim loop or a
- * processor, and a failure that reproduces only under `createRunnerDriver` is in
- * the cycle wrapper. Having both makes that distinction observable instead of
- * guessed.
- */
-export function createClaimLoopDriver(world: World, embeddings: HashEmbeddingBackend = createEmbeddings()): WorkerDriver {
-  const loop = createClaimLoop({
-    db: world.db,
-    processors: buildProcessors(world, embeddings),
-    actor: "reference-dev-agent:worker",
-  });
-
-  return {
-    async drain(): Promise<DrainSummary> {
-      let claimed = 0;
-      let completed = 0;
-      let failed = 0;
-      let cycles = 0;
-      for (let index = 0; index < 50; index += 1) {
-        cycles += 1;
-        const summary = await loop.runOnce(world.tenantId, 25);
         claimed += summary.claimed;
         completed += summary.completed;
         failed += summary.failed;

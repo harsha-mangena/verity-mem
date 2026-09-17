@@ -31,7 +31,7 @@ import { requireTool } from "../auth.ts";
 import { resolveCallerTenant, tenantFromCredential, withBoundContext, withReadContext } from "../context.ts";
 import type { ServerDeps } from "../config.ts";
 import { notFound } from "../errors.ts";
-import { formatUuid } from "../views.ts";
+import { formatUuid, requireId } from "../views.ts";
 
 const EventIdParamsSchema = {
   type: "object",
@@ -134,6 +134,7 @@ export function registerEventRoutes(app: FastifyInstance, options: EventRouteOpt
     async (request, reply) => {
       const caller = requireTool(request, "memory.event.read");
       const params = request.params as { event_id: string };
+      requireId(params.event_id, "evt", "event_id");
       const context = tenantFromCredential({ identity: caller, what: "GET /v1/events" });
 
       const event = await withReadContext(deps, context, async (executor) =>
@@ -160,6 +161,7 @@ export function registerEventRoutes(app: FastifyInstance, options: EventRouteOpt
     async (request, reply) => {
       const caller = requireTool(request, "memory.propose");
       const params = request.params as { event_id: string };
+      requireId(params.event_id, "evt", "event_id");
       const context = tenantFromCredential({ identity: caller, what: "POST /v1/events/{id}/extract" });
 
       // Read the event inside the caller's own reach first, to learn which scope and

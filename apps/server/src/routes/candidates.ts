@@ -37,7 +37,7 @@ import { requireTool } from "../auth.ts";
 import { resolveCallerTenant, tenantFromCredential, withReadContext, withWriteContext } from "../context.ts";
 import type { ServerDeps } from "../config.ts";
 import { ApiError, notFound } from "../errors.ts";
-import { digestHex, formatUuid, stripPrefix } from "../views.ts";
+import { digestHex, formatUuid, requireId, stripPrefix } from "../views.ts";
 
 const CandidateIdParamsSchema = {
   type: "object",
@@ -99,6 +99,7 @@ export function registerCandidateRoutes(app: FastifyInstance, options: Candidate
     async (request, reply) => {
       const caller = requireTool(request, "memory.candidate.read");
       const params = request.params as { candidate_id: string };
+      requireId(params.candidate_id, "cnd", "candidate_id");
       const context = tenantFromCredential({ identity: caller, what: "GET /v1/candidates/{id}" });
 
       const result = await withReadContext(deps, context, async (executor) => {
@@ -220,6 +221,7 @@ export function registerCandidateRoutes(app: FastifyInstance, options: Candidate
     async (request, reply) => {
       const caller = requireTool(request, "memory.decide");
       const params = request.params as { candidate_id: string };
+      requireId(params.candidate_id, "cnd", "candidate_id");
       const body = request.body as DecisionRequest;
       const context = tenantFromCredential({ identity: caller, what: "POST /v1/candidates/{id}/decisions" });
 

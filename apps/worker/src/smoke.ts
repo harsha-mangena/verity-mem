@@ -15,7 +15,7 @@
 import { Db, FilesystemBlobStore, Ledger, loadEnv, resolveTenantId, systemClock, systemIds } from "@veritymem/ledger";
 import { HashEmbeddingBackend, createProjectionProcessor } from "@veritymem/retrieval";
 import { createLogger } from "./log.ts";
-import { countProjectionLag, createOutboxRunner } from "./outbox-runner.ts";
+import { createOutboxRunner } from "./outbox-runner.ts";
 import { createEntailmentBackend, createGate, createIngestProcessor, createModelExtractor } from "./processors.ts";
 import { loadWorkerConfig } from "./config.ts";
 import { DEFAULT_COMMIT_POLICY } from "@veritymem/contracts";
@@ -108,7 +108,7 @@ async function main(): Promise<void> {
       decisions: outcome.rows.map((row) => ({ outcome: row.outcome, reason_codes: row.reason_codes })),
       claims: outcome.claims,
       projected_embeddings: outcome.projected,
-      projection_lag: (await countProjectionLag(db, [tenantId])).pending,
+      projection_lag: (await runner.runCycle()).projection_lag,
     });
   } finally {
     await db.close();

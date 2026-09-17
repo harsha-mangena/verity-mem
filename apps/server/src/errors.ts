@@ -165,12 +165,23 @@ function isPgError(error: unknown): error is PgErrorLike {
  * Translate an unexpected throw into a response without leaking internals.
  *
  * The database's SQLSTATE is preserved because it is short, stable and does not
- * contain data; the driver's message is discarded because it routinely contains
- * the failing statement text and the row's values. The full error goes to the
- * logger, which is where an operator can see it.
+ * contain data; the driver's message is discarded because it routinely contains the
+ * failing statement text and the row's values. The full error goes to the logger,
+ * which is where an operator can see it.
+ *
+ * `22P02` (`invalid_text_representation`) is the one SQLSTATE that is *not* a server
+ * fault. It means a caller supplied an identifier that is the right shape for the
+ * contract — `clm_[0-9a-zA-Z]{8,64}` — but not a UUID, because the contract's
+ * identifier form is a prefixed hex string and the column is a UUID. The route's
+ * `requireId` catches everything the pattern can catch; this catches the residue, and
+ * reporting it as a 400 rather than a 500 is the difference between an operator
+ * paging for a caller's typo and not.
  */
 export function internalError(error: unknown): ApiError {
   if (isPgError(error)) {
+    if (error.code === "22P02") {
+      return new ApiError("validation_failed", "an identifier in the request is not a well-formed identifier", 400);
+    }
     return new ApiError(
       "internal_error",
       "the request could not be completed because of a storage error",

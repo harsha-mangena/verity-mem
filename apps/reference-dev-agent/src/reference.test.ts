@@ -165,12 +165,12 @@ describe("reference workload: multi-agent software delivery", () => {
     assert.equal(
       run.isolation.teammate_reaches_project_scope,
       true,
-      `the teammate must reach project-scope CI claim ${String(run.isolation.ci_claim_id)}`,
+      "the teammate must reach project-scope claims, or this probe cannot distinguish isolation from blindness",
     );
     assert.equal(
       run.isolation.owner_reaches_project_scope,
       true,
-      `the owner must reach project-scope CI claim ${String(run.isolation.ci_claim_id)}`,
+      "the owner must reach project-scope claims too, so nothing was lost by the boundary",
     );
   });
 

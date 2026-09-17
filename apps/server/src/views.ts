@@ -22,6 +22,7 @@ import type {
 } from "@veritymem/contracts";
 import { ageInDays, render, stalenessHorizonFor, toIso, type ClaimRelation, type ClaimRowShape } from "@veritymem/claims";
 import { toPublicId, type Ledger, type QueryExecutor, type SpanRecord } from "@veritymem/ledger";
+import { ApiError } from "./errors.ts";
 
 /** A joined evidence row, as the three read paths select it. */
 export interface EvidenceJoinRow {
@@ -279,6 +280,46 @@ export function toPacketEvidence(evidence: HydratedEvidence | undefined): Packet
 
 export function digestHex(value: Buffer | string): string {
   return typeof value === "string" ? value : value.toString("hex");
+}
+
+/**
+ * The identifier shapes the contract declares, as regexes.
+ *
+ * Kept in step with `packages/contracts/src/primitives.ts` deliberately rather than
+ * imported from it, because that module exports TypeBox schemas for JSON Schema
+ * generation and this needs a plain `RegExp` for a synchronous route check. The
+ * patterns are short and the contract test asserts the same shapes, so a divergence
+ * fails there rather than here.
+ */
+export const ID_PATTERNS = {
+  evt: /^evt_[0-9a-zA-Z]{8,64}$/,
+  clm: /^clm_[0-9a-zA-Z]{8,64}$/,
+  cnd: /^cnd_[0-9a-zA-Z]{8,64}$/,
+  qry: /^qry_[0-9a-zA-Z]{8,64}$/,
+  grt: /^grt_[0-9a-zA-Z]{8,64}$/,
+  ret: /^ret_[0-9a-zA-Z]{8,64}$/,
+} as const;
+
+export type IdPrefixKind = keyof typeof ID_PATTERNS;
+
+/**
+ * Refuse a malformed identifier before it reaches SQL.
+ *
+ * Without this a path parameter like `clm_doesnotexist` reaches
+ * `WHERE claim_id = $1::uuid`, Postgres raises `22P02 invalid_text_representation`,
+ * and the caller gets a 500. A malformed identifier is a client error, and answering
+ * it with a server fault makes an operator page for a caller's typo and makes every
+ * malformed-id probe look like a server fault in the logs. The route parameter schema
+ * accepts `minLength: 1` rather than the contract's pattern because a 400 thrown here
+ * travels in the single error shape, while a Fastify validation failure for a request
+ * with no `Accept` header would be a 406 — a second response shape on the one path
+ * this server promises has only one.
+ */
+export function requireId(value: string | undefined, kind: IdPrefixKind, what: string): string {
+  if (value === undefined || !ID_PATTERNS[kind].test(value)) {
+    throw new ApiError("validation_failed", `${what} must be a ${kind}_ identifier`, 400);
+  }
+  return value;
 }
 
 export function stripPrefix(id: string): string {

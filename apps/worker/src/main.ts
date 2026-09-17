@@ -35,7 +35,7 @@ import {
 import { HashEmbeddingBackend, HostedEmbeddingBackend, createProjectionProcessor } from "@veritymem/retrieval";
 import { loadWorkerConfig, type WorkerConfig } from "./config.ts";
 import { createLogger, describeError, type Logger } from "./log.ts";
-import { countProjectionLag, createOutboxRunner } from "./outbox-runner.ts";
+import { createOutboxRunner } from "./outbox-runner.ts";
 import {
   createEntailmentBackend,
   createGate,
@@ -99,15 +99,12 @@ export function startWorker(config: WorkerConfig, logger: Logger): WorkerHandle 
     if (runner === null) return;
     try {
       const summary = await runner.runCycle();
-      const lag = await countProjectionLag(db, config.tenantSlugs.map((slug) => resolveTenantId(slug)));
       logger.info("worker.batch", {
         claimed: summary.claimed,
         completed: summary.completed,
         failed: summary.failed,
         kinds: summary.kinds,
-        tenants_with_work: summary.tenants_with_work.length,
-        projection_lag_pending: lag.pending,
-        projection_lag_oldest_available_at: lag.oldest_pending_at,
+        projection_lag_pending: summary.projection_lag,
       });
     } catch (error) {
       // A cycle-level failure is a database or configuration problem, not a message
@@ -156,13 +153,12 @@ export function startWorker(config: WorkerConfig, logger: Logger): WorkerHandle 
     });
 
     if (tenantIds.length === 0) {
-      // Said out loud rather than discovered as a silent, permanent zero. Without a
-      // tenant list the claim query cannot be authorized at all (see the port
-      // notice in claim-loop.ts), so an empty list is a misconfiguration and not
-      // an idle worker.
+      // Unreachable in practice — `createOutboxRunner` would already have thrown —
+      // but kept as the explicit statement of why an empty list is a
+      // misconfiguration rather than an idle worker.
       logger.warn("worker.no_tenants", {
         detail:
-          "WORKER_TENANT_SLUGS is empty; the outbox claim cannot be authorized without a tenant, so every cycle will claim nothing",
+          "WORKER_TENANT_SLUGS is empty; claiming is tenant-addressable, so there is nothing to claim for",
       });
     }
 
@@ -182,13 +178,15 @@ export function startWorker(config: WorkerConfig, logger: Logger): WorkerHandle 
       await started;
       if (runner === null) return;
       const summary = await runner.drain();
-      const lag = await countProjectionLag(db, config.tenantSlugs.map((slug) => resolveTenantId(slug)));
+      // The lag is read after the drain, so a non-zero value here means messages that
+      // exhausted their attempts rather than messages still in flight.
+      const lag = await runner.runCycle();
       logger.info("worker.drained", {
         claimed: summary.claimed,
         completed: summary.completed,
         failed: summary.failed,
         kinds: summary.kinds,
-        projection_lag_pending: lag.pending,
+        projection_lag_pending: lag.projection_lag,
       });
     },
     async shutdown(reason: string): Promise<void> {

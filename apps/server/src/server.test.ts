@@ -144,24 +144,43 @@ function adminJson(h: Harness): Record<string, string> {
  * Sunday 02:00 UTC deploy window." — because it is the shape the deterministic
  * decision extractor recognises and the shape the commit gate accepts at
  * `user_self_report` authority.
+ *
+ * Two things are unique per call, and both are load-bearing rather than tidiness:
+ *
+ *   * the stream and idempotency key, because the ledger deduplicates on the key and
+ *     the second call would otherwise return the first call's event; and
+ *   * the *actor*, because the decision extractor keys its claim subject on the actor.
+ *     Two events from the same actor with the same predicate and object produce the
+ *     same proposition, and a second accepted claim that duplicates the first
+ *     supersedes it at the new claim's `valid_from` — which, when both events carry the
+ *     same `occurred_at`, is the earlier claim's `valid_from`, so the supersede closes
+ *     an interval to zero length and `claims_check` refuses it. That is a real gate
+ *     defect (reported, not fixed here: `packages/gate` is owned elsewhere), and a test
+ *     that tripped over it in every second case would be testing the defect instead of
+ *     the server.
  */
-async function writeDeployApproval(h: Harness): Promise<{ eventId: string; claimId: string }> {
+async function writeDeployApproval(
+  h: Harness,
+  options: { readonly occurredAt?: string; readonly actor?: string } = {},
+): Promise<{ eventId: string; claimId: string }> {
+  const suffix = randomUUID().slice(0, 8);
+  const actor = options.actor ?? `user:approver-${suffix}`;
   const appended = await h.app.inject({
     method: "POST",
     url: "/v1/events",
     headers: agentJson(h),
     payload: {
-      stream_id: `thread:${randomUUID().slice(0, 8)}`,
-      idempotency_key: `turn-${randomUUID().slice(0, 8)}`,
+      stream_id: `thread:${suffix}`,
+      idempotency_key: `turn-${suffix}`,
       origin: "user",
-      actor_id: "user:alice",
+      actor_id: actor,
       scope: {
         tenant: h.tenant,
         project: h.project,
         user: h.user,
         purpose: [...h.purposes],
       },
-      occurred_at: "2026-09-10T09:14:00Z",
+      occurred_at: options.occurredAt ?? "2026-09-10T09:14:00Z",
       content: "I approved the Sunday 02:00 UTC deploy window.",
     },
   });
@@ -384,7 +403,7 @@ describe("veritymem server", () => {
   });
 
   it("explains a claim's full promotion history in one call", async () => {
-    const { eventId, claimId } = await writeDeployApproval(h);
+    const { eventId, claimId } = await writeDeployApproval(h, { actor: "user:alice" });
 
     const explained = await h.app.inject({
       method: "GET",
@@ -519,6 +538,26 @@ describe("veritymem server", () => {
     assert.equal(unauthenticated.statusCode, 401);
     assertErrorShape(unauthenticated.json());
     assert.equal((unauthenticated.json() as { error: { code: string } }).error.code, "unauthorized");
+
+    // A malformed identifier is a client error, and both of its shapes must be one:
+    // a value the contract's pattern rejects, and a value the pattern accepts but that
+    // is not a UUID — which only the database can tell you, by raising 22P02.
+    const malformedId = await h.app.inject({
+      method: "GET",
+      url: "/v1/claims/clm_doesnotexist",
+      headers: agentAuth(h),
+    });
+    assert.equal(malformedId.statusCode, 400, malformedId.body);
+    assertErrorShape(malformedId.json());
+    assert.equal((malformedId.json() as { error: { code: string } }).error.code, "validation_failed");
+
+    const wrongShape = await h.app.inject({
+      method: "GET",
+      url: "/v1/claims/not-a-claim-id",
+      headers: agentAuth(h),
+    });
+    assert.equal(wrongShape.statusCode, 400, wrongShape.body);
+    assert.equal((wrongShape.json() as { error: { code: string } }).error.code, "validation_failed");
 
     const bogusToken = await h.app.inject({
       method: "GET",
@@ -840,6 +879,44 @@ describe("veritymem server", () => {
     // inventing a metric.
     assert.equal(run.stages.length, 0);
     assert.ok(run.notes.length > 0);
+  });
+
+  it("exposes exactly the specified route list, plus the action gate", async () => {
+    const document = h.app.swagger() as { paths: Record<string, Record<string, unknown>> };
+    const routes = Object.entries(document.paths)
+      .flatMap(([path, operations]) => Object.keys(operations).map((method) => `${method.toUpperCase()} ${path}`))
+      .sort();
+
+    // The specification's REST list, plus two additions that are argued for in the
+    // README rather than assumed: the action gate, because the specification names it
+    // the enforcement point and an adapter in another process cannot call a TypeScript
+    // function; and `/v1/whoami`, because an audience 403 is otherwise indistinguishable
+    // from a misconfigured profile without reading the server's environment.
+    assert.deepEqual(routes, [
+      "DELETE /v1/grants/{grant_id}",
+      "GET /healthz",
+      "GET /readyz",
+      "GET /v1/candidates/{candidate_id}",
+      "GET /v1/claims/{claim_id}",
+      "GET /v1/claims/{claim_id}/explain",
+      "GET /v1/events/{event_id}",
+      "GET /v1/forget/{job_id}",
+      "GET /v1/query-traces/{trace_id}",
+      "GET /v1/whoami",
+      "POST /v1/actions/gate",
+      "POST /v1/candidates/{candidate_id}/decisions",
+      "POST /v1/claims/{claim_id}/relations",
+      "POST /v1/claims/{claim_id}/reverify",
+      "POST /v1/context/compose",
+      "POST /v1/evaluations/runs",
+      "POST /v1/events",
+      "POST /v1/events/{event_id}/extract",
+      "POST /v1/feedback",
+      "POST /v1/forget",
+      "POST /v1/grants",
+      "POST /v1/query",
+      "POST /v1/replay",
+    ]);
   });
 
   it("cross-check: another tenant reaches nothing", async () => {

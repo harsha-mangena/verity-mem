@@ -39,6 +39,7 @@ import { ApiError, notFound } from "../errors.ts";
 import {
   digestHex,
   formatUuid,
+  requireId,
   readClaimEvidence,
   readPromotions,
   stripPrefix,
@@ -72,6 +73,7 @@ export function registerClaimRoutes(app: FastifyInstance, options: ClaimRouteOpt
     async (request, reply) => {
       const caller = requireTool(request, "memory.claim.read");
       const params = request.params as { claim_id: string };
+      requireId(params.claim_id, "clm", "claim_id");
       const context = tenantFromCredential({ identity: caller, what: "GET /v1/claims/{id}" });
 
       const result = await withReadContext(deps, context, async (executor) => {
@@ -123,7 +125,12 @@ export function registerClaimRoutes(app: FastifyInstance, options: ClaimRouteOpt
     async (request, reply) => {
       const caller = requireTool(request, "memory.relate");
       const params = request.params as { claim_id: string };
+      requireId(params.claim_id, "clm", "claim_id");
       const body = request.body as RelationCreateRequest;
+      // Both ends are validated before either is used: the target is a path-independent
+      // identifier, and a malformed one would reach SQL as a cast failure rather than a
+      // 400.
+      requireId(body.to_claim, "clm", "to_claim");
       const context = tenantFromCredential({ identity: caller, what: "POST /v1/claims/{id}/relations" });
 
       const result = await withWriteContext(deps, context, "claim:relate", async (executor) => {
@@ -180,6 +187,7 @@ export function registerClaimRoutes(app: FastifyInstance, options: ClaimRouteOpt
     async (request, reply) => {
       const caller = requireTool(request, "memory.reverify");
       const params = request.params as { claim_id: string };
+      requireId(params.claim_id, "clm", "claim_id");
       const context = tenantFromCredential({ identity: caller, what: "POST /v1/claims/{id}/reverify" });
 
       const result = await withWriteContext(deps, context, "claim:reverify", async (executor) => {

@@ -13,15 +13,14 @@
  *   - `WORKER_BATCH_SIZE` / `WORKER_POLL_INTERVAL_MS` control the claim loop.
  *   - `WORKER_TENANT_SLUGS` lists the tenants this worker claims for.
  *
- * The tenant list is required, and that is a defect being worked around rather
- * than a design. `outbox` has row-level security with a tenant-keyed policy
- * (migration 0009), and `OutboxWorker.claim()` issues its `UPDATE ... FOR UPDATE
- * SKIP LOCKED` through `Db.systemQuery`, which by definition has no request
- * context bound — so the policy denies every row, the claim returns nothing, and
- * the worker reports a clean, empty, permanently stalled queue. The worker here
- * binds a tenant system context around each `runOnce` call so the claim is
- * authorized, and that requires knowing which tenants to bind. See README.md and the port
- * notice in `claim-loop.ts`. The fix belongs in `packages/ledger`.
+ * The tenant list is required because claiming is tenant-addressable:
+ * `OutboxWorker` claims through the `veritymem.outbox_claim` SECURITY DEFINER
+ * function with an explicit tenant array, so a worker claims its own tenants rather
+ * than the head of a global queue. A global claim would take work belonging to
+ * another deployment and would let a backlog in one tenant starve every other tenant
+ * behind it in `outbox_id` order. An empty list is rejected at construction rather
+ * than silently claiming nothing, because a worker with no tenants looks exactly like
+ * an idle one.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";

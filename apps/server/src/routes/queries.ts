@@ -33,7 +33,7 @@ import { resolveCallerTenant, tenantFromCredential, withReadContext } from "../c
 import type { ServerDeps } from "../config.ts";
 import { notFound } from "../errors.ts";
 import { renderMemoryPacket } from "../prose.ts";
-import { formatUuid, stripPrefix } from "../views.ts";
+import { formatUuid, requireId, stripPrefix } from "../views.ts";
 
 const TraceIdParamsSchema = {
   type: "object",
@@ -158,6 +158,7 @@ export function registerQueryRoutes(app: FastifyInstance, options: QueryRouteOpt
     async (request, reply) => {
       const caller = requireTool(request, "memory.trace");
       const params = request.params as { trace_id: string };
+      requireId(params.trace_id, "qry", "trace_id");
       const context = tenantFromCredential({ identity: caller, what: "GET /v1/query-traces/{id}" });
 
       const trace = await withReadContext(deps, context, async (executor) => {
