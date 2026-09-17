@@ -145,8 +145,13 @@ curl -s -X POST http://127.0.0.1:8787/v1/grants \
 ```
 
 The grant lands in the same reach computation the query planner and the action gate both use,
-so one call fixes both. `GET /readyz` reports whether a named principal holds any membership
-or grant at all, and the `authority.no_reach` finding carries this instruction.
+so one call fixes both.
+
+`GET /v1/whoami` reports it directly: the `reach` field carries the same finding the health
+check produces, so a caller that can see nothing can ask why and get the remedy rather than a
+profile and a tool list. (An earlier revision of this document said `/readyz` reported it.
+That was wrong — `/readyz` is unauthenticated and carries no principal, so it reports the
+projection summary instead, and the authority finding lives on the authenticated endpoint.)
 
 **Record administrative participation.** For a principal that genuinely belongs in a scope
 rather than being granted into it:

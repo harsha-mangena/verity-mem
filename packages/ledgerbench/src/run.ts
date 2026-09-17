@@ -211,6 +211,21 @@ export interface QueryOutcome {
   readonly candidates_denied_by_authz: number;
   readonly channels_used: readonly string[];
   readonly plan_denied_dimensions: readonly string[];
+  /**
+   * The concrete scopes the query resolved to, with their dimensions.
+   *
+   * Published because "the packet is empty" has three very different causes — the plan
+   * authorized nothing, it authorized a scope nothing was written to, or a channel was
+   * asked for text the index does not contain — and without the plan in the artifact the
+   * three are indistinguishable after the fact.
+   */
+  readonly authorized_scopes: readonly {
+    readonly scope_id: string;
+    readonly project: string | null;
+    readonly user: string | null;
+    readonly agent: string | null;
+    readonly session: string | null;
+  }[];
   readonly latency_ms: number;
   /**
    * Model calls the composer made for this packet.
@@ -1154,6 +1169,13 @@ class RunState {
       candidates_denied_by_authz: declared.packet.coverage.candidates_denied_by_authz,
       channels_used: [...declared.packet.coverage.channels_used],
       plan_denied_dimensions: [...declared.plan.denied_dimensions],
+      authorized_scopes: declared.plan.authorized_scopes.map((scope) => ({
+        scope_id: scope.scope_id,
+        project: scope.project,
+        user: scope.user_id,
+        agent: scope.agent_id,
+        session: scope.session_id,
+      })),
       latency_ms: declared.packet.latency_ms,
       model_calls: declared.packet.model_calls,
       relevant,

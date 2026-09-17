@@ -429,10 +429,18 @@ function headlineMetric(stage: EvaluationReport["stages"][number]): string {
   const candidates: (string | null)[] = [
     pick("malicious_instruction_acceptance_rate", pct),
     pick("unsafe_auto_accept_rate", pct),
+    // The read-path stages, so the four stages that were unmeasured for the life of this
+    // harness show a number here rather than a dash.
+    pick("evidence_recall_at_10", pct),
+    pick("citation_precision", pct),
+    pick("abstention_recall", pct),
+    pick("unsafe_allow_rate", pct),
+    pick("unnecessary_block_rate", pct),
     pick("review_burden", pct),
     pick("contradiction_recall", pct),
     pick("residual_matches", raw),
     pick("decision_set_equality", pct),
+    pick("p95_query_ms", raw),
     pick("ms_per_event", raw),
   ];
   return candidates.find((entry) => entry !== null) ?? "—";

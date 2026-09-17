@@ -835,7 +835,8 @@ Reach comes from participation (recorded when a principal writes in a scope) plu
 A principal that has never written anywhere therefore cannot approve anything, which is
 fail-closed and intended — see ADR 0011 for why participation is the basis rather than a role
 table. `INSTALL.md` documents the two supported onboarding paths with worked commands, and
-`GET /readyz` reports `authority.no_reach` for a named principal along with the remedy.
+`GET /v1/whoami` reports `authority.no_reach` for the calling principal along with the remedy —
+it is the authenticated endpoint, because the finding needs a principal and `/readyz` has none.
 
 **Do not fix a refusal by widening the gate.** The refusal is the control operating; the
 remedy is a grant, and grants are time-bounded, purpose-scoped and auditable.

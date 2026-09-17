@@ -20,6 +20,8 @@ import {
   ReadyResponseSchema,
   WhoAmIResponseSchema,
 } from "@veritymem/contracts";
+import { checkActionAuthority } from "@veritymem/retrieval";
+import { resolveTenantId } from "@veritymem/ledger";
 import { requireIdentity } from "../auth.ts";
 import { toolsFor } from "../identity.ts";
 import type { ServerDeps } from "../config.ts";
@@ -149,12 +151,48 @@ export function registerHealthRoutes(app: FastifyInstance, options: HealthRouteO
     },
     async (request, reply) => {
       const identity = requireIdentity(request);
+
+      // Report the caller's *reach*, not only its identity, because identity is not
+      // authorization and the gap between them is where an operator gets stuck.
+      //
+      // A principal that has never written in a scope holds no membership, so it can read
+      // nothing and the action gate will refuse any claim it cites — with
+      // `action.denied_missing_participation`, which is deliberately distinct from an unknown
+      // claim. This endpoint is where that becomes visible: the right answer to "why can I see
+      // nothing" is almost always "you hold no scope yet", and it is not derivable from a
+      // profile or a tool list.
+      let reach: Awaited<ReturnType<typeof checkActionAuthority>> | null = null;
+      const tenant = identity.tenant;
+      if (tenant !== undefined && tenant !== null && tenant !== "") {
+        try {
+          reach = await checkActionAuthority(
+            {
+              db: deps.db,
+              embeddings: {
+                model_id: deps.embeddings.model_id,
+                dimensions: deps.embeddings.dimensions,
+                isModelCall: deps.embeddings.isModelCall,
+              },
+            },
+            { tenantId: resolveTenantId(tenant), principal: identity.principal },
+          );
+        } catch {
+          // A reach lookup that fails must not turn whoami into an error: the identity is
+          // still correct, and an operator asking "who am I" deserves an answer.
+          reach = null;
+        }
+      }
+
       await reply.code(200).send({
         principal: identity.principal,
         tenant: identity.tenant ?? "",
         profile: identity.profile,
         audiences: [...identity.audiences],
         tools: [...toolsFor(identity.profile)],
+        reach:
+          reach === null
+            ? null
+            : { status: reach.status, id: reach.id, detail: reach.detail, remedy: reach.remedy ?? null },
       });
     },
   );

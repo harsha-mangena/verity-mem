@@ -508,6 +508,29 @@ export const WhoAmIResponseSchema = Type.Object(
     audiences: Type.Array(Type.String()),
     /** Tool names this profile may call. The allowlist is the authorization list. */
     tools: Type.Array(Type.String()),
+    /**
+     * What the caller can actually reach, which identity alone does not tell you.
+     *
+     * Null when the credential carries no tenant to resolve. A `status` of `degraded` means
+     * the principal holds no scope membership and no live grant, so it can read nothing and
+     * the action gate will refuse any claim it cites — with
+     * `action.denied_missing_participation`, deliberately distinct from an unknown claim.
+     *
+     * Present because "why can I see nothing" is the most common onboarding question and its
+     * answer is not derivable from a profile or a tool list.
+     */
+    reach: Type.Union([
+      Type.Null(),
+      Type.Object(
+        {
+          status: Type.String(),
+          id: Type.String(),
+          detail: Type.String(),
+          remedy: Type.Union([Type.String(), Type.Null()]),
+        },
+        { additionalProperties: false },
+      ),
+    ]),
   },
   { $id: "WhoAmIResponse", additionalProperties: false },
 );
