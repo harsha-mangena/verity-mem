@@ -96,15 +96,22 @@ export interface RunOutcome {
   readonly exitCode: number;
 }
 
-/** Anchor of the corpus's time axis: one instant, so every batch agrees on "now". */
+/**
+ * Anchor of the corpus's time axis.
+ *
+ * A fixed instant by default, not "now". The anchor defines every `as_of` instant and
+ * `during` window the workload issues, and it is recorded in the report as part of the
+ * dataset's identity — so a run next week against the same dataset must use the same
+ * anchor or it is asking a different question of the same rows. `--anchor now` is
+ * available for someone who deliberately wants the corpus to end today.
+ */
 export function defaultAnchor(explicit: Date | null): Date {
   if (explicit !== null) return explicit;
-  // Truncated to the minute: a re-run a few minutes later should describe the same
-  // dataset, and a per-millisecond anchor would silently move every `as_of` query.
-  const now = new Date();
-  now.setUTCSeconds(0, 0);
-  return now;
+  return new Date(DEFAULT_ANCHOR);
 }
+
+/** The anchor used when `--anchor` is not given. Immutable, so the corpus is reproducible. */
+export const DEFAULT_ANCHOR = "2026-09-17T12:00:00.000Z";
 
 export async function runBenchmark(options: RunOptions): Promise<RunOutcome> {
   const env = loadEnv();
@@ -136,13 +143,15 @@ export async function runBenchmark(options: RunOptions): Promise<RunOutcome> {
       embeddingDimensions: embedding.dimensions,
       statePath: options.statePath,
       onProgress: (progress) => {
-        const now = Date.now();
-        if (now - lastLog < 20_000 && progress.done !== progress.total) return;
-        lastLog = now;
+        // One line per phase. A million-row load emits thousands of batches, and a
+        // wall of progress lines is not progress — the phase boundary is the useful
+        // signal, and a stalled load is diagnosed with `status`, not by scrolling.
+        if (progress.done < progress.total) return;
+        lastLog = Date.now();
         options.log(
-          `  ${progress.phase.padEnd(15)} ${progress.done.toLocaleString("en-US").padStart(9)}/` +
-            `${progress.total.toLocaleString("en-US")}  ${(progress.elapsed_ms / 1000).toFixed(0)}s  ` +
-            `${progress.rows_per_second.toLocaleString("en-US")} rows/s`,
+          `  ${progress.phase.padEnd(15)} ${progress.done.toLocaleString("en-US").padStart(9)} claims  ` +
+            `${(progress.elapsed_ms / 1000).toFixed(1)}s  ` +
+            `${progress.rows_per_second.toLocaleString("en-US")} claims/s`,
         );
       },
     });
@@ -175,6 +184,15 @@ export async function runBenchmark(options: RunOptions): Promise<RunOutcome> {
     max: options.concurrency,
     applicationName: "veritymem-perf-benchmark",
   });
+  // A pooled connection can be closed under us — an operator restarting PostgreSQL, a
+  // container being recycled — and `pg` emits `error` on the pool for an *idle* client.
+  // Without a listener that is an unhandled 'error' event and the process dies with a
+  // stack trace instead of reporting how many samples it had already taken.
+  const poolErrors: string[] = [];
+  db.pool.on("error", (error: Error) => {
+    poolErrors.push(error.message);
+  });
+  const startPoolErrors = poolErrors.length;
   // `compose()` needs a ledger for evidence re-verification. It is the real one, with a
   // memory blob store because this corpus writes every payload inline; the read path
   // never touches a blob unless an event has a payload_ref, and asserting that here
@@ -229,6 +247,7 @@ export async function runBenchmark(options: RunOptions): Promise<RunOutcome> {
         warmupRequests: pass.state === "cold" ? 0 : options.warmupRequests,
         log: options.log,
         label: pass.label,
+        poolErrors,
       });
       measurements.push({ ...result, cache_state: pass.state, label: pass.label });
     }
@@ -316,6 +335,7 @@ interface PassOptions {
   readonly warmupRequests: number;
   readonly log: (message: string) => void;
   readonly label?: string;
+  readonly poolErrors: readonly string[];
 }
 
 /** Prime the caches without recording anything, for a run that skips the cold pass. */
@@ -349,6 +369,7 @@ async function issuePass(
   }
 
   const before = await bufferStats(db);
+  const poolErrorBase = options.poolErrors.length;
   const startedAt = new Date().toISOString();
   const started = performance.now();
   const samples: Sample[] = [];
@@ -396,6 +417,7 @@ async function issuePass(
     content: summary.content,
     by_shape: summary.by_shape,
     buffers: { before, after, delta: diffBuffers(before, after) },
+    pool_errors: [...options.poolErrors].slice(poolErrorBase),
   };
 }
 
@@ -441,13 +463,19 @@ interface DatasetFactInput {
 
 async function buildDatasetFact(input: DatasetFactInput): Promise<DatasetFact> {
   const probe = await probeTemporalShape(input.tenantSlug, input.anchor.getTime());
+  // Read the accepted count back from the database rather than deriving it from the
+  // generator's stated 21/25 mix: the target is stated in accepted claims, so the
+  // number that decides "is this the target size" has to be a measurement.
+  const acceptedClaims = probe.status_mix["accepted"] ?? 0;
   return {
     tenant_slug: input.tenantSlug,
     tenant_id: input.tenantId,
     corpus_seed: input.corpusSeed,
     claims_requested: input.claimsRequested,
     claims_measured: input.claimsMeasured,
-    is_target_size: input.claimsMeasured === 1_000_000,
+    accepted_claims: acceptedClaims,
+    accepted_claims_target: 1_000_000,
+    is_target_size: acceptedClaims >= 1_000_000,
     generator: "packages/perf/src/corpus.ts (deterministic, seeded per claim index)",
     generator_bypassed_write_path: true,
     write_path_statement:

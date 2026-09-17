@@ -23,11 +23,13 @@ import { loadEnv, resolveTenantId } from "@veritymem/ledger";
 import { HashEmbeddingBackend } from "@veritymem/retrieval";
 import { countAll, loadCorpus, syncStreams } from "./load.ts";
 import { TARGET_CLAIMS } from "./report.ts";
-import { defaultAnchor, runBenchmark } from "./run.ts";
+import { DEFAULT_ANCHOR, defaultAnchor, runBenchmark } from "./run.ts";
 
 export interface CliOptions {
   readonly command: "bench" | "load" | "status";
   readonly claims: number;
+  /** Accepted claims the corpus was sized from, or null when `--claims` set the size directly. */
+  readonly acceptedRequested: number | null;
   readonly corpusSeed: string;
   readonly tenantSlug: string;
   readonly workloadSize: number;
@@ -42,6 +44,13 @@ export interface CliOptions {
   readonly referenceMachineDeclared: boolean;
 }
 
+/**
+ * Fraction of generated claims that carry an open valid-time interval, i.e. that a
+ * `current` query can see. The corpus's status mix is fixed at 21/25 accepted and 4/25
+ * superseded, so this constant is derived from that and not tuned per run.
+ */
+export const OPEN_CLAIM_FRACTION = 21 / 25;
+
 export const USAGE = `VerityMem one-million-claim performance benchmark
 
 Usage: node --experimental-strip-types packages/perf/src/main.ts [bench|load|status] [options]
@@ -51,13 +60,18 @@ Usage: node --experimental-strip-types packages/perf/src/main.ts [bench|load|sta
   status               print the row counts for the benchmark tenant
 
 Dataset
-  --claims <n>         accepted claims to generate (default ${TARGET_CLAIMS})
+  --claims <n>         total claims in the corpus (default ${TARGET_CLAIMS}). Roughly 84%
+                       of them are open intervals and 16% are closed, so a corpus of
+                       ${TARGET_CLAIMS} holds about ${Math.round(TARGET_CLAIMS * 0.84 / 1000)}k currently-accepted claims and a
+                       historical tail for the as_of and during modes. Use --accepted
+                       to size the corpus from the accepted count instead.
   --seed <text>        corpus seed (default "veritymem-perf-v1")
   --tenant <slug>      tenant slug. The tenant id is derived from it, so a fresh slug is
                        a fresh dataset and an existing one is reused.
                        (default "perf-bench-<seed>-<claims>")
-  --anchor <iso>       corpus time anchor, e.g. 2026-09-17T00:00:00Z (default: now, to
-                       the minute)
+  --anchor <iso|now>   corpus time anchor. Default ${DEFAULT_ANCHOR} — a fixed
+                       instant, because the anchor defines every as_of and during query
+                       in the workload and must not drift between runs.
   --new-dataset        append a random suffix to the tenant slug; use this to keep an
                        earlier corpus in the same database
 
@@ -83,6 +97,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
   const rest = command === "bench" && argv[0] !== "bench" ? argv : argv.slice(1);
 
   let claims = TARGET_CLAIMS;
+  let acceptedRequested: number | null = null;
   let corpusSeed = "veritymem-perf-v1";
   let tenantSlug: string | null = null;
   let workloadSize = 4_000;
@@ -108,6 +123,14 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     switch (arg) {
       case "--claims":
         claims = Number.parseInt(next(), 10);
+        acceptedRequested = null;
+        break;
+      case "--accepted":
+        acceptedRequested = Number.parseInt(next(), 10);
+        // The corpus keeps a 16% closed-interval tail so that `as_of` and `during`
+        // have a genuinely different row set to find. A caller who asks for N
+        // accepted claims therefore gets a corpus of N / 0.84.
+        claims = Math.ceil((acceptedRequested ?? 0) / OPEN_CLAIM_FRACTION);
         break;
       case "--seed":
         corpusSeed = next();
@@ -116,8 +139,9 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         tenantSlug = next();
         break;
       case "--anchor": {
-        const parsed = new Date(next());
-        if (Number.isNaN(parsed.getTime())) throw new Error("--anchor must be an ISO instant");
+        const raw = next();
+        const parsed = raw === "now" ? new Date() : new Date(raw);
+        if (Number.isNaN(parsed.getTime())) throw new Error("--anchor must be an ISO instant or 'now'");
         anchor = parsed;
         break;
       }
@@ -174,6 +198,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
   return {
     command,
     claims,
+    acceptedRequested,
     corpusSeed,
     tenantSlug:
       tenantSlug ??
@@ -228,10 +253,14 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       embeddingDimensions: backend.dimensions,
       statePath,
       onProgress: (progress) => {
+        // The `load` subcommand is interactive, so every batch reports. The default
+        // `bench` path reports once per phase instead: a million-row load emits
+        // thousands of batches and a wall of progress lines is not progress.
+        if (progress.done < progress.total) return;
         log(
-          `  ${progress.phase.padEnd(15)} ${progress.done.toLocaleString("en-US").padStart(9)}/` +
-            `${progress.total.toLocaleString("en-US")}  ${(progress.elapsed_ms / 1000).toFixed(0)}s  ` +
-            `${progress.rows_per_second.toLocaleString("en-US")} rows/s`,
+          `  ${progress.phase.padEnd(15)} ${progress.done.toLocaleString("en-US").padStart(9)} claims  ` +
+            `${(progress.elapsed_ms / 1000).toFixed(1)}s  ` +
+            `${progress.rows_per_second.toLocaleString("en-US")} claims/s`,
         );
       },
     });
@@ -241,6 +270,12 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     return 0;
   }
 
+  if (options.acceptedRequested !== null) {
+    log(
+      `sizing      ${options.acceptedRequested.toLocaleString("en-US")} accepted claims -> ` +
+        `${options.claims.toLocaleString("en-US")} total claims in the corpus`,
+    );
+  }
   const outcome = await runBenchmark({
     claims: options.claims,
     corpusSeed: options.corpusSeed,

@@ -273,6 +273,18 @@ export interface CorpusClaim {
 export interface CorpusOptions {
   readonly seed: string;
   /**
+   * The tenant the corpus is being materialised for.
+   *
+   * Load-bearing for *identity*, not for content. `generateClaim` derives every primary
+   * key from `(tenantId, label, index)`; it previously derived them from `seed`, which
+   * made the ids identical in every tenant using the same corpus seed. Because
+   * `events.event_id` is a global primary key inserted with `ON CONFLICT DO NOTHING`,
+   * the second tenant to use a seed silently received nothing while the loader reported
+   * every phase complete. The seed still determines the *values*, so one seed produces
+   * the same corpus in each tenant and distinct rows across tenants.
+   */
+  readonly tenantId: string;
+  /**
    * Upper bound of `recorded_at`. Passed in rather than read from the clock inside
    * this function so that one generation pass produces one coherent time axis even
    * if a batch is generated after midnight.
@@ -371,9 +383,13 @@ export function generateClaim(index: number, options: CorpusOptions): CorpusClai
 
   return {
     index,
-    claimId: corpusUuid(options.seed, "clm", index),
-    eventId: corpusUuid(options.seed, "evt", index),
-    spanId: corpusUuid(options.seed, "spn", index),
+    // Keyed on the tenant, not the seed. A seed-Keyed id is identical in every tenant,
+    // and `events.event_id` is a global primary key: the second tenant to load a corpus
+    // would have every row dropped by `ON CONFLICT DO NOTHING` while the loader
+    // reported success.
+    claimId: corpusUuid(options.tenantId, "clm", index),
+    eventId: corpusUuid(options.tenantId, "evt", index),
+    spanId: corpusUuid(options.tenantId, "spn", index),
     scopeIndex,
     subject,
     predicate: template.predicate,
@@ -401,9 +417,14 @@ export function generateClaim(index: number, options: CorpusOptions): CorpusClai
   };
 }
 
-/** The claim id of `index`, without generating the whole row. Used for relation edges. */
-export function claimIdAt(index: number, seed: string): string {
-  return corpusUuid(seed, "clm", index);
+/**
+ * The claim id of `index`, without generating the whole row.
+ *
+ * Takes the tenant, not the seed: the id is what relation edges point at, so deriving it
+ * from anything but the tenant would produce an id no row has.
+ */
+export function claimIdAt(index: number, tenantId: string): string {
+  return corpusUuid(tenantId, "clm", index);
 }
 
 /**

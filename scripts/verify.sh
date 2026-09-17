@@ -244,6 +244,40 @@ if [[ "$FAST" == "0" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+step "8b. Query-latency benchmark against the existing corpus (optional)"
+# ---------------------------------------------------------------------------
+# Non-blocking, and gated on the dataset already existing, for two reasons that are
+# stated rather than implied.
+#
+# **It does not load.** Generating and projecting a million claims takes about an hour
+# on a laptop, so making the acceptance run do it would turn a five-minute check into an
+# hour-long one and the step would be disabled. `--skip-load` measures whatever corpus is
+# already in the database and records its real size in the report.
+#
+# **It does not gate.** The v0.1 target is stated against a *published reference
+# machine*, so a run here cannot pass or fail the release by itself; a laptop missing
+# 250 ms is not a release defect, and a laptop meeting it does not close block B7. The
+# exit code is checked so a crash is visible, but the verdict is read from
+# `$REPORTS_DIR/perf-benchmark.txt` next to the hardware that produced it.
+if [[ "${VERITYMEM_PERF:-0}" == "1" ]]; then
+  export VERITYMEM_PERF_CLAIMS="${VERITYMEM_PERF_CLAIMS:-1190477}"
+  if pnpm eval:perf bench --skip-load \
+    --claims "$VERITYMEM_PERF_CLAIMS" \
+    --workload "${VERITYMEM_PERF_WORKLOAD:-600}" \
+    --reports "$REPORTS_DIR" 2>&1 | tee "$REPORTS_DIR/perf-benchmark-run.txt"; then
+    PERF_P95="$(grep -E '^      p95 (current|as_of|during)' "$REPORTS_DIR/perf-benchmark.txt" 2>/dev/null | tr -s ' ' | tr '\n' ';' || true)"
+    PERF_SIZE="$(grep -E '^    corpus ' "$REPORTS_DIR/perf-benchmark.txt" 2>/dev/null | head -1 | sed 's/^ *//' || true)"
+    note "perf            ${PERF_SIZE:-dataset unknown}"
+    note "perf p95        ${PERF_P95:-see $REPORTS_DIR/perf-benchmark.txt}"
+    note "perf verdict    NOT a reference machine; evidence for block B7, not closure"
+  else
+    note "perf            the benchmark did not complete; see $REPORTS_DIR/perf-benchmark-run.txt"
+  fi
+else
+  note "perf            skipped (set VERITYMEM_PERF=1 to measure the existing corpus)"
+fi
+
+# ---------------------------------------------------------------------------
 step "9. Evidence summary"
 # ---------------------------------------------------------------------------
 # Exported rather than appended after the command: `node -e '...' VAR=value` passes the
@@ -289,5 +323,7 @@ printf '\n\033[32mAcceptance checks passed.\033[0m\n'
 printf 'Reports retained in %s/ for commit %s.\n' "$REPORTS_DIR" "$(git rev-parse --short HEAD)"
 printf '\nNot covered, and stated rather than implied:\n'
 printf '  * cross-tenant and revoked-grant isolation requires an independent red team (block B6)\n'
-printf '  * the p95 target requires a declared reference machine at one million claims (block B7)\n'
+printf '  * the p95 target requires a declared reference machine at one million claims (block B7);\n'
+printf '    step 8b measures it when VERITYMEM_PERF=1 and a corpus exists, and reports the verdict\n'
+printf '    as evidence rather than as a release decision\n'
 printf '  * review burden is reported by LedgerBench and is currently above the 2%% ceiling (block B5)\n'

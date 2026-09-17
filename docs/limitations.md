@@ -58,6 +58,16 @@ work on a held-out corpus, not a code change, and it is not done.
 
 ## Measurements that do not exist
 
+- **The one-million-claim corpus that exists is incomplete.** The tenant
+  `perf-bench-veritymem-perf-v1-1190477` holds 1,185,477 events, spans and claims, of
+  which 995,801 are `accepted`, but only **395,000 embeddings** — 40% of the claims have
+  no dense projection — and no `projection_versions` row, so the dense channel has no
+  recorded model for that tenant. A latency measurement over it exercises a retrieval
+  path with a partially populated vector index. The loader now refuses to report a
+  corpus that did not land (see below), but this dataset predates that check and was
+  produced by an interrupted load whose phases checkpoint independently. Re-running
+  `pnpm eval:perf load` for that tenant resumes from the checkpoint and fills the
+  remainder; until then any number measured against it describes an incomplete index.
 - **p95 query latency at the declared reference scale.** `packages/perf` can drive a
   one-million-claim corpus, but there is no published reference machine, so the
   target is `not_measured` and the run exits non-zero. A laptop number is recorded as
@@ -139,6 +149,39 @@ work on a held-out corpus, not a code change, and it is not done.
 - **The full-text projection keys a claim on subject/predicate/object**, so
   `deploy.window` is one token and a query for "deploy window" matches nothing. See
   `fixtures/README.md` §2a.
+
+## The performance loader derived ids from the seed, not the tenant
+
+Fixed at the commit that adds this note, and recorded because of how it failed.
+
+`generateClaim` derived `claim_id`, `event_id` and `span_id` from
+`corpusUuid(corpusSeed, label, index)`, and `corpusUuid`'s docstring claimed the loader's
+keys were `(tenant, label, index)`. Because `events.event_id` is a **global** primary key
+and every corpus insert ends in `ON CONFLICT ... DO NOTHING`, the second tenant to load a
+given corpus seed had **every row silently discarded**. Eleven tenants ended up sharing
+event ids from one seed.
+
+What made it expensive rather than obvious:
+
+- the loader reported all seven phases complete, with a throughput figure for each,
+  because `runPhase` commits and checkpoints after every batch — a phase reaching its
+  final index means the statements were *accepted*, not that they inserted anything;
+- the failure surfaced as `tenant <slug> holds no claims; run without --skip-load, or
+  check that the tenant slug and corpus seed match`, which points at the corpus and the
+  arguments rather than at the loader;
+- the *content* was right. Only identity was wrong, so a corpus that looked correct in
+  every field was written nowhere.
+
+Three changes:
+
+1. `CorpusOptions` now carries `tenantId` and the ids derive from it. The seed still
+   determines the values, so one seed is still one corpus, and the field is required
+   rather than optional so a new call site cannot forget it.
+2. Relation edges used `corpusUuid(ctx.corpusSeed, ...)` for their target. Once identity
+   moved to the tenant this pointed at a claim in no tenant, and the foreign key
+   `claim_relations_to_claim_fkey` caught it — the one place the bug was loud.
+3. `loadCorpus` now reads its own counts back and **throws** if any corpus table is
+   empty for the tenant, so a load that writes nothing can no longer report success.
 
 ## Environment
 

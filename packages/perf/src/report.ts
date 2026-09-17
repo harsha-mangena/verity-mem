@@ -29,8 +29,17 @@ import type { TimeMode, WorkloadShape } from "./workload.ts";
 
 export const REPORT_VERSION = "perf-benchmark@1";
 export const TARGET_P95_MS = 250;
-/** The claim count the v0.1 target names. */
+/** The accepted-claim count the v0.1 target names. */
 export const TARGET_CLAIMS = 1_000_000;
+
+/**
+ * Fraction of generated claims that are open intervals, i.e. visible to a `current`
+ * query. Kept here so the report can say "this corpus is the target size" without
+ * importing the corpus generator's status mix, and so the two definitions sit next to
+ * each other in review. It must match `corpus.ts`: 21 of every 25 claims are accepted
+ * and open, 4 are superseded and closed.
+ */
+export const OPEN_CLAIM_FRACTION = 21 / 25;
 
 export type CacheState = "cold" | "warm";
 
@@ -53,6 +62,8 @@ export interface ScenarioResult {
     readonly after: BufferStats;
     readonly delta: BufferStats;
   };
+  /** Pool-level errors observed during the pass. Non-empty means the numbers are suspect. */
+  readonly pool_errors: readonly string[];
 }
 
 export interface BenchmarkReport {
@@ -84,6 +95,9 @@ export interface DatasetFact {
   readonly corpus_seed: string;
   readonly claims_requested: number;
   readonly claims_measured: number;
+  /** Accepted claims with an open valid-time interval: what a `current` query sees. */
+  readonly accepted_claims: number;
+  readonly accepted_claims_target: number;
   readonly is_target_size: boolean;
   readonly generator: string;
   readonly generator_bypassed_write_path: true;
@@ -151,6 +165,8 @@ export interface TargetFact {
 export interface VerdictFact {
   readonly target_met_on_this_machine: boolean;
   readonly measured_dataset_size: number;
+  readonly measured_accepted_claims: number;
+  readonly target_accepted_claims: number;
   readonly measured_dataset_is_target_size: boolean;
   readonly compared_against: "headline (warm cache, trace writes enabled)";
   readonly p95_ms_by_mode: Readonly<Record<TimeMode, number>>;
@@ -209,7 +225,9 @@ export function buildReport(input: BuildReportInput): BenchmarkReport {
     ...(input.dataset.is_target_size
       ? []
       : [
-          `The measured dataset is ${input.dataset.claims_measured.toLocaleString("en-US")} accepted claims, not the ${TARGET_CLAIMS.toLocaleString("en-US")} the target names.`,
+          `The measured corpus holds ${input.dataset.accepted_claims.toLocaleString("en-US")} currently-accepted ` +
+            `claims (${input.dataset.claims_measured.toLocaleString("en-US")} rows including the closed historical ` +
+            `tail), not the ${TARGET_CLAIMS.toLocaleString("en-US")} the target names.`,
         ]),
     ...(smallSamples.length > 0
       ? [`Some cells have fewer than ${MIN_SAMPLES_FOR_P99} samples, so their p99 is the largest observation rather than a percentile: ${smallSamples.join(", ")}.`]
@@ -250,11 +268,13 @@ export function buildReport(input: BuildReportInput): BenchmarkReport {
       target_met_on_this_machine: met,
       measured_dataset_size: input.dataset.claims_measured,
       measured_dataset_is_target_size: input.dataset.is_target_size,
+      measured_accepted_claims: input.dataset.accepted_claims,
+      target_accepted_claims: TARGET_CLAIMS,
       compared_against: "headline (warm cache, trace writes enabled)",
       p95_ms_by_mode: p95ByMode,
       slowest_mode: slowest,
       slowest_mode_p95_ms: slowestP95,
-      statement: verdictStatement(met, input.dataset.claims_measured),
+      statement: verdictStatement(met, input.dataset.accepted_claims, input.dataset.claims_measured),
       block_status: "evidence, not closure",
       block_b7_closed: false,
       why_not_closed: whyNotClosed,
@@ -272,8 +292,8 @@ function pickHeadline(measurements: readonly ScenarioResult[]): ScenarioResult |
   );
 }
 
-function verdictStatement(met: boolean, claims: number): string {
-  const size = `${claims.toLocaleString("en-US")} accepted claims`;
+function verdictStatement(met: boolean, accepted: number, total: number): string {
+  const size = `${accepted.toLocaleString("en-US")} currently-accepted claims (${total.toLocaleString("en-US")} claim rows including the closed historical tail)`;
   if (met) {
     return (
       `The 250 ms p95 target is MET on this machine at ${size}, in every time mode, ` +
@@ -379,8 +399,10 @@ export function renderSummary(report: BenchmarkReport): string {
   lines.push(`    tenant     ${report.dataset.tenant_slug}`);
   lines.push(`    corpus     seed "${report.dataset.corpus_seed}", anchor ${report.dataset.anchor}`);
   lines.push(
-    `    measured   ${report.dataset.claims_measured.toLocaleString("en-US")} accepted claims` +
-      (report.dataset.is_target_size ? " (the target size)" : ` (NOT the ${TARGET_CLAIMS.toLocaleString("en-US")} the target names)`),
+    `    corpus     ${report.dataset.claims_measured.toLocaleString("en-US")} claim rows; ` +
+      `${report.dataset.accepted_claims.toLocaleString("en-US")} currently accepted ` +
+      `(${report.dataset.accepted_claims_target.toLocaleString("en-US")} target)` +
+      (report.dataset.is_target_size ? " — AT TARGET SIZE" : " — BELOW TARGET SIZE"),
   );
   for (const count of report.dataset.counts) {
     lines.push(`      ${count.table.padEnd(18)} ${count.rows.toLocaleString("en-US").padStart(12)}`);

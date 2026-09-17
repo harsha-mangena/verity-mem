@@ -24,7 +24,7 @@
  *
  * Two mechanisms, deliberately belt and braces:
  *
- *   1. **Derived keys.** Every primary key is `corpusUuid(seed, label, index)`, so
+ *   1. **Derived keys.** Every primary key is `corpusUuid(tenant, label, index)`, so
  *      re-running any phase re-inserts the same keys and conflicts instead of
  *      duplicating. Inserts use `ON CONFLICT DO NOTHING` where a conflict is
  *      expected on resume.
@@ -307,6 +307,33 @@ export async function loadCorpus(options: LoadOptions): Promise<LoadResult> {
       state = await runPhase(client, state, spec, options, context);
     }
 
+    // Verify the load actually landed, rather than trusting that the phases ran.
+    //
+    // `runPhase` commits and checkpoints after each batch, so a phase reaching its final
+    // index means the statements were accepted -- not that they inserted anything. Every
+    // corpus insert ends in `ON CONFLICT ... DO NOTHING`, which reports success while
+    // writing zero rows, and that is exactly what happened here: the primary keys were
+    // derived from the corpus seed instead of the tenant, so the second tenant to use a
+    // seed had every `events` row discarded by `ON CONFLICT (event_id) DO NOTHING`. The
+    // loader printed seven completed phases and a throughput figure for each. The
+    // benchmark then failed with "tenant holds no claims", which reads as a corpus
+    // problem and is a loader defect.
+    //
+    // A loader that reports success while writing nothing is the failure this project
+    // exists to prevent, so this is an error rather than a warning. It runs on the same
+    // client, inside the same tenant, so it observes exactly what a reader will.
+    const landed = await readCounts(client, options.tenantId);
+    const emptyPhases = landed.filter((entry) => entry.rows === 0);
+    if (emptyPhases.length > 0) {
+      throw new Error(
+        `the corpus did not land: ${emptyPhases.map((entry) => entry.table).join(", ")} ` +
+          `hold no rows for tenant ${options.tenantSlug} after all phases reported complete. ` +
+          `Every corpus insert uses ON CONFLICT DO NOTHING, so a collision on a derived ` +
+          `primary key is silent. Check that the ids are derived from the tenant, not the ` +
+          `corpus seed.`,
+      );
+    }
+
     // The dense projection's recorded model, so the retrieval channel's model-mismatch
     // guard sees the writer's id instead of an empty row and skipping the channel.
     await client.query(
@@ -470,7 +497,7 @@ function phaseSpecs(context: PhaseContext): readonly PhaseSpec[] {
       rows: (claim, ctx) =>
         claim.contradictsIndex === null
           ? []
-          : [[claim.claimId, corpusUuid(ctx.corpusSeed, "clm", claim.contradictsIndex), "contradicts"]],
+          : [[claim.claimId, corpusUuid(ctx.tenantId, "clm", claim.contradictsIndex), "contradicts"]],
     },
     {
       // Two aliases per claim (its subject and its object). `entity_aliases` has no
@@ -509,7 +536,13 @@ async function runPhase(
 
   const total = options.claims;
   const batchSize = batchRows(spec.phase, options.batchSize);
-  const corpusOptions: CorpusOptions = { seed: options.corpusSeed, anchor: options.anchor };
+  const corpusOptions: CorpusOptions = {
+    seed: options.corpusSeed,
+    // Identity comes from the tenant so two tenants can hold the same corpus without
+    // colliding on the global `events.event_id` primary key.
+    tenantId: context.tenantId,
+    anchor: options.anchor,
+  };
   let index = resumeAt;
   let written = 0;
   let current = state;
@@ -605,7 +638,8 @@ export async function readCounts(
      UNION ALL SELECT 'claim_embeddings', count(*)::int FROM claim_embeddings WHERE tenant_id = $1::uuid
      UNION ALL SELECT 'claim_relations', count(*)::int FROM claim_relations r
        JOIN claims c ON c.claim_id = r.from_claim WHERE c.tenant_id = $1::uuid
-     UNION ALL SELECT 'entity_aliases', count(*)::int FROM entity_aliases WHERE tenant_id = $1::uuid`,
+     UNION ALL SELECT 'entity_aliases', count(*)::int FROM entity_aliases WHERE tenant_id = $1::uuid
+     ORDER BY table_name`,
     [tenantId],
   );
   return result.rows.map((row) => ({ table: String(row.table_name), rows: Number(row.rows) }));
