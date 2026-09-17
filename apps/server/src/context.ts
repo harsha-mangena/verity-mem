@@ -180,6 +180,15 @@ export async function callerScopeIds(
 /**
  * Read one object inside a bound request context, or report that it is not there.
  *
+ * Two sequential transactions, deliberately not nested. The first discovers the
+ * caller's reach — membership plus live grants — and the second performs the read
+ * with that reach bound. Nesting them would check a second connection out of the
+ * pool while the first is held, and with a pool of N, N concurrent requests would
+ * deadlock: every request holding an outer connection and waiting for an inner one.
+ * That failure mode is invisible in a single-request test and appears as a
+ * unexplained hang under load, so the shape is avoided structurally rather than
+ * documented.
+ *
  * The binding carries the caller's reachable scope ids and no purposes. That is not
  * a loosening: `veritymem.row_authorized` requires the tenant to match *and*
  * `scope_reachable(scope, current_purposes())`, and it is the scope set — computed
@@ -193,27 +202,17 @@ export async function withReadContext<T>(
   caller: TenantContext,
   fn: (executor: QueryExecutor) => Promise<T>,
 ): Promise<T> {
-  const now = deps.clock.now().toISOString();
+  const scopes = await discoverReach(deps, caller);
   return deps.db.withRequest(
-    { tenant: caller.tenantId, principal: caller.principal, scopeIds: [], purposes: [], action: "api:read" },
-    async (executor) => {
-      const scopes = await callerScopeIds(executor, {
-        tenantId: caller.tenantId,
-        principal: caller.principal,
-        now,
-      });
-      return deps.db.withRequest(
-        {
-          tenant: caller.tenantId,
-          principal: caller.principal,
-          scopeIds: scopes,
-          purposes: [],
-          action: "api:read",
-        },
-        fn,
-        { readOnly: true },
-      );
+    {
+      tenant: caller.tenantId,
+      principal: caller.principal,
+      scopeIds: scopes,
+      purposes: [],
+      action: "api:read",
     },
+    fn,
+    { readOnly: true },
   );
 }
 
@@ -231,26 +230,38 @@ export async function withWriteContext<T>(
   action: string,
   fn: (executor: QueryExecutor) => Promise<T>,
 ): Promise<T> {
+  const scopes = await discoverReach(deps, caller);
+  return deps.db.withRequest(
+    {
+      tenant: caller.tenantId,
+      principal: caller.principal,
+      scopeIds: scopes,
+      purposes: [],
+      action,
+    },
+    fn,
+  );
+}
+
+/**
+ * Discover reach in its own short transaction.
+ *
+ * `action: "api:reach"` rather than `"api:read"`: the trace of what a request did
+ * should show that one round trip resolved authorization and did not touch claim
+ * data, which is the property the whole read path depends on.
+ */
+async function discoverReach(deps: ServerDeps, caller: TenantContext): Promise<string[]> {
   const now = deps.clock.now().toISOString();
   return deps.db.withRequest(
-    { tenant: caller.tenantId, principal: caller.principal, scopeIds: [], purposes: [], action },
-    async (executor) => {
-      const scopes = await callerScopeIds(executor, {
-        tenantId: caller.tenantId,
-        principal: caller.principal,
-        now,
-      });
-      return deps.db.withRequest(
-        {
-          tenant: caller.tenantId,
-          principal: caller.principal,
-          scopeIds: scopes,
-          purposes: [],
-          action,
-        },
-        fn,
-      );
+    {
+      tenant: caller.tenantId,
+      principal: caller.principal,
+      scopeIds: [],
+      purposes: [],
+      action: "api:reach",
     },
+    async (executor) => callerScopeIds(executor, { tenantId: caller.tenantId, principal: caller.principal, now }),
+    { readOnly: true },
   );
 }
 

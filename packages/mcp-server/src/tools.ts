@@ -65,6 +65,15 @@ export interface ToolBackend {
   feedback(request: { trace_id: string; outcome: "correct" | "incorrect" | "incomplete" | "harmful"; correction?: string }): Promise<unknown>;
   createGrant(request: GrantCreateRequest): Promise<Grant>;
   forget(request: ForgetRequest): Promise<RetentionJob>;
+  /**
+   * Optional so a deployment can run the tools without it.
+   *
+   * `GET /v1/query-traces/{trace_id}` exists in the specification and in
+   * `VerityMemClient`, but a backend that does not bind it must say so through
+   * `memory_explain` rather than returning an empty object that reads as "the
+   * trace was empty".
+   */
+  getQueryTrace?(traceId: string): Promise<unknown>;
 }
 
 /** Everything a handler needs that is not the call's own arguments. */
@@ -349,8 +358,28 @@ export async function callTool(
   }
 
   const handlers = createToolHandlers(context);
-  const result = await handlers[tool](args);
-  return { tool, ...result };
+  return { tool, ...(await withBackendErrors(handlers[tool](args))) };
+}
+
+/**
+ * Turns a backend failure into a tool-level refusal.
+ *
+ * A REST denial (`VerityMemError`, e.g. `authz.scope_unreachable`) and a transport
+ * failure both have to reach the model as a readable result. Letting them
+ * propagate would make the MCP client see a protocol error and retry a request
+ * that will be denied again — and the specification's rule is that a denied
+ * action and a failed request stay distinguishable.
+ */
+async function withBackendErrors(result: Promise<ToolResult>): Promise<ToolResult> {
+  try {
+    return await result;
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && typeof (error as { code: unknown }).code === "string") {
+      const coded = error as { code: string; message?: string };
+      return { ok: false, code: coded.code, message: coded.message ?? coded.code };
+    }
+    return { ok: false, code: "backend_error", message: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 function isKnownTool(tool: string): tool is ToolName {
@@ -447,26 +476,27 @@ async function handleExplain(
     return { ok: true, value: { claim_id: explanation.claim_id, explanation, instruction: "This is provenance, not retrieved content: it is the system's own record of how the claim came to be believed." } };
   }
 
-  // A trace id reaches the query-trace route, which is a different object from a
-  // claim explanation. Returning the trace is the honest answer; inventing a
-  // claim explanation for a trace would be a lie about provenance.
-  const traceId = args.trace_id as string;
-  const trace = await fetchTrace(context, traceId);
-  return { ok: true, value: { trace_id: traceId, trace, instruction: "A query trace records the plan, candidates and selection for one read. It is not a promotion history." } };
-}
-
-/**
- * Placeholder seam for `GET /v1/query-traces/{trace_id}`.
- *
- * `ToolBackend` deliberately has no `getQueryTrace` yet: `VerityMemClient` has
- * one, but adding it to this interface before a caller needs it would be a method
- * with no test. Until then a trace lookup reports plainly that this build cannot
- * serve it, which is better than silently returning a claim explanation.
- */
-async function fetchTrace(_context: ToolContext, traceId: string): Promise<never> {
-  throw Object.assign(new Error(`query trace ${traceId} cannot be fetched: the MCP tool backend has no query-trace route bound in this build`), {
-    code: "not_implemented",
-  });
+  // A trace id reaches the query-trace route, which returns a different object
+  // from a claim explanation. Reporting that this build cannot serve the route is
+  // the honest answer; synthesizing a claim explanation for a trace would be a
+  // lie about provenance.
+  const traceId = args.trace_id ?? "";
+  if (context.backend.getQueryTrace === undefined) {
+    return {
+      ok: false,
+      code: "not_implemented",
+      message: `Trace ${traceId} cannot be fetched: this build's tool backend has no query-trace route bound. Use memory_explain with a claim_id.`,
+    };
+  }
+  const trace = await context.backend.getQueryTrace(traceId);
+  return {
+    ok: true,
+    value: {
+      trace_id: traceId,
+      trace,
+      instruction: "A query trace records the plan, candidates and selection for one read. It is not a promotion history.",
+    },
+  };
 }
 
 async function handleRecordEvent(
@@ -720,6 +750,3 @@ function buildTimeSpec(args: {
   }
   return { mode: "during", from: args.time_from, to: args.time_to };
 }
-
-/** Compile-time anchors: the tool layer must keep using the contract enums. */
-type _ContractAnchors = [OriginKind, UseDecision, ClaimRecord, ClaimIdSchema, TraceIdSchema, CandidateProposal, ToolProfile, PrivilegedToolName, AgentToolName];

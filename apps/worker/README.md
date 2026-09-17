@@ -129,21 +129,37 @@ after step 1 would take on work the process has already committed to abandoning.
 
 `migrations/0009` enables row-level security on `outbox` with the policy
 `tenant_id = veritymem.current_tenant_id()`. `OutboxWorker.claim()`,
-`.complete()` and `.fail()` all run through `Db.systemQuery`, which by contract has
-no request context bound — so `current_tenant_id()` is NULL, the policy evaluates
-to FALSE, and the claim matches zero rows. The symptom is the worst kind: `runOnce`
-returns `{claimed: 0, completed: 0, failed: 0}` and the worker looks healthy while
-the queue never drains.
+`.complete()` and `.fail()` all run through `Db.systemQuery`, which by contract
+takes a **fresh pooled connection** with no request context bound — so
+`current_tenant_id()` is NULL, the policy evaluates to FALSE, and the claim matches
+zero rows. The symptom is the worst kind: `runOnce` returns
+`{claimed: 0, completed: 0, failed: 0}` and the worker looks healthy while the
+queue never drains.
 
-This app works around it by binding a tenant system context around each `runOnce`
-call (`src/outbox-runner.ts`), which authorizes the same statements without
-touching the package. The proper fix is a tenant scope inside
-`OutboxWorker.claim/complete/fail`, which is a `packages/ledger` change owned
-elsewhere. Two consequences are real and worth stating plainly:
+Measured against this database, with one pending `extract.event` row for the
+tenant:
+
+```
+db.query(...)       inside a system context -> 1 row
+db.systemQuery(...) inside a system context -> 0 rows   <- a different connection
+new OutboxWorker(db).runOnce(5)             -> {claimed: 0, completed: 0, failed: 0}
+```
+
+Wrapping `OutboxWorker.runOnce` in `db.withSystemContext` therefore does **not**
+help: the context is transaction-local on the outer connection and `systemQuery`
+never sees it. The correct fix is inside `packages/ledger` — `claim`, `complete` and
+`fail` each need a tenant scope. That package is owned elsewhere, so
+`src/claim-loop.ts` is a **port** of those three statements with the original's
+semantics preserved (`SKIP LOCKED`, `attempts + 1`, `max_attempts`,
+`min(300, 2 ** min(attempts, 8))` seconds of backoff, unknown kind throws,
+`bindingFor` from the ledger rather than a copy). Two consequences are real:
 
 - tenants must be enumerated in configuration, because there is no unbound read
   that can list them either (`tenants` is tenant-keyed too);
 - throughput is bounded by tenants × batch size per cycle, not by batch size.
+
+Delete `src/claim-loop.ts` and go back to `new OutboxWorker(db, processors)` the
+moment the ledger package binds a tenant in those three statements.
 
 ### 2. Shutdown is not crash safety
 

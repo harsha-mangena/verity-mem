@@ -185,14 +185,21 @@ export function evaluateTargets(
   checks.push({
     id: "review_burden",
     target: "Review burden under 2% of writes on the reference workload",
-    verdict: burden.writes === 0 ? "not_measured" : burden.within_ceiling ? "pass" : "fail",
-    measurable: burden.writes > 0,
+    verdict:
+      burden.non_adversarial_writes === 0
+        ? "not_measured"
+        : burden.non_adversarial_within_ceiling
+          ? "pass"
+          : "fail",
+    measurable: burden.non_adversarial_writes > 0,
     stage: "commit",
-    observed: burden.writes === 0 ? null : burden.burden,
+    observed: burden.non_adversarial_writes === 0 ? null : burden.non_adversarial_burden,
     note:
-      `Measured over ${burden.writes} decisions from LedgerBench fixtures, ceiling ` +
-      `${GATE_THRESHOLDS.reviewBurdenCeiling}. This is a fixture suite, not the reference workload, so ` +
-      `the number is evidence about the gate and not about production.`,
+      `Measured over the ${burden.non_adversarial_writes} decisions from fixtures that do not exist to ` +
+      `produce review items (ceiling ${GATE_THRESHOLDS.reviewBurdenCeiling}). Across all ${burden.writes} ` +
+      `writes the rate is ${(burden.burden * 100).toFixed(1)}%, because the suite deliberately includes ` +
+      `quarantine paths. Neither number is the reference workload: this is evidence about the gate's ` +
+      `calibration, not about production.`,
   });
 
   const measurable = checks.filter((check) => check.measurable);

@@ -20,8 +20,8 @@
  * context bound — so the policy denies every row, the claim returns nothing, and
  * the worker reports a clean, empty, permanently stalled queue. The worker here
  * binds a tenant system context around each `runOnce` call so the claim is
- * authorized, and that requires knowing which tenants to bind. See README.md and
- * the port notice in `outbox-runner.ts`. The fix belongs in `packages/ledger`.
+ * authorized, and that requires knowing which tenants to bind. See README.md and the port
+ * notice in `claim-loop.ts`. The fix belongs in `packages/ledger`.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";

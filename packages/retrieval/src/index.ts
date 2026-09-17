@@ -6,3 +6,4 @@ export * from "./compose.ts";
 export * from "./retention.ts";
 export * from "./action-gate.ts";
 export * from "./replay.ts";
+export * from "./explain.ts";

@@ -130,7 +130,7 @@ export function createNamespaceCodec(options: NamespaceCodecOptions = {}): Names
       const decoded = decode(namespace, dimensions);
       return {
         tenant: requireDimension(decoded, TENANT_DIMENSION, namespace),
-        ...optionalDimensions(decoded, namespace),
+        ...optionalDimensions(decoded),
         purpose: requirePurposes(decoded, namespace),
       };
     },
@@ -139,7 +139,7 @@ export function createNamespaceCodec(options: NamespaceCodecOptions = {}): Names
       const purposes = decoded.get(PURPOSE_DIMENSION);
       return {
         tenant: requireDimension(decoded, TENANT_DIMENSION, namespace),
-        ...optionalDimensions(decoded, namespace),
+        ...optionalDimensions(decoded),
         ...(purposes === undefined ? {} : { purpose: [...purposes] }),
       };
     },
@@ -163,12 +163,12 @@ export function namespaceFromScope(
     if (dimension === PURPOSE_DIMENSION) continue;
     const value = scope[dimension];
     if (value === undefined || value === null) continue;
-    assertValue(value, dimension, []);
+    assertValue(value, dimension, out);
     out.push(`${dimension}${DIMENSION_SEPARATOR}${value}`);
   }
 
   const purposes = [...scope.purpose];
-  if (purposes.length === 0 && dimensions.includes(PURPOSE_DIMENSION)) {
+  if (purposes.length === 0) {
     throw new NamespaceMappingError(
       "missing_dimension",
       out,
@@ -176,12 +176,10 @@ export function namespaceFromScope(
         "Declare at least one purpose on the scope before turning it into a namespace",
     );
   }
-  if (dimensions.includes(PURPOSE_DIMENSION)) {
-    assertAtLeastOneBoundDimension(scope, out);
-    for (const purpose of [...purposes].sort()) {
-      assertValue(purpose, PURPOSE_DIMENSION, out);
-      out.push(`${PURPOSE_DIMENSION}${DIMENSION_SEPARATOR}${purpose}`);
-    }
+  assertAtLeastOneBoundDimension(scope, out);
+  for (const purpose of [...purposes].sort()) {
+    assertValue(purpose, PURPOSE_DIMENSION, out);
+    out.push(`${PURPOSE_DIMENSION}${DIMENSION_SEPARATOR}${purpose}`);
   }
   return out;
 }
@@ -436,7 +434,6 @@ function requirePurposes(decoded: Map<string, string[]>, namespace: readonly str
 
 function optionalDimensions(
   decoded: Map<string, string[]>,
-  namespace: readonly string[],
 ): Omit<StoreScopePrefix, "tenant" | "purpose"> {
   const out: {
     project?: string;
@@ -449,7 +446,6 @@ function optionalDimensions(
     if (value === undefined) continue;
     out[dimension] = value;
   }
-  void namespace;
   return out;
 }
 

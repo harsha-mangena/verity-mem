@@ -1100,9 +1100,9 @@ export function loadFixtures(options: LoadOptions): FixtureLoadReport {
       try {
         if (name.endsWith(".jsonl")) {
           files.push(parseFixtureFile(path));
-        } else if (name.endsWith(".json")) {
-          // `traces.json` is the index of the individual trace documents; the
-          // documents themselves are loaded so each trace has its own file.
+        } else if (name.endsWith(".json") && name !== CONFORMANCE_INDEX_FILE) {
+          // The individual trace documents are loaded so each trace has its own
+          // file; the index would otherwise be parsed as an extra, malformed trace.
           const trace = parseConformanceDocument(path, readFileSync(path, "utf8"));
           files.push({
             path,
@@ -1133,13 +1133,21 @@ export function loadFixtures(options: LoadOptions): FixtureLoadReport {
   return { root: options.root, files, failures };
 }
 
-/** Every conformance trace under `fixtures/conformance`, excluding the index file. */
+/**
+ * Every conformance trace under `fixtures/conformance`.
+ *
+ * `traces.json` is the published index of the same ten traces, not an eleventh
+ * trace, so it is skipped by name. The index exists so a replay oracle can be
+ * pointed at the whole set without globbing.
+ */
+export const CONFORMANCE_INDEX_FILE = "traces.json";
+
 export function loadConformanceTraces(root: string): { traces: ConformanceTrace[]; failures: FixtureLoadReport["failures"] } {
   const traces: ConformanceTrace[] = [];
   const failures: { file: string; line: number; code: string; message: string }[] = [];
   const dir = join(root, "conformance");
   for (const name of readdirSync(dir).sort()) {
-    if (!name.endsWith(".json") || name === "traces.json") continue;
+    if (!name.endsWith(".json") || name === CONFORMANCE_INDEX_FILE) continue;
     const path = join(dir, name);
     try {
       traces.push(parseConformanceDocument(path, readFileSync(path, "utf8")));

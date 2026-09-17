@@ -517,5 +517,5 @@ export function stripPrefix(id: string): string {
   ].join("-");
 }
 
-export { DEFAULT_USE_POLICY_VERSION };
+export { DEFAULT_USE_POLICY_VERSION, stalenessHorizonFor };
 export type { EntailmentResult, ClaimRecord };

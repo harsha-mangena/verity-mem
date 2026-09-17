@@ -364,9 +364,20 @@ function conflictStage(runs: readonly FixtureRunResult[], failures: readonly str
   const detectedContradictions = decisions.filter((decision) =>
     decision.conflicts.some((hit) => hit.rel === "contradicts"),
   ).length;
-  const contradictionCases = countAssertions(runs, "expect_conflict", (assertion) =>
-    assertion.detail.includes("contradicts"),
-  );
+  // Counted per contradicting proposition, not per assertion: a fixture that
+  // asserts the same contradiction on two lines is one update case, and counting
+  // the assertion twice produced a recall above 100%, which is how this was caught.
+  const contradictionCases = new Set(
+    runs.flatMap((run) =>
+      run.lines
+        .flatMap((line) => line.assertions.map((assertion) => ({ line, assertion })))
+        .filter(
+          (entry) =>
+            entry.assertion.expectation === "expect_conflict" && entry.assertion.detail.includes("contradicts"),
+        )
+        .map((entry) => `${run.fixture_id}:${entry.line.line_id}:${entry.assertion.detail.split("(")[0] ?? ""}`),
+    ),
+  ).size;
   const relationExpectations = countAssertions(runs, "expect_relation_persisted", () => true);
   const relations = runs.flatMap((run) => run.relations);
   const claims = runs.flatMap((run) => run.claims);
@@ -549,9 +560,16 @@ function operationsStage(
 /**
  * A decision that took an accept path despite a rule that should have blocked it.
  *
- * Derived from the reason codes the gate itself wrote, so this cannot drift from
- * the gate's behaviour in one direction: if the gate starts writing a new blocking
- * code, it belongs in this list, or the unsafe-accept metric understates the risk.
+ * Derived from the reason codes the gate itself wrote, so the metric cannot drift
+ * from the gate's behaviour: a new blocking code belongs in this list, or the
+ * unsafe-accept rate silently understates the risk.
+ *
+ * The scope codes are deliberately absent. `scope.broader_than_event_scope` and
+ * `scope.purpose_broadened` are the reason `accept_limited_scope` exists, and that
+ * outcome is the *correct* answer for a candidate that asked for more than its
+ * evidence covers: the claim is admitted at the evidence's scope rather than the
+ * requested one. Counting it as unsafe would invert the metric — it would penalise
+ * the gate for narrowing, which is the behaviour the whole design is built around.
  */
 export function decisionHasBlockingCode(decision: DecisionRecord): boolean {
   const blocking: readonly string[] = [
@@ -566,8 +584,6 @@ export function decisionHasBlockingCode(decision: DecisionRecord): boolean {
     REASON_CODES.ENTAILMENT_CONTRADICTION,
     REASON_CODES.ENTAILMENT_NEUTRAL,
     REASON_CODES.ENTAILMENT_UNAVAILABLE,
-    REASON_CODES.SCOPE_BROADER_THAN_EVENT,
-    REASON_CODES.SCOPE_PURPOSE_BROADENED,
   ];
   return decision.reason_codes.some((code) => blocking.includes(code));
 }
@@ -610,6 +626,14 @@ export interface ReviewBurden {
   readonly burden: number;
   readonly ceiling: number;
   readonly within_ceiling: boolean;
+  /**
+   * The same rate over writes from fixtures that do not deliberately produce review
+   * items. Reported separately and never substituted for the headline number.
+   */
+  readonly non_adversarial_writes: number;
+  readonly non_adversarial_needing_review: number;
+  readonly non_adversarial_burden: number;
+  readonly non_adversarial_within_ceiling: boolean;
   readonly by_fixture: readonly {
     readonly fixture_id: string;
     readonly writes: number;
@@ -619,6 +643,25 @@ export interface ReviewBurden {
   }[];
 }
 
+/**
+ * How many decisions a fixture deliberately routes into review.
+ *
+ * A fixture whose subject *is* a quarantine path produces review items on purpose,
+ * and folding those into the review-burden metric measures the fixture author
+ * rather than the gate. The suite therefore reports two numbers: the rate over
+ * every write, and the rate over the writes that were not written to require
+ * review. Both are published; neither is presented as the product metric, because
+ * the reference workload is neither population.
+ */
+export function adversarialReviewDecisions(run: FixtureRunResult): number {
+  return run.decisions.filter(
+    (decision) =>
+      decision.reason_codes.includes(REASON_CODES.KIND_PRIVILEGED) ||
+      decision.reason_codes.includes(REASON_CODES.ADMISSION_SENSITIVE) ||
+      decision.reason_codes.includes(REASON_CODES.ADMISSION_EXTERNAL_INSTRUCTION),
+  ).length;
+}
+
 export function reviewBurden(runs: readonly FixtureRunResult[]): ReviewBurden {
   const writes = runs.reduce((sum, run) => sum + run.decisions.length, 0);
   const needing = runs.reduce(
@@ -626,12 +669,25 @@ export function reviewBurden(runs: readonly FixtureRunResult[]): ReviewBurden {
     0,
   );
   const burden = rate(needing, writes);
+
+  const ordinary = runs.filter((run) => adversarialReviewDecisions(run) === 0);
+  const ordinaryWrites = ordinary.reduce((sum, run) => sum + run.decisions.length, 0);
+  const ordinaryNeeding = ordinary.reduce(
+    (sum, run) => sum + run.decisions.filter((decision) => decision.requires_review).length,
+    0,
+  );
+  const ordinaryBurden = rate(ordinaryNeeding, ordinaryWrites);
+
   return {
     writes,
     needing_review: needing,
     burden,
     ceiling: GATE_THRESHOLDS.reviewBurdenCeiling,
     within_ceiling: burden <= GATE_THRESHOLDS.reviewBurdenCeiling,
+    non_adversarial_writes: ordinaryWrites,
+    non_adversarial_needing_review: ordinaryNeeding,
+    non_adversarial_burden: ordinaryBurden,
+    non_adversarial_within_ceiling: ordinaryBurden <= GATE_THRESHOLDS.reviewBurdenCeiling,
     by_fixture: runs.map((run) => {
       const runWrites = run.decisions.length;
       const runReviews = run.decisions.filter((decision) => decision.requires_review).length;

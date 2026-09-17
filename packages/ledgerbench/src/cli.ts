@@ -286,6 +286,12 @@ function printSummary(report: EvaluationReport): void {
       `(ceiling ${(report.review_burden.ceiling * 100).toFixed(0)}%) — ` +
       `${report.review_burden.within_ceiling ? "within ceiling" : "OVER CEILING"}`,
   );
+  lines.push(
+    `  review burden, non-adversarial fixtures only: ` +
+      `${(report.review_burden.non_adversarial_burden * 100).toFixed(1)}% of ` +
+      `${report.review_burden.non_adversarial_writes} writes — ` +
+      `${report.review_burden.non_adversarial_within_ceiling ? "within ceiling" : "OVER CEILING"}`,
+  );
   if (report.targets.checks.some((check) => check.note !== undefined)) {
     lines.push("");
     lines.push("  notes");

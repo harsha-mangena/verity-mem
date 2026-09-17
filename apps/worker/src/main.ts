@@ -158,7 +158,7 @@ export function startWorker(config: WorkerConfig, logger: Logger): WorkerHandle 
     if (tenantIds.length === 0) {
       // Said out loud rather than discovered as a silent, permanent zero. Without a
       // tenant list the claim query cannot be authorized at all (see the port
-      // notice in outbox-runner.ts), so an empty list is a misconfiguration and not
+      // notice in claim-loop.ts), so an empty list is a misconfiguration and not
       // an idle worker.
       logger.warn("worker.no_tenants", {
         detail:
