@@ -60,7 +60,10 @@ async function createHarness(label: string, overrides: Partial<Record<string, st
   // Seeded so a failure is reproducible from the label, but salted per harness: the
   // ledger's primary keys are the generated event ids, and two harnesses sharing a
   // seed would collide on the first append rather than on anything interesting.
-  const ids = seededIds(`server-${label}-${randomUUID().slice(0, 8)}`);
+  // Salted per harness: the ledger's primary keys *are* the generated event and claim
+  // ids, so two harnesses sharing a seed collide on the first append. The label stays
+  // in the seed so a failing id is still recognisable in a log line.
+  const ids = seededIds(`server-${label}-${randomUUID()}`);
   const ledger = new Ledger({ db, blobs, clock, ids });
   const tenant = probeTenant(label);
 
@@ -95,8 +98,10 @@ async function createHarness(label: string, overrides: Partial<Record<string, st
     config,
     tenant,
     tenantId: resolveTenantId(tenant),
-    agentToken: "test-agent-token",
-    adminToken: "test-admin-token",
+    // The secrets actually configured, not the defaults: a test that overrode them
+    // and then presented the default would be testing an unauthenticated request.
+    agentToken: overrides["AGENT_TOKEN"]?.slice(overrides["AGENT_TOKEN"].lastIndexOf(":") + 1) ?? "test-agent-token",
+    adminToken: overrides["ADMIN_TOKEN"]?.slice(overrides["ADMIN_TOKEN"].lastIndexOf(":") + 1) ?? "test-admin-token",
     project: "payments",
     user: "alice",
     purposes: ["release_planning"],
@@ -632,7 +637,6 @@ describe("veritymem server", () => {
       headers: agentAuth(h),
     });
     const candidateId = (explained.json() as { candidate: { candidate_id: string } }).candidate.candidate_id;
-    console.log("DIAG explained:", explained.statusCode, "candidateId:", candidateId, JSON.stringify(explained.json()).slice(0, 200));
 
     const contributor = await h.app.inject({
       method: "POST",

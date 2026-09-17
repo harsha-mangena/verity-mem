@@ -56,10 +56,17 @@ V01_TARGETS: tuple[tuple[str, str], ...] = (
 
 def stage_table(stages: Sequence[StageResult]) -> list[dict[str, object]]:
     """One row per expected stage, including the ones the run did not report."""
-    by_name = {stage.stage: stage for stage in stages}
+    # Matched case- and separator-insensitively. The runner publishes the
+    # specification's capitalisation ("Action gate") while its internal id is a
+    # slug ("action_gate"); matching exactly would render every stage as missing,
+    # which reads as a catastrophic run rather than a naming mismatch.
+    def normalise(value: str) -> str:
+        return value.strip().lower().replace("_", " ").replace("-", " ")
+
+    by_name = {normalise(stage.stage): stage for stage in stages}
     rows: list[dict[str, object]] = []
     for name in EXPECTED_STAGES:
-        stage = by_name.get(name)
+        stage = by_name.get(normalise(name))
         if stage is None:
             rows.append(
                 {
@@ -74,7 +81,7 @@ def stage_table(stages: Sequence[StageResult]) -> list[dict[str, object]]:
             continue
         rows.append(
             {
-                "stage": stage.stage,
+                "stage": name,
                 "status": stage.status,
                 "failure_isolated": stage.failure_isolated,
                 "cases": stage.cases,
@@ -149,6 +156,7 @@ def summarise(run: BenchmarkRun) -> dict[str, object]:
         },
         "stages": stages,
         "targets": targets,
+        "unmeasured": list(run.unmeasured),
         "summary": {
             "stages_measured": len(EXPECTED_STAGES) - len(unmeasured_stages),
             "stages_unmeasured": unmeasured_stages,
@@ -265,8 +273,21 @@ def load_run(payload: dict[str, object]) -> BenchmarkRun:
             )
         )
 
+    # Two arrangements for the targets, and the file's own shape decides which it is.
+    # The runner publishes a flat `published_targets` list for exactly this consumer
+    # and keeps the richer `targets.checks` for callers that need the stage each
+    # target is measured through. Deciding by presence rather than by filename means
+    # a future rename cannot silently produce a report with no targets in it.
+    targets_raw = payload.get("published_targets")
+    if targets_raw is None:
+        nested = payload.get("targets")
+        if isinstance(nested, dict):
+            targets_raw = nested.get("checks") or nested.get("published") or []
+        else:
+            targets_raw = nested or []
+
     targets: list[TargetResult] = []
-    for raw in payload.get("targets", []) or []:  # type: ignore[union-attr]
+    for raw in targets_raw:  # type: ignore[union-attr]
         assert isinstance(raw, dict)
         targets.append(
             TargetResult(

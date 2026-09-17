@@ -142,6 +142,8 @@ async function main(): Promise<number> {
     const runs: Awaited<ReturnType<FixtureRunner["run"]>>[] = [];
     const paths: string[] = [];
     const failures: string[] = [];
+    /** Parsed fixtures by id, so a failure can be matched to its declaration. */
+    const fixturesById = new Map<string, ReturnType<typeof loadFixtures>["files"][number]>();
 
     if (!options.conformanceOnly) {
       const report = loadFixtures({
@@ -159,6 +161,7 @@ async function main(): Promise<number> {
       }
       for (const fixture of report.files) {
         if (fixture.header.suite === ("conformance" as unknown as Suite)) continue;
+        fixturesById.set(fixture.header.fixture_id, fixture);
         const result = await runner.run(fixture);
         runs.push(result);
         paths.push(fixture.path);
@@ -207,9 +210,37 @@ async function main(): Promise<number> {
       process.stdout.write(`raw traces: ${options.jsonl}\n`);
     }
 
-    const assertionFailures = runs.reduce((sum, run) => sum + run.assertions_failed, 0);
+    // A failure the fixture declares as a known unmet requirement is still a
+    // failure and still counted in the metrics; it just does not fail the build.
+    // The alternative — treating every declared gap as a passing check — would hide
+    // the gap, and the alternative to *that* — failing on it forever — gets the gate
+    // disabled, which is worse.
+    const undeclared = runs.flatMap((run) =>
+      run.lines.flatMap((line) =>
+        line.assertions
+          .map((assertion, index) => ({ assertion, index }))
+          .filter(({ assertion }) => assertion.status === "fail")
+          .filter(({ index }) => {
+            const fixture = fixturesById.get(run.fixture_id);
+            const declared = fixture?.body.find((entry) => entry.line_id === line.line_id);
+            return declared?.expect[index]?.gap !== true;
+          })
+          .map(({ assertion }) => `${run.fixture_id}:${line.line_id} ${assertion.expectation}`),
+      ),
+    );
+    const declaredGaps = runs.reduce((sum, run) => sum + run.assertions_failed, 0) - undeclared.length;
     const conformanceFailures = conformance?.required_checks_failed ?? 0;
-    return assertionFailures + conformanceFailures > 0 ? 1 : 0;
+    if (declaredGaps > 0) {
+      process.stdout.write(
+        `\n  ${declaredGaps} assertion(s) failed against requirements the fixtures declare as known gaps; ` +
+          `they are reported above and counted in the metrics, and they do not fail this build.\n`,
+      );
+    }
+    if (undeclared.length > 0) {
+      process.stderr.write(`\nundeclared failures (${undeclared.length}):\n`);
+      for (const entry of undeclared) process.stderr.write(`  ${entry}\n`);
+    }
+    return undeclared.length + conformanceFailures > 0 ? 1 : 0;
   } finally {
     await runner.close();
   }

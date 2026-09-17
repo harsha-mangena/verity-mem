@@ -37,6 +37,7 @@ import {
   type StorePutReceipt,
 } from "./store.ts";
 
+/** How the string-keyed store is wired. See `ClaimBackedStoreOptions` for `dimensions`. */
 export interface VerityMemLangChainStoreOptions {
   readonly client: VerityApiClient;
   readonly dimensions?: readonly ScopeDimension[];

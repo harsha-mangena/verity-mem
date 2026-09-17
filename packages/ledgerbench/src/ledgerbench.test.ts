@@ -34,6 +34,12 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = resolve(HERE, "../../../fixtures");
 const MALICIOUS = join(FIXTURES, "ledgerbench/08_malicious_procedure.jsonl");
 
+/**
+ * A runner owns one tenant for its lifetime, and the ledger is append-only, so a
+ * second `run` on the same runner re-enters a world that already holds the first
+ * run's rows. Every test that needs a clean world builds its own runner; this one
+ * exists for the suite-level checks that tolerate a populated tenant.
+ */
 let runner: FixtureRunner;
 
 before(() => {
@@ -299,10 +305,15 @@ describe("running fixtures against the real database", () => {
 
   it("runs the whole ledgerbench, poisoning and deletion suites with only the documented gaps failing", async () => {
     const report = loadFixtures({ root: FIXTURES });
+    const suiteRunner = new FixtureRunner({ seed: 1 });
     const runs: FixtureRunResult[] = [];
-    for (const fixture of report.files) {
-      if ((fixture.header.suite as string) === "conformance") continue;
-      runs.push(await runner.run(fixture));
+    try {
+      for (const fixture of report.files) {
+        if ((fixture.header.suite as string) === "conformance") continue;
+        runs.push(await suiteRunner.run(fixture));
+      }
+    } finally {
+      await suiteRunner.close();
     }
     assert.equal(runs.length, 18, `expected 18 fixture files, ran ${runs.length}`);
 
@@ -385,9 +396,10 @@ describe("running fixtures against the real database", () => {
     // Two runners, not two calls on one: each runner owns a fresh tenant because the
     // ledger is append-only, and a second run inside the same tenant would inherit
     // the first run's rows rather than re-derive them.
-    const first = await runner.run(fixture);
+    const one = new FixtureRunner({ seed: 1 });
     const other = new FixtureRunner({ seed: 1 });
     try {
+      const first = await one.run(fixture);
       const second = await other.run(fixture);
       const render = (run: FixtureRunResult) =>
         run.decisions.map(
@@ -397,6 +409,7 @@ describe("running fixtures against the real database", () => {
       assert.ok(first.decisions.length > 0, "the fixture must produce a decision to compare");
       assert.deepEqual(render(second), render(first), "the gate must be a function of its inputs");
     } finally {
+      await one.close();
       await other.close();
     }
   });
@@ -404,7 +417,9 @@ describe("running fixtures against the real database", () => {
   it("runs the ten conformance traces and reports the unimplemented requirements", async () => {
     const { traces } = loadConformanceTraces(FIXTURES);
     const { runConformance } = await import("./conformance.ts");
-    const conformance = await runConformance(traces, runner);
+    const conformanceRunner = new FixtureRunner({ seed: 1 });
+    const conformance = await runConformance(traces, conformanceRunner);
+    await conformanceRunner.close();
     assert.equal(conformance.traces.length, 10);
     for (const trace of conformance.traces) {
       assert.ok(

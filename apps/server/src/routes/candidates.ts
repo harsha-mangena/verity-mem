@@ -106,7 +106,6 @@ export function registerCandidateRoutes(app: FastifyInstance, options: Candidate
           stripPrefix(params.candidate_id),
         ]);
         const candidate = found.rows[0];
-        console.log("DIAGROUTE", JSON.stringify({ id: params.candidate_id, stripped: stripPrefix(params.candidate_id), rows: found.rows.length }));
         // Not visible and not existing are the same answer. `claim_candidates` is
         // under row-level security, so a candidate in a scope the caller cannot
         // reach simply is not in this result set.
@@ -229,7 +228,6 @@ export function registerCandidateRoutes(app: FastifyInstance, options: Candidate
           stripPrefix(params.candidate_id),
         ]);
         const candidate = found.rows[0];
-        console.log("DIAGDECIDE", JSON.stringify({ id: params.candidate_id, stripped: stripPrefix(params.candidate_id), rows: found.rows.length }));
         if (!candidate) return null;
 
         const spans = await executor.query<{

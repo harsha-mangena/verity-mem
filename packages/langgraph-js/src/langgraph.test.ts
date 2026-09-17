@@ -130,10 +130,12 @@ function createHarness(initial: { readonly packet?: MemoryPacket; readonly verdi
   };
 
   harness.on("/v1/query", () => ({ payload: initial.packet ?? makePacket() }));
+  // `GET /v1/claims/{id}` answers with the documented envelope, not a bare record —
+  // this stub mirrors apps/server, so a wire-shape change fails the suite here.
   harness.on("/v1/claims/", () =>
     initial.claim === null
       ? { status: initial.claimStatus ?? 404, payload: { code: "not_found", message: "no such claim" } }
-      : { payload: initial.claim ?? makeClaimRecord() },
+      : { payload: { claim: initial.claim ?? makeClaimRecord(), relations: [] } },
   );
   harness.on("/v1/actions/gate", () => ({ payload: initial.verdict ?? allowedVerdict() }));
   harness.on("/v1/events", () => ({
@@ -666,6 +668,18 @@ describe("ClaimBackedStore over the REST surface", () => {
     assertNoPrivilegedRoutes(harness.requests);
   });
 
+  it("refuses a claim read whose body is not the documented envelope", async () => {
+    const harness = createHarness();
+    // A bare record where the route documents `{ claim, relations }`: casting it would
+    // produce an item with no id, no scope and no status — a claim that reads as real.
+    harness.on("/v1/claims/", () => ({ payload: makeClaimRecord() }));
+    const store = new ClaimBackedStore({ client: harness.client });
+    await assert.rejects(
+      () => store.get(["tenant:acme", "user:alice", "purpose:release_planning"], CLAIM_ID),
+      /without a `claim` field/,
+    );
+  });
+
   it("refuses delete, enumeration and reads by proposal key without touching the network", async () => {
     const harness = createHarness();
     const store = new ClaimBackedStore({ client: harness.client });
@@ -761,12 +775,14 @@ describe("ClaimBackedStore over the REST surface", () => {
           { namespace: ["tenant:acme", "user:alice", "purpose:release_planning"], key: CLAIM_ID, value: null },
         ] as unknown as readonly StoreOperation[]),
       (error: unknown) => {
-        assert.ok(error instanceof AggregateError);
-        assert.ok(error.errors[0] instanceof StoreOperationRefusedError);
+        // A single-operation batch rethrows the operation's own error, so the refusal
+        // stays typed for the callers that only ever send one operation.
+        assert.ok(error instanceof StoreOperationRefusedError);
+        assert.equal(error.code, "delete");
         return true;
       },
     );
-    assert.deepEqual(harness.requests, [], "a deletion signal must not become an event");
+    assert.equal(harness.requests.length, 0, "a deletion signal must not become an event");
   });
 });
 

@@ -26,6 +26,29 @@ export interface OutboxProcessor {
   handle(message: OutboxMessage): Promise<void>;
 }
 
+/**
+ * Normalise a claimed payload to an object.
+ *
+ * Returns an empty object for anything unusable, which the binding guard then rejects
+ * with its own message — a payload that cannot be parsed is a message that cannot be
+ * processed, and saying so is better than a cast that fails later and elsewhere.
+ */
+export function parsePayload(value: unknown): Record<string, unknown> {
+  if (value === null || value === undefined) return {};
+  if (typeof value === "string") {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : {};
+    } catch {
+      return {};
+    }
+  }
+  if (typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+  return {};
+}
+
 export interface OutboxRunSummary {
   readonly claimed: number;
   readonly completed: number;
@@ -82,14 +105,37 @@ export function bindingFor(message: OutboxMessage): {
   };
 }
 
+export interface OutboxWorkerOptions {
+  /**
+   * Tenants this worker serves.
+   *
+   * `null` means every tenant, which is right for a single-tenant deployment and for
+   * an operator draining the queue, and is the honest way to say "I do not know which
+   * tenants exist yet". An empty array is rejected: a worker configured with no
+   * tenants would claim nothing and look exactly like an idle one.
+   *
+   * This exists because a global claim is wrong in both directions — it takes work
+   * belonging to another deployment, and a backlog in one tenant starves every other
+   * tenant behind it in queue order.
+   */
+  readonly tenants?: readonly string[] | null;
+}
+
 export class OutboxWorker {
   private readonly db: Db;
   private readonly processors = new Map<string, OutboxProcessor>();
   private readonly id = workerId();
+  private readonly tenants: readonly string[] | null;
   private stopping = false;
 
-  constructor(db: Db, processors: readonly OutboxProcessor[] = []) {
+  constructor(db: Db, processors: readonly OutboxProcessor[] = [], options: OutboxWorkerOptions = {}) {
     this.db = db;
+    this.tenants = options.tenants ?? null;
+    if (this.tenants !== null && this.tenants.length === 0) {
+      throw new Error(
+        "OutboxWorker was given an empty tenant list; pass undefined to claim from every tenant",
+      );
+    }
     for (const processor of processors) {
       this.processors.set(processor.kind, processor);
     }
@@ -133,6 +179,21 @@ export class OutboxWorker {
     return { claimed: claimed.length, completed, failed, kinds };
   }
 
+  /**
+   * Claim pending messages.
+   *
+   * Goes through `veritymem.outbox_claim`, a SECURITY DEFINER function, and not
+   * through a plain UPDATE. Migration 0009 enabled row-level security on `outbox`
+   * with a tenant policy, and claiming is legitimately cross-tenant — the worker must
+   * find work before it knows which tenant the work belongs to — so an unbound
+   * connection matches nothing under that policy. The previous implementation used
+   * `systemQuery`, which is *not* a bypass (it holds a rollback and `RESET ALL`, not
+   * owner rights), and the result was a worker that claimed nothing, forever, while
+   * reporting itself healthy.
+   *
+   * A queue a worker cannot read is worse than a queue with no policy, because the
+   * failure is invisible.
+   */
   private async claim(limit: number): Promise<OutboxMessage[]> {
     const result = await this.db.systemQuery<{
       outbox_id: number;
@@ -140,36 +201,23 @@ export class OutboxWorker {
       kind: string;
       payload: Record<string, unknown>;
       attempts: number;
-    }>(
-      `UPDATE outbox
-          SET locked_by = $1, locked_at = now(), attempts = attempts + 1
-        WHERE outbox_id IN (
-                SELECT outbox_id FROM outbox
-                 WHERE completed_at IS NULL
-                   AND available_at <= now()
-                   AND attempts < max_attempts
-                 ORDER BY outbox_id ASC
-                 FOR UPDATE SKIP LOCKED
-                 LIMIT $2
-              )
-      RETURNING outbox_id, tenant_id, kind, payload, attempts`,
-      [this.id, limit],
-    );
+    }>(`SELECT * FROM veritymem.outbox_claim($1, $2, $3::uuid[])`, [this.id, limit, this.tenants]);
     return result.rows.map((row) => ({
       outbox_id: Number(row.outbox_id),
       tenant_id: row.tenant_id,
       kind: row.kind,
-      payload: row.payload,
+      // A `JSONB` column normally arrives parsed, but a `RETURNS TABLE` over
+      // `SELECT * FROM fn()` can arrive as text depending on how the driver infers the
+      // column type. Tolerating both here is deliberate: without it the
+      // missing-scope guard fires on a row whose scope is present, and every message
+      // fails with an error about the wrong thing.
+      payload: parsePayload(row.payload),
       attempts: Number(row.attempts),
     }));
   }
 
   private async complete(outboxId: number): Promise<void> {
-    await this.db.systemQuery(
-      `UPDATE outbox SET completed_at = now(), locked_by = NULL, locked_at = NULL
-        WHERE outbox_id = $1`,
-      [outboxId],
-    );
+    await this.db.systemQuery(`SELECT veritymem.outbox_complete($1)`, [outboxId]);
   }
 
   /**
@@ -179,16 +227,24 @@ export class OutboxWorker {
    */
   private async fail(message: OutboxMessage, error: unknown): Promise<void> {
     const message_text = error instanceof Error ? error.message : String(error);
-    const backoffSeconds = Math.min(300, 2 ** Math.min(message.attempts, 8));
-    await this.db.systemQuery(
-      `UPDATE outbox
-          SET last_error = $2,
-              locked_by = NULL,
-              locked_at = NULL,
-              available_at = now() + ($3 || ' seconds')::interval
-        WHERE outbox_id = $1`,
-      [message.outbox_id, message_text.slice(0, 2000), String(backoffSeconds)],
+    // The backoff is computed inside the database function, so two workers cannot
+    // disagree about it and a caller cannot schedule an immediate retry loop.
+    await this.db.systemQuery(`SELECT veritymem.outbox_fail($1, $2)`, [message.outbox_id, message_text]);
+  }
+
+  /**
+   * Projection lag: pending messages, optionally for one tenant.
+   *
+   * Read through the privileged function for the same reason the claim is: a count
+   * taken under the tenant policy on an unbound connection is always zero, and a lag
+   * metric that always reads zero is worse than no metric because it looks healthy.
+   */
+  async lag(tenantId?: string): Promise<number> {
+    const result = await this.db.systemQuery<{ lag: number }>(
+      `SELECT veritymem.outbox_lag($1::uuid) AS lag`,
+      [tenantId ?? null],
     );
+    return Number(result.rows[0]?.lag ?? 0);
   }
 
   /** Drain until empty or stopped. Used by the worker process and by tests. */

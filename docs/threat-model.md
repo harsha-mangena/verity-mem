@@ -998,3 +998,62 @@ The residual exposure is unchanged and worth restating: this protects the *packe
 rendering path. It does not protect a caller that builds its own prompt from the
 packet's fields, and nothing in the system can prevent that — which is why the
 adapter contract says to pass the packet, not snippets.
+
+
+---
+
+# Addendum 3 — two defects found by the worker and reference-workload agents
+
+## 1. The outbox worker could not claim a single message (fixed)
+
+Migration 0009 enabled row-level security on `outbox` with a tenant policy. That was
+correct in principle — the queue carries `payload.scope_ids` and `payload.purposes`,
+and before 0009 an unbound connection could read every tenant's queue — but it broke
+the claim path, and the failure was invisible:
+
+- `OutboxWorker.claim/complete/fail` used `Db.systemQuery`, which is **not** a bypass.
+  It holds a rollback and `RESET ALL`, not owner rights, so it is subject to the same
+  policies as any other connection. With no request context bound,
+  `current_tenant_id()` is NULL, the policy is FALSE, and the claim matched zero rows.
+- The worker therefore claimed nothing, completed nothing and failed nothing, forever,
+  while reporting itself healthy. Measured on the live database: **5,531 pending rows,
+  all invisible**, `runOnce(5)` returning `{claimed: 0}`.
+- A queue a worker cannot read is worse than a queue with no policy, because the
+  failure is invisible.
+
+Fixed in migrations 0011 and 0012 with `veritymem.outbox_claim/complete/fail/lag`,
+`SECURITY DEFINER`, plus a tenant parameter so a worker claims its own tenants rather
+than the head of a global queue. `packages/ledger/src/outbox.test.ts` now asserts a
+claim actually happens, which is the assertion whose absence allowed this.
+
+**Residual exposure, stated rather than implied:** the app role can now read the queue
+rows it claims, including `payload.chain_input`, the preimage of `events.link_hash`. A
+reader with the app credential can therefore *recompute* a chain link for an event it
+can name. It cannot write one — `events` is append-only and `link_hash` is immutable by
+trigger — so this is a verification capability, not a forgery capability, and anyone who
+can read the event could already verify its link.
+
+## 2. Cross-user isolation did not exist inside a project (fixed)
+
+`veritymem.scope_contains` (migration 0007) is deliberately directional: a caller
+unbound on a dimension reaches any binding of it. So a project-scoped membership
+contains every user scope in that project — intended, and a project-wide operator
+depends on it.
+
+The hole was in `resolveScopes`, which treated a scope binding *no* user as satisfying a
+selector that named one. A principal whose only membership was project-wide therefore
+resolved to the project scope, the directional rule reached every user in it, and
+`user:bob` received `user:alice`'s claims. **Naming yourself did not narrow anything**,
+because the project scope binds no user and so matched the requirement. An isolation
+control the caller cannot tighten by being specific is not an isolation control, and
+`evaluateAction` inherited the same reach.
+
+Fixed in `packages/retrieval/src/planner.ts`: a bound selector dimension is now a
+*requirement* — the scope must bind the same value, and NULL is not a match — with exact
+matches preferred over the wider fallback. `packages/retrieval/src/isolation.test.ts`
+asserts both directions, including the one that is supposed to keep working: a
+project-wide principal still reaches the users in its project.
+
+**Why the existing tests missed it:** they asserted that a project-scoped caller reaches
+the project's users, which is true, and never asserted the converse. A suite can only
+find the direction it looks in.

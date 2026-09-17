@@ -24,6 +24,7 @@ import { NamespaceMappingError } from "./errors.ts";
 /** Every dimension of a VerityMem scope, in canonical order. */
 export const SCOPE_DIMENSIONS = ["tenant", "project", "user", "agent", "session", "purpose"] as const;
 
+/** One dimension of a scope. A namespace segment names one of these, never a combination. */
 export type ScopeDimension = (typeof SCOPE_DIMENSIONS)[number];
 
 /**
@@ -35,9 +36,12 @@ export type ScopeDimension = (typeof SCOPE_DIMENSIONS)[number];
  */
 export const BOUND_DIMENSIONS = ["project", "user", "agent", "session"] as const;
 
+/** A dimension that narrows a scope below the tenant. At least one must be present. */
 export type BoundDimension = (typeof BOUND_DIMENSIONS)[number];
 
+/** Required on every namespace: a read that does not name a tenant is not ambiguous, it is wrong. */
 export const TENANT_DIMENSION = "tenant" as const;
+/** Required on every namespace, and repeatable: a scope admitted for two purposes names both. */
 export const PURPOSE_DIMENSION = "purpose" as const;
 
 /** Separates a dimension name from its value inside one namespace segment. */
@@ -85,6 +89,12 @@ export interface StoreScopePrefix {
   readonly purpose?: readonly string[];
 }
 
+/**
+ * How a codec is configured.
+ *
+ * Optional because the named-segment form needs no configuration, and a codec with no
+ * declared positional order refuses bare namespaces rather than guessing one.
+ */
 export interface NamespaceCodecOptions {
   /**
    * Dimension order used to read namespaces written as bare positional values
@@ -94,6 +104,13 @@ export interface NamespaceCodecOptions {
   readonly dimensions?: readonly ScopeDimension[];
 }
 
+/**
+ * The namespace rules as a value.
+ *
+ * A value rather than a convention so that two codecs with different dimension orders
+ * cannot read each other's data silently, and so the rules can be asserted in a test
+ * with no store, no graph and no peer installed.
+ */
 export interface NamespaceCodec {
   /** The positional order this codec accepts for bare namespaces. */
   readonly dimensions: readonly ScopeDimension[];
@@ -133,11 +150,17 @@ export function createNamespaceCodec(options: NamespaceCodecOptions = {}): Names
     },
     toScope(namespace: readonly string[]): StoreScope {
       const decoded = decode(namespace, dimensions);
-      return {
+      const scope: StoreScope = {
         tenant: requireDimension(decoded, TENANT_DIMENSION, namespace),
         ...optionalDimensions(decoded),
         purpose: requirePurposes(decoded, namespace),
       };
+      // The same rule migration 0001 applies to the `scopes` table: a scope that binds
+      // nothing is a tenant-wide scope in disguise. Enforced here so a write fails
+      // before it reaches the ledger, and so a read cannot address a scope that cannot
+      // exist.
+      assertAtLeastOneBoundDimension(scope, namespace);
+      return scope;
     },
     toScopePrefix(namespace: readonly string[]): StoreScopePrefix {
       const decoded = decode(namespace, dimensions);

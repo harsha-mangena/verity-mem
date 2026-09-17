@@ -58,6 +58,18 @@ export interface EvaluationReport {
   readonly stages: readonly StageResult[];
   readonly review_burden: ReviewBurden;
   readonly targets: TargetsReport;
+  /**
+   * The exit targets as the published report consumes them.
+   *
+   * `python/evals` reads a flat list of `{name, target, observed, passes, note}` at
+   * this key, because that is the shape a report renders from. The richer
+   * `targets.checks` stays for callers that need the stage a target is measured
+   * through, and the two are derived from the same evaluation so they cannot
+   * disagree.
+   */
+  readonly published_targets: TargetsReport["published"];
+  /** What the run could not measure, so a gap is visible before any number. */
+  readonly unmeasured: readonly string[];
   readonly conformance: ConformanceReport | null;
   readonly runs: readonly FixtureRunResult[];
   readonly unknown_reason_codes: readonly string[];
@@ -163,6 +175,18 @@ export function buildReport(input: BuildReportInput): EvaluationReport {
     stages,
     review_burden: burden,
     targets,
+    published_targets: targets.published,
+    unmeasured: [
+      ...unimplementedStages.map(
+        (stage) => `${stage}: not implemented in this build, so its metrics are unmeasured rather than zero`,
+      ),
+      ...(notEvaluated > 0
+        ? [`${notEvaluated} fixture expectation(s) could not be evaluated against this build`]
+        : []),
+      ...targets.checks
+        .filter((check) => !check.measurable)
+        .map((check) => `${check.id}: ${check.blocked_by ?? "no measurement path"}`),
+    ],
     conformance: input.conformance,
     runs: input.runs,
     unknown_reason_codes: unknownReasonCodes(input.runs),

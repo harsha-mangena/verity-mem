@@ -32,7 +32,7 @@ import { fixedClock, loadEnv, seededIds } from "@veritymem/ledger";
 import { DEFAULT_COMMIT_POLICY, GATE_THRESHOLDS } from "@veritymem/contracts";
 import { createNarrative, percent } from "./narrative.ts";
 import { runReferenceWorkload, type ReferenceRun } from "./scenario.ts";
-import { PROJECT_PURPOSES, createRunnerDriver, createWorld } from "./world.ts";
+import { PROJECT_PURPOSES, createEmbeddings, createRunnerDriver, createWorld } from "./world.ts";
 
 /** The clock every run starts from. Changing it changes every age in the output. */
 export const REFERENCE_CLOCK_START = "2026-09-01T09:00:00.000Z";
@@ -115,9 +115,12 @@ export async function runDemo(options: DemoOptions): Promise<ReferenceRun> {
     // and drives them through the same claim loop. `pnpm demo` therefore exercises
     // the worker's code, and a reviewer who wants the out-of-process variant starts
     // `pnpm dev:worker` with WORKER_TENANT_SLUGS set to the tenant printed above.
+    // One embeddings instance for the driver and the reader. Two instances with
+    // different model ids is the silence described in world.ts.
+    const embeddings = createEmbeddings();
     const result = await runReferenceWorkload(world, {
-      driver: createRunnerDriver(world),
-      embeddingModelId: "hash-ngram-v1",
+      driver: createRunnerDriver(world, embeddings),
+      embeddings,
       policyVersion: DEFAULT_COMMIT_POLICY.version,
       ...(narrate
         ? { onStep: (step) => narrative.step(step.step, step.name, step.detail) }
@@ -130,9 +133,30 @@ export async function runDemo(options: DemoOptions): Promise<ReferenceRun> {
       narrative.raw(`  human approval accepted:            ${result.approval.claim_id ?? "(none)"} (${result.approval.authority ?? "n/a"})`);
       narrative.raw(`  hostile procedure accepted:         ${result.hostile.accepted_claims.length === 0 ? "no — quarantined" : "YES (defect)"}`);
       narrative.raw(
-        `  cross-user isolation:               ${result.isolation.teammate_claims === 0 ? "0 claims for the teammate" : `${result.isolation.teammate_claims} returned (LEAK)`}` +
-          `; teammate still reaches project scope: ${result.isolation.teammate_reaches_project_scope ? "yes" : "no (probe vacuous)"}`,
+        `  isolation, same project:            teammate returned ${result.isolation.same_project.claims_returned.length} claim(s); ` +
+          `reached another principal's claim: ${result.isolation.same_project.reached_other_principals_claim ? "YES (boundary not enforced)" : "no"}`,
       );
+      narrative.raw(
+        `  isolation, second project:          teammate returned ${result.isolation.cross_project.claims_returned.length} claim(s); ` +
+          `reached another project's claim: ${result.isolation.cross_project.reached_other_principals_claim ? "YES (LEAK)" : "no"} ` +
+          `(missing: ${result.isolation.cross_project.missing.length})`,
+      );
+      narrative.raw(
+        "  The first line is the probe the specification asks for and it reports a real",
+      );
+      narrative.raw(
+        "  gap: within one project there is no per-user boundary, because scope",
+      );
+      narrative.raw(
+        "  containment treats an unbound dimension as reaching every binding of it.",
+      );
+      narrative.raw(
+        "  `scope.within_event_scope` still holds at promotion time, and purposes, tenant",
+      );
+      narrative.raw(
+        "  and project are enforced. apps/reference-dev-agent/README.md has the mechanism",
+      );
+      narrative.raw("  and the two candidate fixes.");
       narrative.raw(`  contradiction detected:             ${result.contradiction.reason_codes.includes("conflict.contradicts_accepted") ? "yes — needs_review" : "no (defect)"}`);
       narrative.raw(`  correction history readable:        ${result.correction.readable_after_supersession ? "yes" : "no (defect)"}; current-time query returns it: ${result.correction.in_current_query ? "yes (defect)" : "no"}`);
       narrative.raw(`  retention residual matches:         ${result.retention.residual_matches} per ${result.retention.residual_scan.length} stores (${result.retention.status})`);

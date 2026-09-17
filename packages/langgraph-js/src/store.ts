@@ -99,6 +99,12 @@ export interface StorePutReceipt {
   readonly key: string;
 }
 
+/**
+ * One store operation.
+ *
+ * The `type` discriminant is this package's; {@link normalizeOperation} also accepts the
+ * peer's own operation objects, which are distinguished by their fields instead.
+ */
 export type StoreOperation =
   | { readonly type: "get"; readonly namespace: readonly string[]; readonly key: string }
   | {
@@ -117,6 +123,7 @@ export type StoreOperation =
     }
   | { readonly type: "list_namespaces" };
 
+/** The result type for one operation, so a typed batch returns a typed tuple. */
 export type StoreOperationResult<Op> = Op extends { readonly type: "get" }
   ? StoreItem | undefined
   : Op extends { readonly type: "put" }
@@ -129,6 +136,7 @@ export type StoreOperationResult<Op> = Op extends { readonly type: "get" }
           ? string[][]
           : never;
 
+/** Results positionally aligned with the operations that produced them. */
 export type StoreOperationResults<Ops extends readonly StoreOperation[]> = {
   -readonly [K in keyof Ops]: StoreOperationResult<Ops[K]>;
 };
@@ -144,12 +152,24 @@ export const STORE_SEARCH_FILTERS = [
   "offset",
 ] as const;
 
+/**
+ * What a search may constrain.
+ *
+ * Deliberately small: every key here is one the store either honours or refuses, because
+ * a filter that is silently ignored returns more than the caller asked for.
+ */
 export interface SearchOptions {
   readonly filter?: Readonly<Record<string, unknown>>;
   readonly limit?: number;
   readonly offset?: number;
 }
 
+/**
+ * How the store is wired.
+ *
+ * `dimensions` is the only option with a security consequence: it declares the positional
+ * order accepted for bare namespaces, and a different order addresses different data.
+ */
 export interface ClaimBackedStoreOptions {
   readonly client: VerityApiClient;
   /**
@@ -221,7 +241,10 @@ export class ClaimBackedStore {
 
     let claim: ClaimRecord;
     try {
-      claim = await this.client.getClaim(key);
+      // The route answers with `{ claim, relations }`; the relations are already
+      // folded into the record's own `conflicts`, so the envelope is unwrapped here
+      // and the rest of this class speaks in claims.
+      claim = (await this.client.getClaim(key)).claim;
     } catch (error) {
       // "Does not exist" and "not visible to you" are the same answer, because the
       // store must not become an existence oracle for claims the caller cannot read.

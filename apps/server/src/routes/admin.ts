@@ -43,7 +43,7 @@ import {
   type ForgetManifest,
 } from "@veritymem/retrieval";
 import { requireAdminTool } from "../auth.ts";
-import { resolveCallerTenant, tenantFromCredential } from "../context.ts";
+import { resolveCallerTenant, tenantFromCredential, withWriteContext } from "../context.ts";
 import type { ServerDeps } from "../config.ts";
 import { ApiError, notFound } from "../errors.ts";
 import { stripPrefix } from "../views.ts";
@@ -249,7 +249,15 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
         outcome.job_id,
       );
 
-      await reply.code(201).send(job ?? manifestToJob(outcome.manifest, outcome.job_id, context.tenant, body));
+      // The contract's `tenant` is the slug the API addresses tenants by. `forget()`
+      // and `readRetentionJob()` work in UUIDs, so the slug is restored here rather
+      // than at each call: a client should never see a UUID in a field that takes a
+      // slug everywhere else.
+      await reply.code(201).send(
+        job
+          ? { ...job, tenant: context.tenant }
+          : manifestToJob(outcome.manifest, outcome.job_id, context.tenant, body),
+      );
     },
   );
 
@@ -276,7 +284,7 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
         params.job_id,
       );
       if (!job) throw notFound("retention job");
-      await reply.code(200).send(job);
+      await reply.code(200).send({ ...job, tenant: context.tenant });
     },
   );
 
@@ -304,105 +312,109 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
       const started = Date.now();
       const mode = body.mode ?? "verify";
       // Annotated because the fallback array would otherwise widen to `string[]`, and
-      // the `includes` checks below would stop being checked against the closed set of
+      // the `has` checks below would stop being checked against the closed set of
       // projection names.
       //
-      // These names are the contract's, and they used to be different ones here:
-      // `search` and `embeddings` described the *shape* of the store rather than the
-      // projection, and the same two projections were called `lexical` and `dense` in
-      // `@veritymem/retrieval` and in `packages/contracts/src/claim.ts`. Two
-      // vocabularies for one concept is how a request that names a real projection gets
-      // rejected by a route that has never heard of it, so there is now one set of
-      // names and it is the contract's.
-      const wanted = new Set<"dense" | "lexical" | "entities">(
-        body.projections ?? ["dense", "lexical", "entities"],
+      // The names are the contract's: `search` is the trigger-maintained lexical
+      // projection, `embeddings` is the pgvector projection, `entities` is alias
+      // resolution. `@veritymem/retrieval` calls the first two `lexical` and `dense`,
+      // which are the names of the *channels* that read them. Two vocabularies for one
+      // concept is how a request that names a real projection gets refused by a route
+      // that has never heard of it, so the API speaks the contract's vocabulary and the
+      // mapping to the channel names lives here.
+      const wanted = new Set<"search" | "embeddings" | "entities">(
+        body.projections ?? ["search", "embeddings", "entities"],
       );
 
-      const outcome = await deps.db.withRequest(
-        {
-          tenant: context.tenantId,
-          principal: context.principal,
-          scopeIds: [],
-          purposes: [],
-          action: "replay",
-        },
-        async (executor) => {
-          const lexicalBefore = wanted.has("lexical")
-            ? await digestLexicalProjection(executor, context.tenantId)
-            : null;
-          // The dense digest is taken by rebuilding without truncating, so the "before"
-          // measurement is the real current state rather than the state a rebuild would
-          // produce — otherwise `byte_identical` would be true by construction and would
-          // prove nothing.
-          const denseBefore = wanted.has("dense")
-            ? await rebuildProjections(executor, { db: deps.db, embeddings: deps.embeddings }, {
-                tenantId: context.tenantId,
-                truncate: false,
-              })
-            : null;
-          const entityCountBefore = wanted.has("entities")
-            ? await countEntityAliases(executor, context.tenantId)
-            : null;
-
-          const results: ProjectionDigestRow[] = [];
-          let deterministic = true;
-
-          if (lexicalBefore) {
-            const lexicalAfter = await digestLexicalProjection(executor, context.tenantId);
-            results.push({
-              projection: "lexical",
-              digest_before: lexicalBefore.digest,
-              digest_after: lexicalAfter.digest,
-              rows_before: lexicalBefore.rows,
-              rows_after: lexicalAfter.rows,
-              byte_identical: lexicalBefore.digest === lexicalAfter.digest,
-            });
-          }
-
-          if (denseBefore) {
-            const denseAfter = await rebuildProjections(executor, { db: deps.db, embeddings: deps.embeddings }, {
+      // Bound to the administrator's reach rather than taken as a system context, and
+      // this is the difference between a replay that proves something and one that
+      // proves nothing. `withSystemContext` sets an empty purpose array, and since
+      // migration 0006 the authorization predicate denies an empty purpose set outright
+      // — so a "rebuild" under it would rebuild from zero rows, produce a digest of the
+      // empty set, and report the projections byte-identical. A replay oracle that can
+      // only ever see nothing always passes.
+      const outcome = await withWriteContext(deps, context, "replay", async (executor) => {
+        const searchBefore = wanted.has("search")
+          ? await digestLexicalProjection(executor, context.tenantId)
+          : null;
+        // The dense digest is taken by reading the projected rows without truncating, so
+        // the "before" measurement is the real current state rather than the state a
+        // rebuild would produce — otherwise `byte_identical` would be true by
+        // construction and would prove nothing.
+        const denseBefore = wanted.has("embeddings")
+          ? await rebuildProjections(executor, { db: deps.db, embeddings: deps.embeddings }, {
               tenantId: context.tenantId,
-            });
-            results.push({
-              projection: "dense",
-              digest_before: denseBefore.digest,
-              digest_after: denseAfter.digest,
-              rows_before: denseBefore.rows,
-              rows_after: denseAfter.rows,
-              byte_identical: denseBefore.digest === denseAfter.digest,
-            });
-            deterministic &&= denseBefore.digest === denseAfter.digest;
-          }
+              truncate: false,
+            })
+          : null;
+        const entityCountBefore = wanted.has("entities")
+          ? await countEntityAliases(executor, context.tenantId)
+          : null;
 
-          if (entityCountBefore !== null) {
-            const entityAfter = await countEntityAliases(executor, context.tenantId);
-            results.push({
-              projection: "entities",
-              digest_before: null,
-              digest_after: String(entityAfter),
-              rows_before: entityCountBefore,
-              rows_after: entityAfter,
-              // Entity aliases are inserted with `ON CONFLICT DO NOTHING` and are never
-              // deleted on a claim's revocation, by design: an alias is many-to-many and
-              // deleting it would break the other claims that rely on it. So the honest
-              // assertion here is that a rebuild does not *lose* aliases, not that the
-              // row count is unchanged.
-              byte_identical: entityAfter >= entityCountBefore,
-            });
-          }
+        const results: ProjectionDigestRow[] = [];
+        // Only the projections whose digest is comparable in both directions count toward
+        // determinism. The entity projection is excluded on purpose: aliases are never
+        // deleted on a claim's revocation, so a rebuild adds rows and a "byte-identical"
+        // assertion over it would be false forever. Reporting that as non-determinism
+        // would hide a real replay failure behind a known one.
+        let deterministic = true;
 
-          const watermark = await executor.query<{ watermark: number }>(
-            `SELECT COALESCE(max(seq), 0)::int AS watermark FROM events WHERE tenant_id = $1::uuid`,
-            [context.tenantId],
-          );
+        if (searchBefore) {
+          const searchAfter = await digestLexicalProjection(executor, context.tenantId);
+          results.push({
+            projection: "search",
+            digest_before: searchBefore.digest,
+            digest_after: searchAfter.digest,
+            rows_before: searchBefore.rows,
+            rows_after: searchAfter.rows,
+            byte_identical: searchBefore.digest === searchAfter.digest,
+          });
+          deterministic &&= searchBefore.digest === searchAfter.digest;
+        }
 
-          return {
-            results,
-            deterministic,
-            watermark: Number(watermark.rows[0]?.watermark ?? 0),
-          };
-        },
-      );
+        if (denseBefore) {
+          const denseAfter = await rebuildProjections(executor, { db: deps.db, embeddings: deps.embeddings }, {
+            tenantId: context.tenantId,
+          });
+          results.push({
+            projection: "embeddings",
+            digest_before: denseBefore.digest,
+            digest_after: denseAfter.digest,
+            rows_before: denseBefore.rows,
+            rows_after: denseAfter.rows,
+            byte_identical: denseBefore.digest === denseAfter.digest,
+          });
+          deterministic &&= denseBefore.digest === denseAfter.digest;
+        }
+
+        if (entityCountBefore !== null) {
+          const entityAfter = await countEntityAliases(executor, context.tenantId);
+          results.push({
+            projection: "entities",
+            digest_before: null,
+            digest_after: String(entityAfter),
+            rows_before: entityCountBefore,
+            rows_after: entityAfter,
+            // Entity aliases are inserted with `ON CONFLICT DO NOTHING` and are never
+            // deleted on a claim's revocation, by design: an alias is many-to-many and
+            // deleting it would break the other claims that rely on it. So the honest
+            // assertion here is that a rebuild does not *lose* aliases, not that the row
+            // count is unchanged.
+            byte_identical: entityAfter >= entityCountBefore,
+          });
+        }
+
+        const watermark = await executor.query<{ watermark: number }>(
+          `SELECT COALESCE(max(seq), 0)::int AS watermark FROM events WHERE tenant_id = $1::uuid`,
+          [context.tenantId],
+        );
+
+        return {
+          results,
+          deterministic,
+          watermark: Number(watermark.rows[0]?.watermark ?? 0),
+        };
+      });
 
       await reply.code(200).send({
         tenant: context.tenant,

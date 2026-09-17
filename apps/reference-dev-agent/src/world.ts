@@ -238,6 +238,73 @@ export function createGate(world: World): CommitGate {
 // Reads
 // ---------------------------------------------------------------------------
 
+export interface ScopeVisibility {
+  readonly scope_id: string;
+  readonly project: string | null;
+  readonly user: string | null;
+  /** Claim ids in this scope whose predicate matches. Empty means the scope is blind to it. */
+  readonly matching_claims: readonly string[];
+}
+
+/**
+ * What a principal can see when bound to the scopes the planner authorized.
+ *
+ * This is the raw authorization read, underneath every channel: it binds exactly the
+ * scope ids `resolveScopes` produced and asks the database which claims with a given
+ * predicate are visible. Nothing filters after retrieval, so a non-empty result here
+ * *is* reachability — which is why a cross-user probe has to check it directly rather
+ * than inferring isolation from an empty packet. An empty packet can also mean the
+ * query text did not match, the purpose was wrong, or the claim expired, and all
+ * three look identical from the outside.
+ */
+export async function scopeVisibility(
+  world: World,
+  input: {
+    readonly principal: string;
+    readonly scopeIds: readonly string[];
+    readonly purposes: readonly string[];
+    readonly predicate: string;
+  },
+): Promise<readonly ScopeVisibility[]> {
+  if (input.scopeIds.length === 0) return [];
+  return world.db.withRequest(
+    {
+      tenant: world.tenantId,
+      principal: input.principal,
+      scopeIds: input.scopeIds,
+      purposes: [...input.purposes],
+      action: "reference:visibility",
+    },
+    async (executor) => {
+      const rows = await executor.query<{
+        scope_id: string;
+        project: string | null;
+        user_id: string | null;
+        claim_id: string;
+      }>(
+        `SELECT s.scope_id, s.project, s.user_id, c.claim_id
+           FROM claims c
+           JOIN scopes s ON s.scope_id = c.scope_id
+          WHERE c.predicate = $1
+          ORDER BY s.user_id NULLS FIRST, c.claim_id ASC`,
+        [input.predicate],
+      );
+      const byScope = new Map<string, { project: string | null; user: string | null; claims: string[] }>();
+      for (const row of rows.rows) {
+        const entry = byScope.get(row.scope_id) ?? { project: row.project, user: row.user_id, claims: [] };
+        entry.claims.push(toPublicId("clm", row.claim_id));
+        byScope.set(row.scope_id, entry);
+      }
+      return [...byScope.entries()].map(([scopeId, entry]) => ({
+        scope_id: scopeId,
+        project: entry.project,
+        user: entry.user,
+        matching_claims: entry.claims,
+      }));
+    },
+  );
+}
+
 export interface Counts {
   readonly claims: number;
   readonly decisions: number;

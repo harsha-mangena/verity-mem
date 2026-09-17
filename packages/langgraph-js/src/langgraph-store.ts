@@ -36,6 +36,7 @@ import { StoreOperationRefusedError } from "./errors.ts";
 import type { ScopeDimension } from "./namespace.ts";
 import { ClaimBackedStore, type ClaimBackedStoreOptions, type StoreItem } from "./store.ts";
 
+/** How the peer-backed store is wired. See `ClaimBackedStoreOptions` for `dimensions`. */
 export interface VerityMemStoreOptions {
   readonly client: VerityApiClient;
   readonly dimensions?: readonly ScopeDimension[];

@@ -224,30 +224,75 @@ export async function resolveScopes(
     candidates.set(scope.scope_id, scope);
   }
 
-  const narrow = (scope: ResolvedScopeRow): boolean => {
+  /**
+   * Does a resolved scope satisfy the selector?
+   *
+   * A selector dimension is a **requirement**, not a wildcard. When the caller names a
+   * user, the scope must bind that user; a scope that binds none is not eligible.
+   *
+   * The earlier form of this check was `scope.user_id !== null && scope.user_id !==
+   * selector.user`, which treated "this scope does not bind the user dimension" as a
+   * match. That read like a harmless convenience and was a real authorization hole:
+   *
+   *   * a principal participating in a project-wide scope — a CI service, a
+   *     project-admin, anyone whose writes carry no `user` — resolved to that project
+   *     scope;
+   *   * `scope_contains` is deliberately directional, so a project-scoped caller
+   *     reaches every user scope inside the project;
+   *   * therefore `user:bob` asking for `{project: "payments"}` received
+   *     `user:alice`'s user-scoped claims. Verified live against the running database.
+   *
+   * Worse, naming yourself did not help: `{project, user: "bob"}` narrowed to the same
+   * project scope, because the project scope binds no user and so matched the
+   * requirement. An isolation control that the caller cannot tighten by being specific
+   * is not an isolation control.
+   *
+   * With the requirement semantics, `{project: "payments"}` from a project-scoped
+   * caller still reaches the project's users — that is what a project scope means, and
+   * a project-wide operator legitimately needs it. What no longer happens is a
+   * *user-scoped* claim arriving to a caller who asked as a specific user, because the
+   * project scope is then excluded and the user's own scope is what resolves.
+   */
+  const satisfiesSelector = (scope: ResolvedScopeRow): boolean => {
     if (scope.purpose.length === 0) return false;
     if (!scope.purpose.some((purpose) => input.purposes.includes(purpose))) return false;
-    if (input.selector.project !== undefined && scope.project !== null && scope.project !== input.selector.project) {
-      return false;
-    }
-    if (input.selector.user !== undefined && scope.user_id !== null && scope.user_id !== input.selector.user) {
-      return false;
-    }
-    if (input.selector.agent !== undefined && scope.agent_id !== null && scope.agent_id !== input.selector.agent) {
-      return false;
-    }
-    if (input.selector.session !== undefined && scope.session_id !== null && scope.session_id !== input.selector.session) {
-      return false;
-    }
+
+    // A bound selector dimension requires the scope to bind the same value. A NULL on
+    // the scope is not a match: "no value" is not "the caller's value".
+    const requires = (selectorValue: string | undefined, scopeValue: string | null): boolean =>
+      selectorValue === undefined || scopeValue === selectorValue;
+
+    if (!requires(input.selector.project, scope.project)) return false;
+    if (!requires(input.selector.user, scope.user_id)) return false;
+    if (!requires(input.selector.agent, scope.agent_id)) return false;
+    if (!requires(input.selector.session, scope.session_id)) return false;
     return true;
   };
+
+  // Two passes, and the order matters. A scope that satisfies the selector exactly is
+  // the caller's own claim about itself and is preferred. Only if the selector names no
+  // dimensions that any held scope binds do we fall back to the wider set, because a
+  // caller that names only its project is asking about the project, and refusing to
+  // answer would break the project-wide operator the containment rule exists to serve.
+  const exact = [...candidates.values()].filter(satisfiesSelector);
+  const narrow = (scope: ResolvedScopeRow): boolean => satisfiesSelector(scope);
 
   // A selector that names a dimension the principal's scopes do not bind is
   // asking for something those scopes cannot express. Rather than dropping the
   // scope (which would silently return nothing useful), the selector dimension is
   // applied to the reachable *set*: the principal reaches what it holds, filtered
   // to the requested dimensions.
-  const scopes = [...candidates.values()].filter(narrow);
+  // A selector that names a user is a hard requirement: it must be satisfiable by a
+  // scope the caller actually holds. If it is not, the caller reaches nothing, which is
+  // the correct answer to "show me my memory" from a principal that holds no
+  // user-scoped membership — and is far better than answering with someone else's.
+  const selectorNamesUser = input.selector.user !== undefined;
+  const scopes = selectorNamesUser
+    ? exact
+    : exact.length > 0
+      ? exact
+      : [...candidates.values()].filter(narrow);
+  void narrow;
 
   const resolution =
     grantCount > 0

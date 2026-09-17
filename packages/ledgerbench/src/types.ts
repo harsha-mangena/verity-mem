@@ -56,7 +56,7 @@ export interface ClaimMatch {
   readonly tenant?: string;
 }
 
-export interface ExpectClaim extends ClaimMatch {
+export interface ExpectClaim extends ClaimMatch, ExpectationBase {
   readonly type: "expect_claim";
   readonly scope?: {
     readonly project?: string;
@@ -67,7 +67,7 @@ export interface ExpectClaim extends ClaimMatch {
   };
 }
 
-export interface ExpectNoClaim extends ClaimMatch {
+export interface ExpectNoClaim extends ClaimMatch, ExpectationBase {
   readonly type: "expect_no_claim";
   /**
    * Restrict the assertion to one scope.
@@ -85,17 +85,17 @@ export interface ExpectNoClaim extends ClaimMatch {
   };
 }
 
-export interface ExpectQuarantined {
+export interface ExpectQuarantined extends ExpectationBase {
   readonly type: "expect_quarantined";
   readonly kind?: ClaimKind;
 }
 
-export interface ExpectNeedsReview {
+export interface ExpectNeedsReview extends ExpectationBase {
   readonly type: "expect_needs_review";
   readonly kind?: ClaimKind;
 }
 
-export interface ExpectScopeNarrowed {
+export interface ExpectScopeNarrowed extends ExpectationBase {
   readonly type: "expect_scope_narrowed";
   readonly kind?: ClaimKind;
 }
@@ -110,7 +110,7 @@ export interface ExpectScopeNarrowed {
  * asserted the row would report a failure the metric cannot explain. The
  * `conflict.relation_persisted_rate` metric reports the difference separately.
  */
-export interface ExpectConflict {
+export interface ExpectConflict extends ExpectationBase {
   readonly type: "expect_conflict";
   readonly kind: RelationKind;
   readonly subject?: string;
@@ -127,12 +127,12 @@ export interface ExpectConflict {
  * that accepted either for both would let a system that never revokes pass a
  * revocation fixture.
  */
-export interface ExpectRevoked extends ClaimMatch {
+export interface ExpectRevoked extends ClaimMatch, ExpectationBase {
   readonly type: "expect_revoked";
 }
 
 /** The claim was replaced by a newer one and is history, not current belief. */
-export interface ExpectSuperseded extends ClaimMatch {
+export interface ExpectSuperseded extends ClaimMatch, ExpectationBase {
   readonly type: "expect_superseded";
 }
 
@@ -147,7 +147,7 @@ export interface ExpectSuperseded extends ClaimMatch {
  * would make a correct detection report as a failure with no way to tell the two
  * apart; keeping them apart lets the stage metric count the gap explicitly.
  */
-export interface ExpectRelationPersisted {
+export interface ExpectRelationPersisted extends ExpectationBase {
   readonly type: "expect_relation_persisted";
   readonly kind: RelationKind;
   readonly subject?: string;
@@ -158,14 +158,14 @@ export interface ExpectRelationPersisted {
   readonly against_object?: unknown;
 }
 
-export interface ExpectMissing {
+export interface ExpectMissing extends ExpectationBase {
   readonly type: "expect_missing";
   readonly query: string;
   /** Substring the packet's `missing` entry must contain, case-insensitive. */
   readonly contains?: string;
 }
 
-export interface ExpectReason {
+export interface ExpectReason extends ExpectationBase {
   readonly type: "expect_reason";
   readonly must_include?: readonly string[];
   readonly must_exclude?: readonly string[];
@@ -173,29 +173,47 @@ export interface ExpectReason {
   readonly line_id?: string;
 }
 
-export interface ExpectGrant {
+export interface ExpectGrant extends ExpectationBase {
   readonly type: "expect_grant";
   readonly subject: string;
   readonly expires_at?: string;
   readonly expired?: boolean;
 }
 
-export interface ExpectDeleted {
+export interface ExpectDeleted extends ExpectationBase {
   readonly type: "expect_deleted";
   readonly stores: readonly string[];
   readonly residual_matches: number;
   readonly status: string;
 }
 
-export interface ExpectResidualScan {
+export interface ExpectResidualScan extends ExpectationBase {
   readonly type: "expect_residual_scan";
   readonly stores: Readonly<Record<string, number>>;
   readonly ledger_rows_preserved?: number;
 }
 
-export interface ExpectUnverifiableClaim extends ClaimMatch {
+export interface ExpectUnverifiableClaim extends ClaimMatch, ExpectationBase {
   readonly type: "expect_unverifiable_claim";
   readonly reason_codes?: readonly string[];
+}
+
+/**
+ * Fields every expectation may carry, so a fixture can declare that an assertion is
+ * a known gap rather than a passing check.
+ *
+ * `gap` is not an excuse and it does not make an assertion pass: the runner still
+ * reports `fail`, and the stage metrics still count it. What it changes is the exit
+ * code — a run whose only failures are declared gaps is telling the truth about a
+ * known limitation, while a run with an undeclared failure is telling you something
+ * changed. Without the distinction the two are indistinguishable to CI, and a gate
+ * that cannot tell them apart gets disabled.
+ */
+export interface ExpectationBase {
+  /** True when the fixture asserts a requirement the current build does not meet. */
+  readonly gap?: boolean;
+  /** Why the requirement is unmet. Required alongside `gap`, enforced by the parser. */
+  readonly gap_reason?: string;
 }
 
 export type Expectation =

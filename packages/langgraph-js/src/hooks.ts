@@ -43,6 +43,7 @@ import type { StoreScope } from "./namespace.ts";
 import { namespaceFromScope } from "./namespace.ts";
 import { writeScopeOf } from "./store.ts";
 
+/** What every hook needs: a client, and a clock if the caller wants reproducible timestamps. */
 export interface HookDependencies {
   readonly client: VerityApiClient;
   /** Injected so recorded timestamps are reproducible in a replay. */
@@ -68,6 +69,7 @@ export interface BeforeRunInput {
   readonly subjects?: readonly string[];
 }
 
+/** The packet, its safe rendering, and the namespace the read used. */
 export interface BeforeRunResult {
   readonly packet: MemoryPacket;
   /** The fenced, escaped rendering. Place it in the user channel; see `context.ts`. */
@@ -126,6 +128,12 @@ export const SIDE_EFFECT_STATUSES = ["none", "performed", "attempted", "unknown"
  */
 export type SideEffectStatus = (typeof SIDE_EFFECT_STATUSES)[number];
 
+/**
+ * One tool call, as the caller observed it.
+ *
+ * `input` and `output` are hashed whether or not they are stored, so an observation stays
+ * replayable and tamper-evident even when the stored excerpt is bounded or absent.
+ */
 export interface ToolObservationInput {
   /** Tool identity, e.g. `github.create_release`. Part of the actor id, so it is not optional. */
   readonly tool: string;
@@ -150,6 +158,7 @@ export interface ToolObservationInput {
   readonly sensitivity?: Sensitivity;
 }
 
+/** What recording an observation produced: an event, its hashes, and its side-effect status. */
 export interface ObservationReceipt {
   readonly event_id: string;
   readonly seq: number;
@@ -214,7 +223,7 @@ export async function afterTool(
   };
 
   const receipt = await dependencies.client.appendEvent({
-    stream_id: input.stream_id ?? `store:tool:${input.tool}`,
+    stream_id: input.stream_id ?? `tool:${input.tool}`,
     // The call id makes a retried tool wrapper idempotent; the output hash makes a
     // second *different* result for the same call a distinct observation rather than
     // a silently dropped duplicate.
@@ -269,6 +278,7 @@ export interface AgentConclusion {
   readonly rationale?: string;
 }
 
+/** The run's transcript and the conclusions the agent reached, offered as proposals. */
 export interface AfterRunInput {
   /** The run this transcript belongs to. Idempotency key for the transcript event. */
   readonly run_id: string;
@@ -282,6 +292,7 @@ export interface AfterRunInput {
   readonly sensitivity?: Sensitivity;
 }
 
+/** A proposal is an event id, never a claim id: nothing is believed yet. */
 export interface ProposalReceipt {
   readonly index: number;
   readonly event_id: string;
@@ -290,6 +301,7 @@ export interface ProposalReceipt {
   readonly extraction: ExtractionState;
 }
 
+/** Receipts for the transcript and each proposal, plus the promotion guarantee as a literal type. */
 export interface AfterRunResult {
   readonly transcript_event_id: string;
   readonly transcript_seq: number;
@@ -428,6 +440,7 @@ export interface BeforeActionInput {
   readonly trace_id?: string;
 }
 
+/** An allowed action check. A denial is thrown, so this type only ever describes a pass. */
 export interface ActionGateCheck {
   readonly verdict: ActionGateVerdict;
   readonly action: string;

@@ -77,6 +77,7 @@ export interface VerityMemoryState {
   readonly [channel: string]: unknown;
 }
 
+/** The side effect a graph is about to take, and the claims it depends on. */
 export interface PendingAction {
   readonly action: string;
   readonly action_risk: ActionRisk;
@@ -91,6 +92,12 @@ export interface MemoryNodeScope {
   readonly purpose: string;
 }
 
+/**
+ * Everything a node needs that is not in the state.
+ *
+ * Scope and purpose are bound here rather than read from the state so that a graph cannot
+ * change the scope it is authorized for by writing to a channel.
+ */
 export interface MemoryNodeDependencies extends MemoryNodeScope {
   readonly client: VerityApiClient;
   readonly clock?: Clock;

@@ -60,6 +60,7 @@ export interface PeerProbe {
   readonly detail: string;
 }
 
+/** Which store base classes this installation can see, and which one a caller would get. */
 export interface LangGraphPeerReport {
   /** Every specifier probed, in order, with the outcome. */
   readonly probes: readonly PeerProbe[];
@@ -67,6 +68,7 @@ export interface LangGraphPeerReport {
   readonly base_store: string | null;
 }
 
+/** How the structural store is wired, plus whether a missing peer should be fatal. */
 export interface NamespacedStoreOptions {
   readonly client: VerityApiClient;
   readonly dimensions?: readonly ScopeDimension[];

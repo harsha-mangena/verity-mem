@@ -321,6 +321,18 @@ export function parseExpectation(file: string, line: number, value: unknown, ind
     type !== "expect_grant";
   const match = usesClaimMatch ? parseClaimMatch(file, line, source) : {};
 
+  // `gap` declares a known unmet requirement. The reason is mandatory: a gap with
+  // no explanation is indistinguishable from a fixture that gave up.
+  const gap = optionalBoolean(file, line, source, "gap");
+  const gapReason = optionalString(file, line, source, "gap_reason");
+  if (gap === true && gapReason === undefined) {
+    fail(file, line, "missing_field", "`gap: true` needs a `gap_reason` saying why the requirement is unmet");
+  }
+  const gapFields = {
+    ...(gap !== undefined ? { gap } : {}),
+    ...(gapReason !== undefined ? { gap_reason: gapReason } : {}),
+  };
+
   switch (type as Expectation["type"]) {
     case "expect_claim": {
       const scope = optionalObject(file, line, source, "scope");
@@ -345,6 +357,7 @@ export function parseExpectation(file: string, line: number, value: unknown, ind
                 : {}),
             };
       return {
+        ...gapFields,
         type: "expect_claim",
         ...(match as ClaimMatch),
         ...(parsedScope !== undefined ? { scope: parsedScope } : {}),
@@ -373,20 +386,34 @@ export function parseExpectation(file: string, line: number, value: unknown, ind
                 : {}),
             };
       return {
+        ...gapFields,
         type: "expect_no_claim",
         ...(match as ClaimMatch),
         ...(parsedScope !== undefined ? { scope: parsedScope } : {}),
       };
     }
     case "expect_quarantined":
-      return { type: "expect_quarantined", ...((match as ClaimMatch).kind !== undefined ? { kind: (match as ClaimMatch).kind } : {}) };
+      return {
+        ...gapFields,
+        type: "expect_quarantined",
+        ...((match as ClaimMatch).kind !== undefined ? { kind: (match as ClaimMatch).kind } : {}),
+      };
     case "expect_needs_review":
-      return { type: "expect_needs_review", ...((match as ClaimMatch).kind !== undefined ? { kind: (match as ClaimMatch).kind } : {}) };
+      return {
+        ...gapFields,
+        type: "expect_needs_review",
+        ...((match as ClaimMatch).kind !== undefined ? { kind: (match as ClaimMatch).kind } : {}),
+      };
     case "expect_scope_narrowed":
-      return { type: "expect_scope_narrowed", ...((match as ClaimMatch).kind !== undefined ? { kind: (match as ClaimMatch).kind } : {}) };
+      return {
+        ...gapFields,
+        type: "expect_scope_narrowed",
+        ...((match as ClaimMatch).kind !== undefined ? { kind: (match as ClaimMatch).kind } : {}),
+      };
     case "expect_conflict":
     case "expect_relation_persisted": {
       return {
+        ...gapFields,
         type: type as "expect_conflict" | "expect_relation_persisted",
         kind: oneOf(file, line, requiredString(file, line, source, "kind"), RELATION_KINDS, "`kind`"),
         subject: requiredString(file, line, source, "subject"),
@@ -404,11 +431,12 @@ export function parseExpectation(file: string, line: number, value: unknown, ind
       };
     }
     case "expect_revoked":
-      return { type: "expect_revoked", ...(match as ClaimMatch) };
+      return { ...gapFields, type: "expect_revoked", ...(match as ClaimMatch) };
     case "expect_superseded":
-      return { type: "expect_superseded", ...(match as ClaimMatch) };
+      return { ...gapFields, type: "expect_superseded", ...(match as ClaimMatch) };
     case "expect_missing":
       return {
+        ...gapFields,
         type: "expect_missing",
         query: requiredString(file, line, source, "query"),
         ...(optionalString(file, line, source, "contains") !== undefined
@@ -430,6 +458,7 @@ export function parseExpectation(file: string, line: number, value: unknown, ind
       if (mustInclude) checkReasonCodes(file, line, mustInclude, "expect_reason.must_include");
       if (mustExclude) checkReasonCodes(file, line, mustExclude, "expect_reason.must_exclude");
       return {
+        ...gapFields,
         type: "expect_reason",
         ...(mustInclude !== undefined ? { must_include: mustInclude } : {}),
         ...(mustExclude !== undefined ? { must_exclude: mustExclude } : {}),
@@ -441,6 +470,7 @@ export function parseExpectation(file: string, line: number, value: unknown, ind
       if (expiresAt !== undefined) requireInstant(file, line, expiresAt, "expect_grant.expires_at");
       const expired = optionalBoolean(file, line, source, "expired");
       return {
+        ...gapFields,
         type: "expect_grant",
         subject: requiredString(file, line, source, "subject"),
         ...(expiresAt !== undefined ? { expires_at: expiresAt } : {}),
@@ -453,6 +483,7 @@ export function parseExpectation(file: string, line: number, value: unknown, ind
         fail(file, line, "wrong_type", "expect_deleted.residual_matches must be a non-negative integer");
       }
       return {
+        ...gapFields,
         type: "expect_deleted",
         stores: stringArray(file, line, source, "stores", { minItems: 1 }),
         residual_matches: residual,
@@ -482,6 +513,7 @@ export function parseExpectation(file: string, line: number, value: unknown, ind
         fail(file, line, "wrong_type", "expect_residual_scan.ledger_rows_preserved must be a non-negative integer");
       }
       return {
+        ...gapFields,
         type: "expect_residual_scan",
         stores: parsedStores,
         ...(preserved !== undefined ? { ledger_rows_preserved: preserved } : {}),
@@ -491,6 +523,7 @@ export function parseExpectation(file: string, line: number, value: unknown, ind
       const codes = optionalStringArray(file, line, source, "reason_codes");
       if (codes) checkReasonCodes(file, line, codes, "expect_unverifiable_claim.reason_codes");
       return {
+        ...gapFields,
         type: "expect_unverifiable_claim",
         ...(match as ClaimMatch),
         ...(codes !== undefined ? { reason_codes: codes } : {}),

@@ -19,7 +19,7 @@
 import type {
   ActionGateRequest,
   ActionGateVerdict,
-  ClaimRecord,
+  ClaimReadResponse,
   EventAppendRequest,
   EventAppendResponse,
   MemoryPacket,
@@ -44,6 +44,7 @@ export interface VerityRoutes {
   readonly actionGate: string;
 }
 
+/** The routes as the specification's API design section defines them, plus the action gate. */
 export const DEFAULT_ROUTES: VerityRoutes = Object.freeze({
   events: "/v1/events",
   claims: "/v1/claims",
@@ -63,14 +64,27 @@ export const DEFAULT_ROUTES: VerityRoutes = Object.freeze({
 export interface VerityApiClient {
   /** `POST /v1/events` — append an untrusted event to the canonical ledger. */
   appendEvent(request: EventAppendRequest): Promise<EventAppendResponse>;
-  /** `GET /v1/claims/{claim_id}` — read a believed claim with its six dimensions. */
-  getClaim(claimId: string): Promise<ClaimRecord>;
+  /**
+   * `GET /v1/claims/{claim_id}` — a believed claim with its six dimensions.
+   *
+   * Returns the route's documented envelope (`{ claim, relations }`) rather than the
+   * bare record, because that is what `apps/server` answers and what
+   * `@veritymem/sdk-ts` types. Unwrapping it here would hide a wire-shape change from
+   * every caller at once.
+   */
+  getClaim(claimId: string): Promise<ClaimReadResponse>;
   /** `POST /v1/query` — the authorized read path; returns a packet, never snippets. */
   query(request: QueryRequest): Promise<MemoryPacket>;
   /** `POST /v1/actions/gate` — the enforcement point for a consequential side effect. */
   gateAction(request: ActionGateRequest): Promise<ActionGateVerdict>;
 }
 
+/**
+ * Transport configuration.
+ *
+ * `token` is the agent-facing credential only: this client has no admin audience, so
+ * `/v1/grants` and `/v1/forget` are unreachable from it by construction.
+ */
 export interface HttpVerityClientOptions {
   /** Origin of the API, e.g. `http://127.0.0.1:8080`. No trailing slash required. */
   readonly baseUrl: string;
@@ -117,8 +131,23 @@ export class HttpVerityClient implements VerityApiClient {
     return await this.send<EventAppendResponse>("POST", this.routes.events, request);
   }
 
-  async getClaim(claimId: string): Promise<ClaimRecord> {
-    return await this.send<ClaimRecord>("GET", `${this.routes.claims}/${encodeURIComponent(claimId)}`);
+  async getClaim(claimId: string): Promise<ClaimReadResponse> {
+    const path = `${this.routes.claims}/${encodeURIComponent(claimId)}`;
+    const body = await this.send<unknown>("GET", path);
+    // Checked rather than cast: the route answers with an envelope, and a body that
+    // silently lacks `claim` would make every downstream field undefined — a claim
+    // with no id, no scope and no status, which reads as a claim that exists.
+    const claim = (body as { readonly claim?: unknown } | null)?.claim;
+    if (typeof claim !== "object" || claim === null) {
+      throw new VerityApiError({
+        status: 200,
+        method: "GET",
+        path,
+        message: `GET ${path} returned a body without a \`claim\` field; the documented response is { claim, relations }`,
+        body,
+      });
+    }
+    return body as ClaimReadResponse;
   }
 
   async query(request: QueryRequest): Promise<MemoryPacket> {

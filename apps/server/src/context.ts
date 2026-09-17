@@ -143,7 +143,24 @@ export function resolveCallerTenant(input: {
  */
 export async function callerScopes(
   query: QueryFn,
-  input: { readonly tenantId: string; readonly principal: string; readonly now: string },
+  input: {
+    readonly tenantId: string;
+    readonly principal: string;
+    readonly now: string;
+    /**
+     * Whether this credential administers the tenant.
+     *
+     * `privacy-admin` is the profile that owns sharing, forgetting, replay and
+     * evaluation, and those operations act on the tenant rather than on the caller's
+     * own participation — an administrator who has never written to a scope has no
+     * `principal_scopes` row for it and would otherwise be unable to revoke a grant or
+     * review a candidate in it. The reach is still server-owned: it is bounded by the
+     * tenant, recorded in `principal_scopes` with `source = 'admin'` so an operator can
+     * see how it arose, and it does not extend to reading claim *content* on the
+     * ordinary read path, which binds the caller's own reach.
+     */
+    readonly tenantAdmin?: boolean;
+  },
 ): Promise<CallerScope[]> {
   const memberScopes = await query<CallerScope>(
     `SELECT s.scope_id, s.project, s.user_id, s.agent_id, s.session_id, s.purpose
@@ -204,9 +221,42 @@ export async function callerScopes(
           )
         ).rows;
 
+  const adminScopes = input.tenantAdmin === true
+    ? (
+        await query<CallerScope>(
+          `SELECT s.scope_id, s.project, s.user_id, s.agent_id, s.session_id, s.purpose
+             FROM scopes s
+            WHERE s.tenant_id = $1::uuid`,
+          [input.tenantId],
+        )
+      ).rows
+    : [];
+
   const byId = new Map<string, CallerScope>();
-  for (const scope of [...memberScopes.rows, ...grantedScopes]) byId.set(scope.scope_id, scope);
+  for (const scope of [...memberScopes.rows, ...grantedScopes, ...adminScopes]) byId.set(scope.scope_id, scope);
   return [...byId.values()];
+}
+
+/**
+ * Record that a tenant administrator participates in a scope.
+ *
+ * Written through `veritymem.record_participation`, which is the SECURITY DEFINER
+ * function the write path already uses, so the row is indistinguishable in shape from
+ * an organic membership and is labelled `admin` by the caller. Idempotent, and it
+ * fails closed: a failure to record does not grant anything, it only leaves the reach
+ * smaller than it was.
+ */
+export async function recordAdminParticipation(
+  query: QueryFn,
+  input: { readonly tenantId: string; readonly principal: string; readonly scopeIds: readonly string[] },
+): Promise<void> {
+  for (const scopeId of input.scopeIds) {
+    await query(`SELECT veritymem.record_participation($1::uuid, $2, $3::uuid)`, [
+      input.tenantId,
+      input.principal,
+      scopeId,
+    ]);
+  }
 }
 
 /** The reachable scope ids, for binding a request context. */
@@ -242,7 +292,12 @@ export interface CallerReach {
 
 export async function callerReach(
   query: QueryFn,
-  input: { readonly tenantId: string; readonly principal: string; readonly now: string },
+  input: {
+    readonly tenantId: string;
+    readonly principal: string;
+    readonly now: string;
+    readonly tenantAdmin?: boolean;
+  },
 ): Promise<CallerReach> {
   const scopes = await callerScopes(query, input);
   const purposes = new Set<string>();
@@ -291,10 +346,20 @@ async function withReachContext<T>(
       action: `${action}:reach`,
     },
     async (executor) => {
-      const reach = await callerReach(
-        (text, params) => executor.query(text, params),
-        { tenantId: caller.tenantId, principal: caller.principal, now },
-      );
+      const query: QueryFn = (text, params) => executor.query(text, params);
+      const reach = await callerReach(query, {
+        tenantId: caller.tenantId,
+        principal: caller.principal,
+        now,
+        tenantAdmin: caller.identity.profile === "privacy-admin",
+      });
+      if (caller.identity.profile === "privacy-admin") {
+        await recordAdminParticipation(query, {
+          tenantId: caller.tenantId,
+          principal: caller.principal,
+          scopeIds: reach.scopeIds,
+        });
+      }
       await executor.query(`SELECT veritymem.set_request_context($1::uuid, $2, $3::uuid[], $4::text[], $5)`, [
         caller.tenantId,
         caller.principal,

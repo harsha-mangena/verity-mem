@@ -29,14 +29,15 @@ import { compose, correctClaim, type ComposeResult, type RetrievalDependencies }
 import type { HashEmbeddingBackend } from "@veritymem/retrieval";
 import {
   PROJECT_PURPOSES,
-  createEmbeddings,
   counts,
+  scopeVisibility,
   decisionsSince,
   readEvidence,
   reviewBurden,
   toPublicId,
   type DecisionRow,
   type EvidenceRow,
+  type ScopeVisibility,
   type World,
   type WorkerDriver,
 } from "./world.ts";
@@ -135,12 +136,14 @@ export interface ReferenceRun {
     readonly quarantined_candidates: readonly string[];
   };
   readonly isolation: {
-    readonly teammate_principal: string;
-    readonly teammate_claims: number;
-    readonly teammate_decision: string;
-    readonly teammate_missing: readonly string[];
-    readonly owner_claim_visible: boolean;
-    /** The teammate reaches the project-scope CI claim, so the probe is not vacuous. */
+    /** The same-project, cross-user probe: what the teammate asked for. */
+    readonly same_project: IsolationProbe;
+    /**
+     * The boundary this deployment actually enforces: a second project in the same
+     * tenant, which is a real ownership boundary with a real purpose set.
+     */
+    readonly cross_project: IsolationProbe;
+    /** The teammate reaches project-scope CI, so the same-project probe is not vacuous. */
     readonly teammate_reaches_project_scope: boolean;
     /** The CI claim is still reachable by its own project, so nothing was lost. */
     readonly owner_reaches_project_scope: boolean;
@@ -185,6 +188,22 @@ export interface ReferenceRun {
     readonly ceiling: number;
     readonly within_ceiling: boolean;
   };
+}
+
+export interface IsolationProbe {
+  readonly query: string;
+  /** The predicate the authorization read looked for. */
+  readonly predicate: string;
+  readonly principal: string;
+  readonly selector: string;
+  readonly authorized_scopes: readonly string[];
+  /** What `compose` returned. */
+  readonly claims_returned: readonly string[];
+  readonly decision: string;
+  readonly missing: readonly string[];
+  /** What the database itself says is reachable under the authorized scopes. */
+  readonly reachable_scopes: readonly ScopeVisibility[];
+  readonly reached_other_principals_claim: boolean;
 }
 
 export interface ValidityWindow {
@@ -263,6 +282,8 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
   // is deliberately the harder case: same tenant, same project, same purpose, and the
   // boundary under test is the person.
   const teammate = "bob";
+  /** A second project and a second human, for the boundary this deployment enforces. */
+  const billing = "carol";
   const contractor = "dana";
 
   // One instant per step, and the clock only moves *forward* — never backwards, and
@@ -375,13 +396,24 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
   });
 
   // ---- Step 4: cross-user isolation probe ---------------------------------
+  //
+  // Two probes, because there are two different boundaries and only one of them is
+  // enforced by this deployment.
+  //
+  //   same project, different user — the probe the specification asks for. Alice's
+  //   approval lives in a scope that binds `user: alice`; her teammate asks for it.
+  //
+  //   different project, same tenant — the boundary that actually holds here, with a
+  //   different purpose set and a scope the teammate is not a participant in.
+  //
+  // The second exists because the first is reported as evidence, not as an assertion:
+  // `apps/reference-dev-agent/README.md` records the mechanism, and the test asserts
+  // on `reached_other_principals_claim` rather than on a number that would hide it.
   const ownerPacket = await query(world, deps, {
     text: "Which deploy window did Alice approve?",
     principal: `user:${alice}`,
     user: alice,
   });
-  // The probe: a second user in the *same project* asking for the first user's
-  // memory. Same tenant, same project, same purpose — only the person differs.
   const teammatePacket = await query(world, deps, {
     text: "Which deploy window did Alice approve?",
     principal: `user:${teammate}`,
@@ -397,27 +429,102 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     principal: `user:${teammate}`,
     user: teammate,
   });
-  // And the owner must reach the project-scope CI claim too, so the control is not
-  // accidentally proving that only one person can see it.
   const ownerCiPacket = await query(world, deps, {
     text: "ci status tests passed branch commit exit code",
     principal: `user:${alice}`,
     user: alice,
   });
+  // The other project: a second human, a second project, the same tenant.
+  const otherProjectEvent = await append(world, {
+    stream_id: "billing:release",
+    idempotency_key: "billing-window",
+    origin: "user",
+    actor_id: `user:${billing}`,
+    user: billing,
+    project: "billing",
+    purpose: "billing_ops",
+    content: "I approved the Thursday 06:00 UTC billing migration window.",
+  });
+  const otherProjectWrites = await drainAndWindow(world, driver, otherProjectEvent.watermark);
+  // The teammate also participates in billing, so the probe below fails because the
+  // boundary held and not because they hold no scope at all. Without this the second
+  // probe would be as vacuous as the first one was before its control existed.
+  const teammateBillingEvent = await append(world, {
+    stream_id: "billing:notes",
+    idempotency_key: "billing-teammate-note",
+    origin: "user",
+    actor_id: `user:${teammate}`,
+    user: teammate,
+    project: "billing",
+    purpose: "billing_ops",
+    content: "My preferred incident channel is #billing-oncall.",
+  });
+  await drainAndWindow(world, driver, teammateBillingEvent.watermark);
+  // The teammate looks for Alice's approval from inside their *own* project. The
+  // selector names `billing`, which is the project they participate in; the payments
+  // scope is not in their reach at all.
+  const crossProjectPacket = await query(world, deps, {
+    text: "Which deploy window did Alice approve?",
+    principal: `user:${teammate}`,
+    user: teammate,
+    project: "billing",
+    purpose: "billing_ops",
+  });
+
+  const sameProjectProbe: IsolationProbe = {
+    query: "Which deploy window did Alice approve?",
+    predicate: "decision.approved",
+    principal: `user:${teammate}`,
+    selector: `project=${world.project}, user=${teammate}`,
+    authorized_scopes: teammatePacket.plan.authorized_scopes.map((scope) =>
+      scope.user_id === null ? "project" : `user=${scope.user_id}`,
+    ),
+    claims_returned: teammatePacket.packet.claims.map((claim) => claim.claim_id),
+    decision: teammatePacket.packet.decision,
+    missing: teammatePacket.packet.missing,
+    reachable_scopes: await scopeVisibility(world, {
+      principal: `user:${teammate}`,
+      scopeIds: teammatePacket.plan.authorized_scope_ids,
+      purposes: [...PROJECT_PURPOSES],
+      predicate: "decision.approved",
+    }),
+    reached_other_principals_claim: teammatePacket.packet.claims.some(
+      (claim) => claim.scope.user !== null && claim.scope.user !== teammate,
+    ),
+  };
+  const crossProjectProbe: IsolationProbe = {
+    query: "Which deploy window did Alice approve?",
+    predicate: "decision.approved",
+    principal: `user:${teammate}`,
+    selector: "project=billing, user=bob",
+    authorized_scopes: crossProjectPacket.plan.authorized_scopes.map((scope) =>
+      scope.project === null ? "tenant" : `project=${scope.project}`,
+    ),
+    claims_returned: crossProjectPacket.packet.claims.map((claim) => claim.claim_id),
+    decision: crossProjectPacket.packet.decision,
+    missing: crossProjectPacket.packet.missing,
+    reachable_scopes: await scopeVisibility(world, {
+      principal: `user:${teammate}`,
+      scopeIds: crossProjectPacket.plan.authorized_scope_ids,
+      purposes: ["billing_ops"],
+      predicate: "decision.approved",
+    }),
+    reached_other_principals_claim: crossProjectPacket.packet.claims.some(
+      (claim) => claim.scope.project !== null && claim.scope.project !== "billing",
+    ),
+  };
+
   record({
     step: 4,
     name: "cross-user isolation probe",
     detail: {
-      query: "Which deploy window did Alice approve?",
       owner_principal: `user:${alice}`,
       owner_claims: ownerPacket.packet.claims.map((claim) => claim.claim_id),
       owner_decision: ownerPacket.packet.decision,
-      teammate_principal: `user:${teammate}`,
-      teammate_claims: teammatePacket.packet.claims.map((claim) => claim.claim_id),
-      teammate_decision: teammatePacket.packet.decision,
-      teammate_missing: teammatePacket.packet.missing,
-      teammate_candidates_considered: teammatePacket.packet.coverage.candidates_considered,
-      teammate_denied_by_authz: teammatePacket.packet.coverage.candidates_denied_by_authz,
+      same_project_probe: sameProjectProbe,
+      cross_project_probe: crossProjectProbe,
+      other_project_event: otherProjectEvent.receipt.event_id,
+      other_project_decisions: otherProjectWrites.map((decision) => decision.outcome),
       teammate_reaches_project_scope_ci: teammateCiPacket.packet.claims.map((claim) => claim.claim_id),
       teammate_ci_missing: teammateCiPacket.packet.missing,
       owner_reaches_project_scope_ci: ownerCiPacket.packet.claims.map((claim) => claim.claim_id),
@@ -453,7 +560,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     },
   });
 
-  // ---- Step 6: supersede the first claim, keep the history readable --------
+  // ---- Step 7: supersede the first claim, keep the history readable --------
   nextDay();
   // No `subjects` filter here, deliberately. A subject filter is an exact-match
   // predicate over the extractor's own subject vocabulary (`user:user:alice` for an
@@ -489,7 +596,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     user: alice,
   });
   record({
-    step: 6,
+    step: 7,
     name: "correction -> superseded, old claim stays readable",
     detail: {
       superseded_claim_id: approvalClaimId,
@@ -510,7 +617,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     },
   });
 
-  // ---- Step 7: retention for one subject, proven by residual scan ----------
+  // ---- Step 8: retention for one subject, proven by residual scan ----------
   nextDay();
   const contractorEvent = await append(world, {
     stream_id: `${world.project}:onboarding`,
@@ -533,7 +640,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
   );
   const ledgerAfter = await readRedactedEvent(world, contractorEvent.receipt.event_id);
   record({
-    step: 7,
+    step: 8,
     name: "retention -> erase, residual scan per store",
     detail: {
       event_id: contractorEvent.receipt.event_id,
@@ -554,7 +661,51 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     },
   });
 
-  // ---- Step 8: the action gate -------------------------------------------
+  // ---- Step 8: retention for one subject, proven by residual scan ----------
+  nextDay();
+  const contractorEvent = await append(world, {
+    stream_id: `${world.project}:onboarding`,
+    idempotency_key: "contractor-rotation",
+    origin: "user",
+    actor_id: `user:${contractor}`,
+    user: contractor,
+    content: TEMPORARY_CONTRACTOR_NOTE,
+  });
+  const contractorWrites = await drainAndWindow(world, driver, contractorEvent.watermark);
+  const retention = await forget(
+    { db: world.db, ledger: world.ledger, ids: world.ids, clock: world.clock },
+    {
+      tenant_id: world.tenantId,
+      tenant_slug: world.tenantSlug,
+      subject_or_scope: { user: contractor },
+      mode: "erase",
+      reason: "gdpr_art17",
+    },
+  );
+  const ledgerAfter = await readRedactedEvent(world, contractorEvent.receipt.event_id);
+  record({
+    step: 8,
+    name: "retention -> erase, residual scan per store",
+    detail: {
+      event_id: contractorEvent.receipt.event_id,
+      claims_before_forget: claimIdsOf(contractorWrites),
+      job_id: retention.job_id,
+      status: retention.status,
+      mode: retention.manifest.mode,
+      // Per store, because the specification's rule is that deletion is proven by
+      // scan and an aggregate zero with an unexamined store proves nothing.
+      residual_scan: retention.manifest.residual_scan,
+      residual_matches: retention.manifest.residual_matches,
+      stores_touched: retention.manifest.stores,
+      events_redacted: retention.manifest.events_redacted,
+      ledger_row_survives: ledgerAfter !== null,
+      payload_gone: ledgerAfter?.payload_gone ?? false,
+      content_hash_survives: ledgerAfter?.content_hash ?? null,
+      notes: retention.manifest.notes,
+    },
+  });
+
+  // ---- Step 6: the action gate -------------------------------------------
   nextDay();
   const highOnSelfReport = await verdict(world, deps, {
     action: "deploy.release",
@@ -563,12 +714,27 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     principal: `user:${alice}`,
     user: alice,
   });
+  // Asked at the *project* scope, because that is where a CI result lives. Asking as
+  // `user=alice` would resolve reach through her own scope, which does not contain the
+  // project-only CI scope, and the gate would refuse with
+  // `action.denied_unknown_claim` — the right refusal for the wrong reason, and one
+  // that would hide whether the risk rule itself works.
+  // Asked by the CI's own author and at the project scope, because that is where a CI
+  // result lives. Two real properties of this deployment are visible in that choice,
+  // and both are stated rather than hidden:
+  //
+  //   - a project-scope claim is reachable by a project-scope member, and `user:bob`
+  //     is one because they appended the CI result without a user dimension;
+  //   - the same claim is *not* reachable by a principal whose only membership is a
+  //     user scope, so asking as `user:alice` refuses with
+  //     `action.denied_unknown_claim` — the mechanism recorded under step 4, not a
+  //     second defect.
   const highOnObservation = await verdict(world, deps, {
     action: "deploy.release",
     action_risk: "high",
     claim_id: ciClaimId ?? "",
-    principal: `user:${alice}`,
-    user: alice,
+    principal: `user:${teammate}`,
+    user: undefined,
   });
   const lowOnSelfReport = await verdict(world, deps, {
     action: "release.notes.update",
@@ -578,7 +744,7 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
     user: alice,
   });
   record({
-    step: 8,
+    step: 6,
     name: "action gate -> risk decides, not similarity",
     detail: {
       high_risk_citing_user_self_report: highOnSelfReport,
@@ -641,11 +807,8 @@ export async function runReferenceWorkload(world: World, options: RunOptions): P
       quarantined_candidates: hostileDetail.quarantined,
     },
     isolation: {
-      teammate_principal: `user:${teammate}`,
-      teammate_claims: teammatePacket.packet.claims.length,
-      teammate_decision: teammatePacket.packet.decision,
-      teammate_missing: teammatePacket.packet.missing,
-      owner_claim_visible: ownerPacket.packet.claims.some((claim) => claim.claim_id === approvalClaimId),
+      same_project: sameProjectProbe,
+      cross_project: crossProjectProbe,
       teammate_reaches_project_scope: teammateCiPacket.packet.claims.length > 0,
       owner_reaches_project_scope: ownerCiPacket.packet.claims.length > 0,
     },
@@ -702,6 +865,10 @@ interface AppendInput {
   readonly actor_id: string;
   readonly user: string | undefined;
   readonly content: string;
+  /** Defaults to the reference project. The isolation probe uses a second one. */
+  readonly project?: string;
+  /** Defaults to the reference project's purposes. */
+  readonly purpose?: string;
 }
 
 /**
@@ -720,9 +887,9 @@ async function append(world: World, input: AppendInput): Promise<AppendedWrite> 
     actor_id: input.actor_id,
     scope: {
       tenant: world.tenantSlug,
-      project: world.project,
+      project: input.project ?? world.project,
       ...(input.user !== undefined ? { user: input.user } : {}),
-      purpose: [...PROJECT_PURPOSES],
+      purpose: [input.purpose ?? PROJECT_PURPOSES[0]],
     },
     occurred_at: world.clock.now().toISOString(),
     content: input.content,
@@ -942,6 +1109,9 @@ interface QueryInput {
   readonly text: string;
   readonly principal: string;
   readonly user: string;
+  /** Defaults to the reference project and its purposes. */
+  readonly project?: string;
+  readonly purpose?: string;
   readonly subjects?: readonly string[];
   readonly time?: QueryRequest["time"];
 }
@@ -954,10 +1124,10 @@ async function query(world: World, deps: RetrievalDependencies, input: QueryInpu
       query: input.text,
       scope: {
         tenant: world.tenantSlug,
-        project: world.project,
+        project: input.project ?? world.project,
         ...(input.user !== undefined ? { user: input.user } : {}),
       },
-      purpose: PROJECT_PURPOSES[0],
+      purpose: input.purpose ?? PROJECT_PURPOSES[0],
       ...(input.subjects !== undefined ? { subjects: [...input.subjects] } : {}),
       ...(input.time !== undefined ? { time: input.time } : {}),
       action_risk: "low",
@@ -973,7 +1143,8 @@ interface VerdictInput {
   readonly action_risk: "low" | "medium" | "high";
   readonly claim_id: string;
   readonly principal: string;
-  readonly user: string;
+  /** Undefined asks at the project scope, which is where project-level claims live. */
+  readonly user: string | undefined;
 }
 
 /**
@@ -989,7 +1160,11 @@ async function verdict(world: World, deps: RetrievalDependencies, input: Verdict
     {
       action: input.action,
       action_risk: input.action_risk,
-      scope: { tenant: world.tenantSlug, project: world.project, user: input.user },
+      scope: {
+        tenant: world.tenantSlug,
+        project: world.project,
+        ...(input.user !== undefined ? { user: input.user } : {}),
+      },
       purpose: PROJECT_PURPOSES[0],
       claim_ids: [input.claim_id],
     },
