@@ -69,6 +69,20 @@ export interface ExpectClaim extends ClaimMatch {
 
 export interface ExpectNoClaim extends ClaimMatch {
   readonly type: "expect_no_claim";
+  /**
+   * Restrict the assertion to one scope.
+   *
+   * Without it, "no claim" means "nothing is currently believed for this match",
+   * which is what a scope-broadening fixture needs. With it, the assertion becomes
+   * "nothing was admitted into *this* scope" — the contamination question.
+   */
+  readonly scope?: {
+    readonly project?: string;
+    readonly user?: string;
+    readonly agent?: string;
+    readonly session?: string;
+    readonly purpose?: readonly string[];
+  };
 }
 
 export interface ExpectQuarantined {

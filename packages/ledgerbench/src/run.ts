@@ -1594,13 +1594,17 @@ class RunState {
           return { expectation: expectation.type, status: "pass", detail: `${live.length} accepted claim(s) match` };
         }
         case "expect_no_claim": {
+          const scopeFilter = expectation.type === "expect_no_claim" ? expectation.scope : undefined;
           const matches = claims.filter((claim) => {
             if (!matchesClaim(claim, expectation)) return false;
+            if (scopeFilter !== undefined && !scopeMatches(claim, scopeFilter)) return false;
             if (claim.status === "rejected") return false;
             // Without an explicit status, "no claim" means "nothing currently
             // believed". A superseded row is history that must survive, and
             // counting it here would make a correct supersession look like a leak.
-            if (expectation.status === undefined) return claim.valid_to === null && claim.status === "accepted";
+            if (expectation.status === undefined && scopeFilter === undefined) {
+              return claim.valid_to === null && claim.status === "accepted";
+            }
             return true;
           });
           if (matches.length > 0) {

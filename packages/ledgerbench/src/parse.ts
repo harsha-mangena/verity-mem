@@ -350,8 +350,34 @@ export function parseExpectation(file: string, line: number, value: unknown, ind
         ...(parsedScope !== undefined ? { scope: parsedScope } : {}),
       };
     }
-    case "expect_no_claim":
-      return { type: "expect_no_claim", ...(match as ClaimMatch) };
+    case "expect_no_claim": {
+      const scope = optionalObject(file, line, source, "scope");
+      const parsedScope =
+        scope === undefined
+          ? undefined
+          : {
+              ...(optionalString(file, line, scope, "project") !== undefined
+                ? { project: optionalString(file, line, scope, "project") as string }
+                : {}),
+              ...(optionalString(file, line, scope, "user") !== undefined
+                ? { user: optionalString(file, line, scope, "user") as string }
+                : {}),
+              ...(optionalString(file, line, scope, "agent") !== undefined
+                ? { agent: optionalString(file, line, scope, "agent") as string }
+                : {}),
+              ...(optionalString(file, line, scope, "session") !== undefined
+                ? { session: optionalString(file, line, scope, "session") as string }
+                : {}),
+              ...(optionalStringArray(file, line, scope, "purpose") !== undefined
+                ? { purpose: optionalStringArray(file, line, scope, "purpose") as string[] }
+                : {}),
+            };
+      return {
+        type: "expect_no_claim",
+        ...(match as ClaimMatch),
+        ...(parsedScope !== undefined ? { scope: parsedScope } : {}),
+      };
+    }
     case "expect_quarantined":
       return { type: "expect_quarantined", ...((match as ClaimMatch).kind !== undefined ? { kind: (match as ClaimMatch).kind } : {}) };
     case "expect_needs_review":

@@ -14,7 +14,7 @@
     "migrate:verify": "node --experimental-strip-types scripts/migrate.ts --verify",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "node --experimental-strip-types --test --test-concurrency=1 \"packages/*/src/**/*.test.ts\" \"apps/*/src/**/*.test.ts\"",
-    "test:unit": "node --experimental-strip-types --test \"packages/*/src/**/*.test.ts\"",
+    "test:unit": "node --experimental-strip-types --test --test-concurrency=1 \"packages/*/src/**/*.test.ts\"",
     "db:up": "docker compose -f deploy/compose/docker-compose.yml up -d",
     "db:down": "docker compose -f deploy/compose/docker-compose.yml down",
     "db:reset": "docker compose -f deploy/compose/docker-compose.yml down -v && docker compose -f deploy/compose/docker-compose.yml up -d --wait",
