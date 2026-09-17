@@ -1025,17 +1025,17 @@ export function parseConformanceDocument(path: string, text: string): Conformanc
     required_outcome: parseConformanceOutcome(path, line, field(path, line, source, "required_outcome"), "required_outcome"),
     ...(source["unimplemented_outcome"] !== undefined
       ? {
-          unimplemented_outcome: {
-            ...parseConformanceOutcome(
-              path,
-              line,
-              source["unimplemented_outcome"],
-              "unimplemented_outcome",
-            ),
-            ...(optionalString(path, line, source, "because") !== undefined
-              ? { because: optionalString(path, line, source, "because") as string }
-              : {}),
-          },
+          unimplemented_outcome: (() => {
+            const raw = asObject(path, line, source["unimplemented_outcome"], "unimplemented_outcome");
+            // `because` belongs to the unimplemented block, not to the trace: it
+            // explains why this one requirement is not met, and reading it from the
+            // trace root silently dropped every explanation while still parsing.
+            const because = optionalString(path, line, raw, "because");
+            return {
+              ...parseConformanceOutcome(path, line, raw, "unimplemented_outcome"),
+              ...(because !== undefined ? { because } : {}),
+            };
+          })(),
         }
       : {}),
     ...(source["notes"] !== undefined ? { notes: (source["notes"] ?? null) as string | null } : {}),

@@ -18,7 +18,7 @@
  *     disclosure and occasionally a cross-scope one. The code is logged, the
  *     message is generic.
  */
-import type { FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { LedgerError } from "@veritymem/ledger";
 
 export interface ApiErrorBody {
@@ -193,11 +193,8 @@ export interface ErrorHandlerOptions {
  * default handler returns `{statusCode, error, message}`, which is a second error
  * shape and therefore a second thing for every client to parse.
  */
-export function installErrorHandler(
-  app: { setErrorHandler: (handler: unknown) => void; setNotFoundHandler: (handler: unknown) => void },
-  options: ErrorHandlerOptions,
-): void {
-  app.setErrorHandler((error: unknown, request: FastifyRequest, reply: FastifyReply) => {
+export function installErrorHandler(app: FastifyInstance, options: ErrorHandlerOptions): void {
+  app.setErrorHandler((error, request, reply) => {
     const candidate = error as { validation?: FastifyValidationIssue[]; statusCode?: number };
 
     if (candidate.validation && candidate.validation.length > 0) {

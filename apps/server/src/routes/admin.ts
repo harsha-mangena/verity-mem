@@ -303,14 +303,15 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
 
       const started = Date.now();
       const mode = body.mode ?? "verify";
-      // Annotated because the fallback array would otherwise widen to `string[]`,
-      // and the `includes` checks below would stop being checked against the closed
-      // set of projection names.
-      const wanted: readonly ("search" | "embeddings" | "entities")[] = body.projections ?? [
-        "search",
-        "embeddings",
-        "entities",
-      ];
+      // Annotated because the fallback array would otherwise widen to `string[]`, and
+      // the `includes` checks below would stop being checked against the closed set of
+      // projection names. The contract's names are mapped to the stores they describe
+      // — `search` is the trigger-maintained lexical column, `embeddings` is the
+      // pgvector projection — because a caller asking to replay "search" is asking
+      // about a projection, not about a table name.
+      const wanted = new Set<"search" | "embeddings" | "entities">(
+        body.projections ?? ["search", "embeddings", "entities"],
+      );
 
       const outcome = await deps.db.withRequest(
         {
@@ -321,20 +322,20 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
           action: "replay",
         },
         async (executor) => {
-          const lexicalBefore = wanted.includes("search")
+          const lexicalBefore = wanted.has("search")
             ? await digestLexicalProjection(executor, context.tenantId)
             : null;
           // The dense digest is taken by reading the projected rows without truncating,
           // so the "before" measurement is the real current state rather than the state
           // a rebuild would produce — otherwise `byte_identical` would be true by
           // construction and would prove nothing.
-          const denseBefore = wanted.includes("embeddings")
+          const denseBefore = wanted.has("embeddings")
             ? await rebuildProjections(executor, { db: deps.db, embeddings: deps.embeddings }, {
                 tenantId: context.tenantId,
                 truncate: false,
               })
             : null;
-          const entityCountBefore = wanted.includes("entities")
+          const entityCountBefore = wanted.has("entities")
             ? await countEntityAliases(executor, context.tenantId)
             : null;
 

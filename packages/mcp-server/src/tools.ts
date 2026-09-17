@@ -50,16 +50,7 @@ import { findRenderViolations, renderPacketForModel } from "./render.ts";
 export interface ToolBackend {
   query(request: QueryRequest): Promise<MemoryPacket>;
   explainClaim(claimId: string): Promise<ClaimExplanation>;
-  appendEvent(request: {
-    stream_id: string;
-    origin: OriginKind;
-    actor_id: string;
-    scope: { tenant: string; project?: string; user?: string; agent?: string; session?: string; purpose: string[] };
-    occurred_at: string;
-    content: string;
-    idempotency_key?: string;
-    sensitivity?: "normal" | "private" | "high";
-  }): Promise<EventAppendResponse>;
+  appendEvent(request: AppendEventRequest): Promise<EventAppendResponse>;
   getCandidate(candidateId: string): Promise<unknown>;
   decideCandidate(candidateId: string, request: DecisionRequest): Promise<Decision>;
   feedback(request: { trace_id: string; outcome: "correct" | "incorrect" | "incomplete" | "harmful"; correction?: string }): Promise<unknown>;
@@ -76,12 +67,40 @@ export interface ToolBackend {
   getQueryTrace?(traceId: string): Promise<unknown>;
 }
 
+/**
+ * The append body the tools send.
+ *
+ * Narrower than `EventAppendRequest` from the contracts in exactly two places:
+ * `scope` always carries a purpose (the session's, or the caller's explicit list),
+ * and the model is never asked to supply `expected_seq`. Both are constraints the
+ * tool layer enforces rather than forwards.
+ */
+export interface AppendEventRequest {
+  readonly stream_id: string;
+  readonly origin: OriginKind;
+  readonly actor_id: string;
+  readonly scope: { tenant: string; project?: string; user?: string; agent?: string; session?: string; purpose: string[] };
+  readonly occurred_at: string;
+  readonly content: string;
+  readonly idempotency_key?: string;
+  readonly sensitivity?: "normal" | "private" | "high";
+}
+
 /** Everything a handler needs that is not the call's own arguments. */
 export interface ToolContext {
   readonly session: AuthorizedSession;
   readonly backend: ToolBackend;
   /** Injected so tests are deterministic; the tools never call `Date.now()` directly. */
   readonly now: () => Date;
+  /**
+   * Incremented once per authorization decision.
+   *
+   * Present because the property that needs proving is "every call is
+   * re-authorized, including the ones the SDK never advertised", and that property
+   * is invisible from the outside. A counter makes it observable in a test that
+   * goes through a real transport.
+   */
+  readonly authorizationChecks?: { count: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +362,8 @@ export async function callTool(
   if (!isKnownTool(tool)) {
     return { tool, ok: false, code: "authz.unknown_tool", message: `No tool named "${tool}" exists.` };
   }
+
+  if (context.authorizationChecks !== undefined) context.authorizationChecks.count += 1;
 
   // The scope a call asks for, taken only for the authorization check. Handlers
   // re-derive it from the session, so a forged field here cannot reach the API.

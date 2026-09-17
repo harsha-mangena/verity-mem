@@ -7,7 +7,8 @@
  * are the parts that decide whether a tenant boundary holds and whether a side effect
  * is gated, so they must be testable — and reviewable — without an optional package
  * installed. `@veritymem/langgraph/langchain-core` is the module that extends the
- * peer's `BaseStore`, and it is imported only when the peer is present.
+ * peer's `BaseStore` statically, and it is imported only when the peer is present;
+ * `peer.ts` discovers the peer at runtime instead and is safe to re-export here.
  */
 export * from "./errors.ts";
 export * from "./clock.ts";
@@ -18,3 +19,4 @@ export * from "./store.ts";
 export * from "./context.ts";
 export * from "./hooks.ts";
 export * from "./nodes.ts";
+export * from "./peer.ts";

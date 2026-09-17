@@ -17,15 +17,27 @@ importers:
 
   apps/reference-dev-agent:
     dependencies:
+      '@veritymem/claims':
+        specifier: workspace:*
+        version: link:../../packages/claims
       '@veritymem/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@veritymem/gate':
+        specifier: workspace:*
+        version: link:../../packages/gate
       '@veritymem/ledger':
         specifier: workspace:*
         version: link:../../packages/ledger
-      '@veritymem/sdk-ts':
+      '@veritymem/model-adapters':
         specifier: workspace:*
-        version: link:../../packages/sdk-ts
+        version: link:../../packages/model-adapters
+      '@veritymem/policy':
+        specifier: workspace:*
+        version: link:../../packages/policy
+      '@veritymem/retrieval':
+        specifier: workspace:*
+        version: link:../../packages/retrieval
 
   apps/server:
     dependencies:
@@ -133,6 +145,9 @@ importers:
       '@langchain/core':
         specifier: '>=1.0.0'
         version: 1.2.11
+      '@langchain/langgraph-checkpoint':
+        specifier: '>=0.2.0'
+        version: 1.1.5(@langchain/core@1.2.11)
       '@veritymem/contracts':
         specifier: workspace:*
         version: link:../contracts
@@ -210,6 +225,10 @@ importers:
       '@veritymem/ledger':
         specifier: workspace:*
         version: link:../ledger
+    devDependencies:
+      '@veritymem/testkit':
+        specifier: workspace:*
+        version: link:../testkit
 
   packages/policy:
     dependencies:
@@ -308,6 +327,12 @@ packages:
   '@langchain/core@1.2.11':
     resolution: {integrity: sha512-8yuWLLloTSYA453akm2JSadOVa8kGDY8v+kTzQ6kTY6aIETTEIxgysjZWyKrWQLo3UazctsSoGJ8JrdCGFL4/w==}
     engines: {node: '>=20'}
+
+  '@langchain/langgraph-checkpoint@1.1.5':
+    resolution: {integrity: sha512-BwDwl5VeTOh6CVuiIPgsUgfK51vTJDMSbFcSCUfjJWsl8/DPdK/mbv+ejxJstkSk/BlSPMP4JfXWcN6jD2ea2Q==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      '@langchain/core': ^1.1.48
 
   '@lukeed/ms@2.0.2':
     resolution: {integrity: sha512-9I2Zn6+NJLfaGoz9jN3lpwDgAYvfGeNYdbAIjJOqzs4Tpc+VU3Jqq4IofSUBKajiDS8k9fZIg18/z13mpk1bsA==}
@@ -1080,6 +1105,10 @@ snapshots:
       - '@opentelemetry/sdk-trace-base'
       - openai
       - ws
+
+  '@langchain/langgraph-checkpoint@1.1.5(@langchain/core@1.2.11)':
+    dependencies:
+      '@langchain/core': 1.2.11
 
   '@lukeed/ms@2.0.2': {}
 

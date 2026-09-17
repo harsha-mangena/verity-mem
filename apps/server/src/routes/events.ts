@@ -317,7 +317,10 @@ export function toEventRecord(
     content_hash: event.content_hash,
     prev_hash: event.prev_hash,
     chained: event.chained,
-    sensitivity: event.sensitivity,
+    // The column is typed `string` by the ledger because the database owns the
+    // vocabulary. The response schema refuses an unlisted label, so a value the
+    // contract does not know leaves as a 500 rather than as a silently novel label.
+    sensitivity: event.sensitivity as EventRecord["sensitivity"],
     media_type: event.media_type,
     byte_length: event.byte_length,
     redacted_at: event.redacted_at,

@@ -19,6 +19,7 @@
  * mapping must be testable without a database, without a graph, and without the
  * optional LangChain peer installed.
  */
+import { NamespaceMappingError } from "./errors.ts";
 
 /** Every dimension of a VerityMem scope, in canonical order. */
 export const SCOPE_DIMENSIONS = ["tenant", "project", "user", "agent", "session", "purpose"] as const;

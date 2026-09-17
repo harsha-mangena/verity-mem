@@ -21,10 +21,8 @@ import type { ScopeDimension } from "./namespace.ts";
 import {
   ClaimBackedStore,
   type SearchOptions,
-  type StoreItem,
   type StoreOperation,
   type StoreOperationResults,
-  type StorePutReceipt,
 } from "./store.ts";
 
 /** The methods LangGraph's store API calls. A structural description, not an import. */
@@ -181,6 +179,3 @@ export async function createLangGraphStore(options: NamespacedStoreOptions): Pro
     }
   })();
 }
-
-/** Re-exported so a caller of this module does not need a second import for the receipt type. */
-export type { StoreItem, StorePutReceipt };

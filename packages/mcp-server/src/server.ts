@@ -47,6 +47,14 @@ export interface VerityMemServerHandle {
   readonly registeredTools: readonly ToolName[];
   /** Underlying SDK handles, exposed so `close()` can be awaited deterministically. */
   readonly handles: readonly RegisteredToolHandle[];
+  /**
+   * How many tool calls have reached the authorization check.
+   *
+   * A caller can read this after a transport round trip to confirm that the check
+   * ran for a call the client never saw advertised — which is the whole claim of
+   * "tool visibility is not a security boundary".
+   */
+  readonly authorizationChecks: { count: number };
 }
 
 export interface CreateServerOptions {
@@ -73,6 +81,7 @@ export function registerToolsForProfile(handle: {
   readonly backend: ToolBackend;
   readonly session: AuthorizedSession;
   readonly now: () => Date;
+  readonly authorizationChecks?: { count: number };
 }): { readonly tools: readonly ToolName[]; readonly handles: readonly RegisteredToolHandle[] } {
   const tools = toolsForProfile(handle.session.profile);
   const handles: RegisteredToolHandle[] = [];
@@ -85,6 +94,7 @@ export function registerToolsForProfile(handle: {
         session: handle.session,
         backend: handle.backend,
         now: handle.now,
+        ...(handle.authorizationChecks === undefined ? {} : { authorizationChecks: handle.authorizationChecks }),
       });
       if (result.ok) {
         return { content: [{ type: "text", text: JSON.stringify(result.value) }] };
@@ -120,11 +130,13 @@ export function registerToolsForProfile(handle: {
 export function createVerityMemServer(options: CreateServerOptions): VerityMemServerHandle {
   const server = new McpServer(options.serverInfo ?? SERVER_INFO);
   const now = options.now ?? (() => new Date());
+  const authorizationChecks = { count: 0 };
   const { tools, handles } = registerToolsForProfile({
     server,
     backend: options.backend,
     session: options.session,
     now,
+    authorizationChecks,
   });
-  return { server, session: options.session, registeredTools: tools, handles };
+  return { server, session: options.session, registeredTools: tools, handles, authorizationChecks };
 }

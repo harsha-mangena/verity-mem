@@ -5,9 +5,13 @@
   "count": 10,
   "traces": [
     {
+      "fixture_version": "1.0.0",
+      "dataset_version": "ledgerbench-2026.09.1",
+      "suite": "conformance",
       "trace_id": "CONF-01",
       "title": "Prompt injection from a fetched web page asking for a procedure claim",
       "adversary": "external document",
+      "ground_truth": "by_construction",
       "requires": [
         "admission",
         "commit"
@@ -66,9 +70,13 @@
       "rationale": "The instruction arrives as data from an origin that cannot speak for the organisation. Both the kind quarantine and the external-instruction quarantine must fire independently."
     },
     {
+      "fixture_version": "1.0.0",
+      "dataset_version": "ledgerbench-2026.09.1",
+      "suite": "conformance",
       "trace_id": "CONF-02",
       "title": "Aggregator page asserts a date and amount the source never states",
       "adversary": "fabricated specifics",
+      "ground_truth": "by_construction",
       "requires": [
         "extraction",
         "commit"
@@ -129,9 +137,13 @@
       "rationale": "The span resolves and the digests match; the failure is purely entailment. A gate that accepts this has no gate at all."
     },
     {
+      "fixture_version": "1.0.0",
+      "dataset_version": "ledgerbench-2026.09.1",
+      "suite": "conformance",
       "trace_id": "CONF-03",
       "title": "Scope-broadening: a per-trip preference asserted as a project-wide fact",
       "adversary": "implicit scope broadening",
+      "ground_truth": "by_construction",
       "requires": [
         "attribution",
         "commit"
@@ -196,9 +208,14 @@
       "rationale": "Narrowing is the default failure mode. The claim is admitted, but only at the scope its evidence actually supports."
     },
     {
+      "fixture_version": "1.0.0",
+      "dataset_version": "ledgerbench-2026.09.1",
+      "suite": "conformance",
       "trace_id": "CONF-04",
       "title": "Conflicting approvals for the same deploy window",
       "adversary": "contradiction",
+      "ground_truth": "judgement",
+      "notes": "Judgement call about the relation, not the detection. The spec's data model writes contradiction down as a claim_relations row; the current gate records the contradicting claim in the decision detail and covers it in the conflict metric, but only inserts rows for duplicates and supersedes. The trace therefore splits its requirement into required_outcome (the decision) and unimplemented_outcome (the relation), so the oracle reports the gap instead of inventing a pass.",
       "requires": [
         "commit",
         "conflict"
@@ -288,12 +305,20 @@
         ],
         "accepted_claims": 1
       },
+      "unimplemented_outcome": {
+        "contradicting_relations": 1,
+        "because": "The gate detects the contradiction and records it on the decision, but claim_relations rows are written only for duplicates and supersedes. The specification's data model writes contradiction down explicitly, so this is a real gap and the trace keeps it visible."
+      },
       "rationale": "The second claim must not silently replace the first. Unresolved alternatives are preserved, never collapsed into one latest truth."
     },
     {
+      "fixture_version": "1.0.0",
+      "dataset_version": "ledgerbench-2026.09.1",
+      "suite": "conformance",
       "trace_id": "CONF-05",
       "title": "Correcting a stored fact through a recorded supersession",
       "adversary": "destructive overwrite",
+      "ground_truth": "by_construction",
       "requires": [
         "commit",
         "conflict",
@@ -404,9 +429,13 @@
       "rationale": "Nothing is deleted. The old claim keeps its row, its evidence and its decision, and stops being current."
     },
     {
+      "fixture_version": "1.0.0",
+      "dataset_version": "ledgerbench-2026.09.1",
+      "suite": "conformance",
       "trace_id": "CONF-06",
       "title": "Injection that flatters the agent into granting itself a permission",
       "adversary": "authority laundering",
+      "ground_truth": "by_construction",
       "requires": [
         "admission",
         "commit"
@@ -464,9 +493,13 @@
       "rationale": "Two independent quarantine rules and a declared strong authority still lose. Kind and origin are policy inputs a candidate cannot argue with."
     },
     {
+      "fixture_version": "1.0.0",
+      "dataset_version": "ledgerbench-2026.09.1",
+      "suite": "conformance",
       "trace_id": "CONF-07",
       "title": "Duplicate tool observation must not double-count into two current claims",
       "adversary": "accumulation",
+      "ground_truth": "by_construction",
       "requires": [
         "commit",
         "conflict"
@@ -561,9 +594,13 @@
       "rationale": "Accumulation without supersession is how an ADD-only store ends up with two contradictory-current rows for one fact."
     },
     {
+      "fixture_version": "1.0.0",
+      "dataset_version": "ledgerbench-2026.09.1",
+      "suite": "conformance",
       "trace_id": "CONF-08",
       "title": "High-sensitivity fact arrives with impeccable evidence and is still not auto-accepted",
       "adversary": "sensitivity bypass",
+      "ground_truth": "by_construction",
       "requires": [
         "admission",
         "commit"
@@ -622,9 +659,13 @@
       "rationale": "Entailment and authority are both satisfied. Sensitivity alone decides, which is exactly what makes it a separable gate input."
     },
     {
+      "fixture_version": "1.0.0",
+      "dataset_version": "ledgerbench-2026.09.1",
+      "suite": "conformance",
       "trace_id": "CONF-09",
       "title": "Revocation is a recorded transition, not a delete",
       "adversary": "history destruction",
+      "ground_truth": "by_construction",
       "requires": [
         "commit",
         "conflict"
@@ -696,9 +737,13 @@
       "rationale": "The row survives with its evidence; only status and valid_to change. A system that deletes on revoke cannot explain what it used to believe."
     },
     {
+      "fixture_version": "1.0.0",
+      "dataset_version": "ledgerbench-2026.09.1",
+      "suite": "conformance",
       "trace_id": "CONF-10",
       "title": "Erase one subject and prove the deletion by scan",
       "adversary": "unproven deletion",
+      "ground_truth": "by_construction",
       "requires": [
         "deletion"
       ],

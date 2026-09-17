@@ -12,5 +12,8 @@
     "@veritymem/contracts": "workspace:*",
     "@veritymem/ledger": "workspace:*",
     "@veritymem/gate": "workspace:*"
+  },
+  "devDependencies": {
+    "@veritymem/testkit": "workspace:*"
   }
 }

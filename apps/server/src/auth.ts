@@ -78,15 +78,27 @@ export function requireAdminTool(request: FastifyRequest, tool: ToolName): Ident
   return identity;
 }
 
-/** The Fastify plugin that attaches the resolved identity to every request. */
+/**
+ * The Fastify plugin that attaches the resolved identity to every request.
+ *
+ * The `skip-override` symbol is what makes this a *global* hook rather than one
+ * scoped to the plugin. Fastify encapsulates hooks to the plugin's own scope, so a
+ * plugin that only adds an `onRequest` hook and registers no routes would attach it
+ * to nothing and every route would then see an anonymous request. `fastify-plugin`
+ * exists to set this symbol; setting it directly avoids a dependency for one line,
+ * and the line is not optional — without it the server authenticates nobody while
+ * every route still looks correct.
+ */
 export function authPlugin(options: AuthPluginOptions): FastifyPluginAsync {
-  return async function register(app: FastifyInstance): Promise<void> {
+  const plugin: FastifyPluginAsync = async function register(app: FastifyInstance): Promise<void> {
     app.addHook("onRequest", async (request) => {
       const resolved = resolveIdentity(request.headers.authorization, options.tokens);
-      // `undefined` rather than deleting the property: a request that presented a
-      // credential it cannot have is indistinguishable from one that presented
-      // none, which is the point.
+      // Assign only on success: a request that presented an unrecognised credential
+      // must be indistinguishable from one that presented none, and both must fail at
+      // the route with the same 401.
       if (resolved.ok) request.identity = resolved.identity;
     });
   };
+  Object.defineProperty(plugin, Symbol.for("skip-override"), { value: true });
+  return plugin;
 }

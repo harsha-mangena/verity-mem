@@ -15,18 +15,28 @@ import {
   type Proposal,
 } from "./extractor.ts";
 
-export interface CompletionRequest {
+export interface LlmCompletionRequest {
   readonly system: string;
   readonly user: string;
   readonly max_output_tokens?: number;
   readonly temperature?: number;
 }
 
-export interface CompletionResponse {
+/**
+ * The request type the adapters accept. An alias rather than a derived interface:
+ * an interface with no members of its own is erased inconsistently by Node's
+ * type-stripping loader, and the two names exist only so that callers can spell the
+ * type either way.
+ */
+export type CompletionRequest = LlmCompletionRequest;
+
+export interface LlmCompletionResponse {
   readonly text: string;
   readonly model: string;
   readonly usage?: { readonly input_tokens?: number; readonly output_tokens?: number };
 }
+
+export type CompletionResponse = LlmCompletionResponse;
 
 export interface LlmAdapter {
   readonly id: string;

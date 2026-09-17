@@ -96,5 +96,9 @@
       }
     ],
     "accepted_claims": 1
+  },
+  "unimplemented_outcome": {
+    "contradicting_relations": 1,
+    "because": "The gate detects the contradiction and records it on the decision, but claim_relations rows are written only for duplicates and supersedes. The specification's data model writes contradiction down explicitly, so this is a real gap and the trace keeps it visible."
   }
 }
