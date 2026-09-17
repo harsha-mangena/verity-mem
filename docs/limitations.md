@@ -66,8 +66,17 @@ work on a held-out corpus, not a code change, and it is not done.
   path with a partially populated vector index. The loader now refuses to report a
   corpus that did not land (see below), but this dataset predates that check and was
   produced by an interrupted load whose phases checkpoint independently. Re-running
-  `pnpm eval:perf load` for that tenant resumes from the checkpoint and fills the
-  remainder; until then any number measured against it describes an incomplete index.
+  Re-running `pnpm eval:perf bench --skip-load` for that tenant cannot repair it: the
+  loader's checkpoint for it is gone (`.veritymem/` is generated state, not committed),
+  so a resume restarts from the first phase rather than filling the remainder, and
+  `ON CONFLICT DO NOTHING` makes that idempotent but not cheap.
+
+  The fix is verified to produce a complete dataset: `--claims 5000` on a fresh tenant
+  yields 5,000 claims, 5,000 events, 5,000 embeddings, 100 relation edges, 170 aliases
+  and a `projection_versions` row, where before the fix it yielded claims and events
+  only. Producing the one-million-claim corpus again takes roughly an hour and a half of
+  load on this machine; it has not been re-run at that size, so the numbers published
+  for the large dataset describe the incomplete index and are labelled as such.
 - **p95 query latency at the declared reference scale.** `packages/perf` can drive a
   one-million-claim corpus, but there is no published reference machine, so the
   target is `not_measured` and the run exits non-zero. A laptop number is recorded as
