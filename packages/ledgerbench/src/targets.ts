@@ -16,6 +16,26 @@ import { GATE_THRESHOLDS } from "@veritymem/contracts";
 import type { FixtureRunResult } from "./run.ts";
 import { rate, reviewBurden, type StageResult } from "./stages.ts";
 
+/**
+ * Target ids as the published report names them.
+ *
+ * The internal ids are implementation labels; these are the specification's, and
+ * they are what a reader citing a number will use. Without the mapping a rename here
+ * would show up downstream as a target that was never measured.
+ */
+const PUBLISHED_TARGET_IDS: Readonly<Record<string, string>> = {
+  evidence_reference: "evidence_coverage",
+  cross_tenant_retrieval: "cross_tenant_retrievals",
+  unsupported_auto_commit: "unsupported_auto_commit",
+  contradiction_detection: "contradiction_detection",
+  gold_evidence_recall: "gold_evidence_recall_at_10",
+  selective_repair: "selective_repair",
+  deterministic_projections: "deterministic_projection",
+  p95_query_latency: "p95_query_ms",
+  model_calls_per_event: "model_calls",
+  review_burden: "review_burden",
+};
+
 export interface TargetCheck {
   /** Stable key so a published number can be cited across runs. */
   readonly id: string;
@@ -35,6 +55,14 @@ export interface TargetCheck {
 
 export interface TargetsReport {
   readonly checks: readonly TargetCheck[];
+  /** The same checks under the identifiers the published report uses. */
+  readonly published: readonly {
+    readonly name: string;
+    readonly target: string;
+    readonly observed: number | string | null;
+    readonly passes: boolean;
+    readonly note: string;
+  }[];
   /** Every measurable target passed. Unmeasurable targets make this false. */
   readonly all_measurable_targets_pass: boolean;
   readonly all_targets_pass: boolean;
@@ -205,6 +233,16 @@ export function evaluateTargets(
   const measurable = checks.filter((check) => check.measurable);
   return {
     checks,
+    published: checks.map((check) => ({
+      name: PUBLISHED_TARGET_IDS[check.id] ?? check.id,
+      target: check.target,
+      observed: check.observed,
+      // An unmeasurable target is not passing. A partial run must not look complete.
+      passes: check.verdict === "pass",
+      note: [check.note, check.blocked_by !== undefined ? `blocked by ${check.blocked_by}` : undefined]
+        .filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+        .join(" "),
+    })),
     all_measurable_targets_pass: measurable.every((check) => check.verdict === "pass"),
     all_targets_pass: checks.every((check) => check.verdict === "pass"),
     measurable: measurable.length,

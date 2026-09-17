@@ -258,9 +258,23 @@ export type FeedbackRequest = Static<typeof FeedbackRequestSchema>;
 // Evaluation runs
 // ---------------------------------------------------------------------------
 
+/**
+ * An evaluation run request.
+ *
+ * `suite` is deliberately **optional** even though a run without one is meaningless.
+ * Making it required would have Fastify reject a malformed body with a 400 *before*
+ * the route's audience check runs, so an agent credential calling
+ * `/v1/evaluations/runs` would see a schema error instead of the 403 its audience
+ * deserves — and the audience refusal is the answer an operator needs. The route
+ * validates the suite itself, after authentication, and defaults to `ledgerbench`.
+ */
 export const EvaluationRunRequestSchema = Type.Object(
   {
-    suite: Type.Union([Type.Literal("ledgerbench"), Type.Literal("poisoning"), Type.Literal("deletion")]),
+    suite: Type.Optional(
+      Type.Union([Type.Literal("ledgerbench"), Type.Literal("poisoning"), Type.Literal("deletion")], {
+        default: "ledgerbench",
+      }),
+    ),
     gate: Type.Optional(Type.Union([Type.Literal("on"), Type.Literal("off")], { default: "on" })),
     seed: Type.Optional(Type.Integer({ default: 1 })),
     limit: Type.Optional(Type.Integer({ minimum: 1 })),

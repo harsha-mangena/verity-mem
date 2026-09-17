@@ -29,7 +29,7 @@ import {
   type FeedbackResponse,
 } from "@veritymem/contracts";
 import { requireTool } from "../auth.ts";
-import { resolveCallerTenant, withReadContext } from "../context.ts";
+import { resolveCallerTenant, tenantFromCredential, withReadContext } from "../context.ts";
 import type { ServerDeps } from "../config.ts";
 import { notFound } from "../errors.ts";
 import { formatUuid, stripPrefix } from "../views.ts";
@@ -56,7 +56,7 @@ export function registerFeedbackRoutes(app: FastifyInstance, options: FeedbackRo
     async (request, reply) => {
       const caller = requireTool(request, "memory.feedback");
       const body = request.body as FeedbackRequest;
-      const context = resolveCallerTenant({ identity: caller, requestTenant: undefined, what: "POST /v1/feedback" });
+      const context = tenantFromCredential({ identity: caller, what: "POST /v1/feedback" });
 
       const trace = await withReadContext(deps, context, async (executor) => {
         const result = await executor.query<{

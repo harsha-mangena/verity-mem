@@ -50,6 +50,31 @@ export interface TenantContext {
 }
 
 /**
+ * The tenant a credential is bound to.
+ *
+ * For the routes that address an object by id — an event, a claim, a candidate, a
+ * trace — there is no tenant in the body to check, so the credential's binding is the
+ * only tenant the request can be about. A tenant-less credential cannot use these
+ * routes at all: without a binding there is no tenant to *be* in, and choosing one
+ * from the request would be the caller selecting its own tenant.
+ */
+export function tenantFromCredential(input: { readonly identity: Identity; readonly what: string }): TenantContext {
+  if (input.identity.tenant === null || input.identity.tenant.length === 0) {
+    throw new ApiError(
+      "validation_failed",
+      `${input.what} addresses an existing object by id, so the credential must be bound to a tenant`,
+      400,
+    );
+  }
+  return {
+    tenant: input.identity.tenant,
+    tenantId: resolveTenantId(input.identity.tenant),
+    principal: input.identity.principal,
+    identity: input.identity,
+  };
+}
+
+/**
  * Resolve the tenant a request acts on, refusing a body that disagrees with the
  * credential.
  *

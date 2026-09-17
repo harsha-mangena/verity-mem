@@ -36,14 +36,16 @@ export interface NamespacedStore {
   listNamespaces(options?: Record<string, unknown>): Promise<string[][]>;
 }
 
+export interface PeerProbe {
+  readonly specifier: string;
+  readonly found: boolean;
+  readonly namespaced: boolean;
+  readonly detail: string;
+}
+
 export interface LangGraphPeerReport {
   /** Every specifier probed, in order, with the outcome. */
-  readonly probes: readonly {
-    readonly specifier: string;
-    readonly found: boolean;
-    readonly namespaced: boolean;
-    readonly detail: string;
-  }[];
+  readonly probes: readonly PeerProbe[];
   /** The first specifier that exported a usable base class, or `null`. */
   readonly base_store: string | null;
 }
@@ -73,7 +75,7 @@ const PEER_CANDIDATES = ["@langchain/langgraph-checkpoint", "@langchain/core"] a
  * caller can ask, log, and fail loudly if the answer matters.
  */
 export async function probeLangGraphPeer(): Promise<LangGraphPeerReport> {
-  const probes: LangGraphPeerReport["probes"] = [];
+  const probes: PeerProbe[] = [];
   let baseStore: string | null = null;
 
   for (const specifier of PEER_CANDIDATES) {
@@ -85,7 +87,7 @@ export async function probeLangGraphPeer(): Promise<LangGraphPeerReport> {
   return { probes, base_store: baseStore };
 }
 
-async function probeSpecifier(specifier: string): Promise<LangGraphPeerReport["probes"][number]> {
+async function probeSpecifier(specifier: string): Promise<PeerProbe> {
   try {
     // Variable specifier: see the module comment. TypeScript must not resolve this.
     const imported = (await import(specifier)) as Record<string, unknown>;

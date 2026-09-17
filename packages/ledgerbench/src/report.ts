@@ -14,6 +14,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_COMMIT_POLICY } from "@veritymem/contracts";
+import { loadEnv } from "@veritymem/ledger";
 import type { ConformanceReport } from "./conformance.ts";
 import { evaluateStages, reviewBurden, unknownReasonCodes, type ReviewBurden, type StageResult } from "./stages.ts";
 import { evaluateTargets, type TargetsReport } from "./targets.ts";
@@ -23,7 +24,11 @@ export interface RunManifest {
   readonly run_id: string;
   readonly suite: string;
   readonly seed: number;
+  readonly gate: "on" | "off";
   readonly run_scope: string;
+  /** Single values as well as the sets: one fixture set means one revision to cite. */
+  readonly dataset_version: string;
+  readonly fixture_version: string;
   readonly dataset_versions: readonly string[];
   readonly fixture_versions: readonly string[];
   /** Digest over every fixture file's bytes, so a revision is citable. */
@@ -33,6 +38,13 @@ export interface RunManifest {
   readonly policy_version: string;
   readonly gate_backend: string;
   readonly gate_model_sha256: string | null;
+  /**
+   * The embedding projection in force. Recorded even though this run does not
+   * build one, because a manifest that omits a provenance field is a manifest a
+   * reader has to guess about.
+   */
+  readonly embedding_backend: string;
+  readonly embedding_model_id: string;
   readonly entailment_floor: number;
   readonly review_burden_ceiling: number;
   readonly started_at: string;
@@ -124,7 +136,10 @@ export function buildReport(input: BuildReportInput): EvaluationReport {
     run_id: input.runId,
     suite: "ledgerbench",
     seed: input.seed,
+    gate: "on",
     run_scope: input.runScope,
+    dataset_version: [...new Set(input.runs.map((run) => run.dataset_version))].sort().join(", "),
+    fixture_version: [...new Set(input.runs.map((run) => run.fixture_version))].sort().join(", "),
     dataset_versions: [...new Set(input.runs.map((run) => run.dataset_version))].sort(),
     fixture_versions: [...new Set(input.runs.map((run) => run.fixture_version))].sort(),
     dataset_digest: datasetDigest(input.fixturesRoot, input.fixturePaths),
@@ -133,6 +148,8 @@ export function buildReport(input: BuildReportInput): EvaluationReport {
     policy_version: DEFAULT_COMMIT_POLICY.version,
     gate_backend: input.gateBackend,
     gate_model_sha256: input.gateModelSha256,
+    embedding_backend: loadEnv().embedding.backend,
+    embedding_model_id: `${loadEnv().embedding.modelId}-${loadEnv().embedding.dimensions}`,
     entailment_floor: DEFAULT_COMMIT_POLICY.thresholds.entailmentFloor,
     review_burden_ceiling: DEFAULT_COMMIT_POLICY.thresholds.reviewBurdenCeiling,
     started_at: input.startedAt,

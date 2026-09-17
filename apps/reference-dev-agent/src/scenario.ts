@@ -933,7 +933,7 @@ interface QueryInput {
 }
 
 async function query(world: World, deps: RetrievalDependencies, input: QueryInput): Promise<ComposeResult> {
-  return compose(
+  const result = await compose(
     deps,
     {
       tenant_id: world.tenantId,
@@ -951,6 +951,10 @@ async function query(world: World, deps: RetrievalDependencies, input: QueryInpu
     },
     { principal: input.principal },
   );
+  if (process.env["VM_DEBUG_SCOPES"] === "1") {
+    process.stderr.write(`DEBUG query=${JSON.stringify(input.text)} principal=${input.principal} scopes=${JSON.stringify(result.plan.authorized_scope_ids)} denied=${JSON.stringify(result.plan.denied_dimensions)} channels=${JSON.stringify(result.channels.map((c) => [c.channel, c.hits.length]))} fused=${result.fused.length} claims=${result.packet.claims.length}\n`);
+  }
+  return result;
 }
 
 interface VerdictInput {

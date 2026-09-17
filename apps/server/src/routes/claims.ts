@@ -33,7 +33,7 @@ import {
 } from "@veritymem/contracts";
 import { createRelation, readClaim, readRelations } from "@veritymem/claims";
 import { requireTool } from "../auth.ts";
-import { resolveCallerTenant, withReadContext, withWriteContext } from "../context.ts";
+import { resolveCallerTenant, tenantFromCredential, withReadContext, withWriteContext } from "../context.ts";
 import type { ServerDeps } from "../config.ts";
 import { ApiError, notFound } from "../errors.ts";
 import {
@@ -72,7 +72,7 @@ export function registerClaimRoutes(app: FastifyInstance, options: ClaimRouteOpt
     async (request, reply) => {
       const caller = requireTool(request, "memory.claim.read");
       const params = request.params as { claim_id: string };
-      const context = resolveCallerTenant({ identity: caller, requestTenant: undefined, what: "GET /v1/claims/{id}" });
+      const context = tenantFromCredential({ identity: caller, what: "GET /v1/claims/{id}" });
 
       const result = await withReadContext(deps, context, async (executor) => {
         const claim = await readClaim(executor, params.claim_id);
@@ -124,11 +124,7 @@ export function registerClaimRoutes(app: FastifyInstance, options: ClaimRouteOpt
       const caller = requireTool(request, "memory.relate");
       const params = request.params as { claim_id: string };
       const body = request.body as RelationCreateRequest;
-      const context = resolveCallerTenant({
-        identity: caller,
-        requestTenant: undefined,
-        what: "POST /v1/claims/{id}/relations",
-      });
+      const context = tenantFromCredential({ identity: caller, what: "POST /v1/claims/{id}/relations" });
 
       const result = await withWriteContext(deps, context, "claim:relate", async (executor) => {
         // Both ends must be readable by this caller. A relation is a statement about
@@ -184,11 +180,7 @@ export function registerClaimRoutes(app: FastifyInstance, options: ClaimRouteOpt
     async (request, reply) => {
       const caller = requireTool(request, "memory.reverify");
       const params = request.params as { claim_id: string };
-      const context = resolveCallerTenant({
-        identity: caller,
-        requestTenant: undefined,
-        what: "POST /v1/claims/{id}/reverify",
-      });
+      const context = tenantFromCredential({ identity: caller, what: "POST /v1/claims/{id}/reverify" });
 
       const result = await withWriteContext(deps, context, "claim:reverify", async (executor) => {
         const claim = await readClaim(executor, params.claim_id);
@@ -303,11 +295,7 @@ export function registerClaimRoutes(app: FastifyInstance, options: ClaimRouteOpt
     async (request, reply) => {
       const caller = requireTool(request, "memory.explain");
       const params = request.params as { claim_id: string };
-      const context = resolveCallerTenant({
-        identity: caller,
-        requestTenant: undefined,
-        what: "GET /v1/claims/{id}/explain",
-      });
+      const context = tenantFromCredential({ identity: caller, what: "GET /v1/claims/{id}/explain" });
 
       const started = performance.now();
       const explanation = await withReadContext(deps, context, async (executor) =>

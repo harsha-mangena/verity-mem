@@ -320,9 +320,7 @@ export class ClaimBackedStore {
     const scope = this.codec.toScopePrefix(namespacePrefix);
     const purpose = singlePurpose(scope.purpose);
     const filter = options.filter ?? {};
-    assertKnownFilters(filter);
-
-    const query = queryTextOf(filter);
+    const query = resolveSearchQuery(filter);
     const subjects = arrayField(filter, "subjects");
     const kinds = arrayField(filter, "kinds");
     const limit = clampLimit(options.limit ?? numberField(filter, "limit") ?? this.defaultLimit);
@@ -551,7 +549,14 @@ function singlePurpose(purposes: readonly string[] | undefined): string {
   return first;
 }
 
-function assertKnownFilters(filter: Readonly<Record<string, unknown>>): void {
+/**
+ * Resolve the query text a search needs, refusing anything it would otherwise ignore.
+ *
+ * Returns the text rather than only validating, so the "there is no query" case cannot
+ * be checked in one place and used in another — a validation that returns nothing is
+ * how a check and its use drift apart.
+ */
+function resolveSearchQuery(filter: Readonly<Record<string, unknown>>): string {
   const unknown = Object.keys(filter).filter(
     (key) => !(STORE_SEARCH_FILTERS as readonly string[]).includes(key),
   );
@@ -563,7 +568,8 @@ function assertKnownFilters(filter: Readonly<Record<string, unknown>>): void {
       { filter: Object.keys(filter) },
     );
   }
-  if (queryTextOf(filter) === undefined) {
+  const query = queryTextOf(filter);
+  if (query === undefined) {
     throw new StoreOperationRefusedError(
       "search_without_query",
       "search needs filter.query or filter.subjects. VerityMem search is an authorized retrieval, not a scan of " +
@@ -571,6 +577,7 @@ function assertKnownFilters(filter: Readonly<Record<string, unknown>>): void {
       { filter: Object.keys(filter) },
     );
   }
+  return query;
 }
 
 function queryTextOf(filter: Readonly<Record<string, unknown>>): string | undefined {

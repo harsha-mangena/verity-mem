@@ -18,6 +18,28 @@ import { GATE_THRESHOLDS, REASON_CODES, isKnownReasonCode } from "@veritymem/con
 import type { Expectation } from "./types.ts";
 import type { ClaimRow, DecisionRecord, FixtureRunResult } from "./run.ts";
 
+/**
+ * The stage name as the specification's table writes it.
+ *
+ * The report publishes this rather than the lowercase id, because the Python
+ * reporter matches a stage by name and a translation table between the two would
+ * turn a rename into a silently missing stage.
+ */
+export const STAGE_TITLES: Readonly<Record<string, string>> = {
+  admission: "Admission",
+  extraction: "Extraction",
+  attribution: "Attribution",
+  commit: "Commit",
+  conflict: "Conflict",
+  retrieval: "Retrieval",
+  composition: "Composition",
+  abstention: "Abstention",
+  action_gate: "Action gate",
+  forgetting: "Forgetting",
+  replay: "Replay",
+  operations: "Operations",
+};
+
 /** The stage table from the specification, in order, plus Operations. */
 export const STAGE_IDS = [
   "admission",
@@ -43,6 +65,13 @@ export interface StageMetrics {
 
 export interface StageResult {
   readonly stage: StageId;
+  /**
+   * The specification's capitalisation of the same stage.
+   *
+   * Filled in once by `evaluateStages` rather than written in each stage builder,
+   * so a new stage cannot ship with a name that disagrees with `STAGE_TITLES`.
+   */
+  readonly name?: string;
   readonly title: string;
   readonly status: StageStatus;
   readonly failure_isolated: string;
@@ -147,7 +176,7 @@ export function evaluateStages(input: EvaluationInput): StageResult[] {
   }
   const failures = (stage: StageId): readonly string[] => failuresByStage.get(stage) ?? [];
 
-  return [
+  const built = [
     admissionStage(runs, failures("admission")),
     extractionStage(runs, failures("extraction")),
     attributionStage(runs, failures("attribution")),
@@ -161,6 +190,7 @@ export function evaluateStages(input: EvaluationInput): StageResult[] {
     replayStage(runs, failures("replay")),
     operationsStage(runs, input, failures("operations")),
   ];
+  return built.map((entry) => ({ ...entry, name: STAGE_TITLES[entry.stage] ?? entry.title }));
 }
 
 function notImplemented(stage: keyof typeof UNIMPLEMENTED_STAGES, failures: readonly string[]): StageResult {

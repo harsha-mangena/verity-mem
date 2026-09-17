@@ -28,7 +28,7 @@ import { CommitGate } from "@veritymem/gate";
 import { DETERMINISTIC_EXTRACTORS, IngestPipeline } from "@veritymem/model-adapters";
 import { projectClaim } from "@veritymem/retrieval";
 import { requireTool } from "../auth.ts";
-import { resolveCallerTenant, withBoundContext } from "../context.ts";
+import { resolveCallerTenant, tenantFromCredential, withBoundContext } from "../context.ts";
 import type { ServerDeps } from "../config.ts";
 import { notFound } from "../errors.ts";
 import { formatUuid } from "../views.ts";
@@ -134,7 +134,7 @@ export function registerEventRoutes(app: FastifyInstance, options: EventRouteOpt
     async (request, reply) => {
       const caller = requireTool(request, "memory.event.read");
       const params = request.params as { event_id: string };
-      const context = resolveCallerTenant({ identity: caller, requestTenant: undefined, what: "GET /v1/events" });
+      const context = tenantFromCredential({ identity: caller, what: "GET /v1/events" });
 
       const event = await withBoundContext(
         deps,
@@ -169,11 +169,7 @@ export function registerEventRoutes(app: FastifyInstance, options: EventRouteOpt
     async (request, reply) => {
       const caller = requireTool(request, "memory.propose");
       const params = request.params as { event_id: string };
-      const context = resolveCallerTenant({
-        identity: caller,
-        requestTenant: undefined,
-        what: "POST /v1/events/{id}/extract",
-      });
+      const context = tenantFromCredential({ identity: caller, what: "POST /v1/events/{id}/extract" });
 
       // Read the event first, unbound by scope but bound by tenant, to learn which
       // scope and purposes the extraction belongs to. Binding the caller's own reach

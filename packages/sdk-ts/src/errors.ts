@@ -14,17 +14,22 @@
 /**
  * Payload of the server's structured error body.
  *
- * Mirrors the Fastify-style envelope. `packages/contracts` does not freeze an
- * error schema, so this shape is read defensively at runtime and is the one
- * response shape in the SDK that is not contract-typed: an error body is
- * produced by the framework and the auth layer before any route schema applies.
+ * The server nests the machine-readable fields under `error` (`apps/server`'s
+ * `ApiErrorBody`), and the code is drawn from a closed set of API error codes.
+ * `packages/contracts` does not freeze this schema, so it is read defensively at
+ * runtime: an error body is produced by the framework and the auth layer before
+ * any route schema applies. A code that cannot be read is reported as
+ * `unknown_error` rather than being flattened into success.
  */
 export interface VerityMemErrorBody {
-  error?: string;
+  error?: {
+    code?: string;
+    message?: string;
+    details?: unknown;
+  };
+  /** Tolerated because not every intermediary preserves the envelope. */
   code?: string;
   message?: string;
-  status?: number;
-  details?: unknown;
   [key: string]: unknown;
 }
 
@@ -86,6 +91,11 @@ export class VerityMemError extends Error {
   /** True when the caller is authenticated but not permitted: a decision, not a fault. */
   get isDenial(): boolean {
     return this.status === HTTP_STATUS.FORBIDDEN || this.status === HTTP_STATUS.UNAUTHORIZED;
+  }
+
+  /** True when the request was well formed but the object is absent or unreachable. */
+  get isNotFound(): boolean {
+    return this.status === HTTP_STATUS.NOT_FOUND;
   }
 
   /** True when the request never produced an HTTP response and a retry may be meaningful. */

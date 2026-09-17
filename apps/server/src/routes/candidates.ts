@@ -34,7 +34,7 @@ import {
 import { readClaims } from "@veritymem/claims";
 import { defaultAuthorityFor } from "@veritymem/gate";
 import { requireTool } from "../auth.ts";
-import { resolveCallerTenant, withReadContext, withWriteContext } from "../context.ts";
+import { resolveCallerTenant, tenantFromCredential, withReadContext, withWriteContext } from "../context.ts";
 import type { ServerDeps } from "../config.ts";
 import { ApiError, notFound } from "../errors.ts";
 import { digestHex, formatUuid, stripPrefix } from "../views.ts";
@@ -99,11 +99,7 @@ export function registerCandidateRoutes(app: FastifyInstance, options: Candidate
     async (request, reply) => {
       const caller = requireTool(request, "memory.candidate.read");
       const params = request.params as { candidate_id: string };
-      const context = resolveCallerTenant({
-        identity: caller,
-        requestTenant: undefined,
-        what: "GET /v1/candidates/{id}",
-      });
+      const context = tenantFromCredential({ identity: caller, what: "GET /v1/candidates/{id}" });
 
       const result = await withReadContext(deps, context, async (executor) => {
         const found = await executor.query<CandidateRow>(`${CANDIDATE_SELECT} WHERE cc.candidate_id = $1::uuid`, [
@@ -225,11 +221,7 @@ export function registerCandidateRoutes(app: FastifyInstance, options: Candidate
       const caller = requireTool(request, "memory.decide");
       const params = request.params as { candidate_id: string };
       const body = request.body as DecisionRequest;
-      const context = resolveCallerTenant({
-        identity: caller,
-        requestTenant: undefined,
-        what: "POST /v1/candidates/{id}/decisions",
-      });
+      const context = tenantFromCredential({ identity: caller, what: "POST /v1/candidates/{id}/decisions" });
 
       const result = await withWriteContext(deps, context, "candidate:decide", async (executor) => {
         const found = await executor.query<CandidateRow>(`${CANDIDATE_SELECT} WHERE cc.candidate_id = $1::uuid`, [

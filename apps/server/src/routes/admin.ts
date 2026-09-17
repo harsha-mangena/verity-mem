@@ -43,7 +43,7 @@ import {
   type ForgetManifest,
 } from "@veritymem/retrieval";
 import { requireAdminTool } from "../auth.ts";
-import { resolveCallerTenant, withAdminContext } from "../context.ts";
+import { resolveCallerTenant, tenantFromCredential, withAdminContext } from "../context.ts";
 import type { ServerDeps } from "../config.ts";
 import { ApiError, notFound } from "../errors.ts";
 import { stripPrefix } from "../views.ts";
@@ -178,7 +178,7 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
     async (request, reply) => {
       const caller = requireAdminTool(request, "memory.share");
       const params = request.params as { grant_id: string };
-      const context = resolveCallerTenant({ identity: caller, requestTenant: undefined, what: "DELETE /v1/grants" });
+      const context = tenantFromCredential({ identity: caller, what: "DELETE /v1/grants" });
 
       const deleted = await deps.db.withRequest(
         {
@@ -268,7 +268,7 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
     async (request, reply) => {
       const caller = requireAdminTool(request, "memory.forget");
       const params = request.params as { job_id: string };
-      const context = resolveCallerTenant({ identity: caller, requestTenant: undefined, what: "GET /v1/forget" });
+      const context = tenantFromCredential({ identity: caller, what: "GET /v1/forget" });
 
       const job = await readRetentionJob(
         { db: deps.db, ledger: deps.ledger, ids: deps.ids, clock: deps.clock },
@@ -299,7 +299,7 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
     async (request, reply) => {
       const caller = requireAdminTool(request, "memory.replay");
       const body = request.body as ReplayRequest;
-      const context = resolveCallerTenant({ identity: caller, requestTenant: undefined, what: "POST /v1/replay" });
+      const context = tenantFromCredential({ identity: caller, what: "POST /v1/replay" });
 
       const started = Date.now();
       const mode = body.mode ?? "verify";
@@ -431,11 +431,7 @@ export function registerAdminRoutes(app: FastifyInstance, options: AdminRouteOpt
     async (request, reply) => {
       const caller = requireAdminTool(request, "memory.evaluate");
       const body = request.body as EvaluationRunRequest;
-      const context = resolveCallerTenant({
-        identity: caller,
-        requestTenant: undefined,
-        what: "POST /v1/evaluations/runs",
-      });
+      const context = tenantFromCredential({ identity: caller, what: "POST /v1/evaluations/runs" });
 
       const startedAt = deps.clock.now().toISOString();
       const runId = deps.ids.next("evr");

@@ -100,11 +100,28 @@ async function createHarness(label: string, overrides: Partial<Record<string, st
   };
 }
 
+/**
+ * Bearer headers, without a content type.
+ *
+ * The content type is deliberately *not* set for a bodyless request: `inject()` with
+ * `content-type: application/json` and no payload hands Fastify an empty string to
+ * parse, which is refused before any handler runs. A test that always set it would be
+ * testing a request shape no client sends.
+ */
 function agentAuth(h: Harness): Record<string, string> {
-  return { authorization: `Bearer ${h.agentToken}`, "content-type": "application/json" };
+  return { authorization: `Bearer ${h.agentToken}` };
 }
 
 function adminAuth(h: Harness): Record<string, string> {
+  return { authorization: `Bearer ${h.adminToken}` };
+}
+
+/** Bearer headers plus a JSON content type, for a request that carries a body. */
+function agentJson(h: Harness): Record<string, string> {
+  return { authorization: `Bearer ${h.agentToken}`, "content-type": "application/json" };
+}
+
+function adminJson(h: Harness): Record<string, string> {
   return { authorization: `Bearer ${h.adminToken}`, "content-type": "application/json" };
 }
 
@@ -120,7 +137,7 @@ async function writeDeployApproval(h: Harness): Promise<{ eventId: string; claim
   const appended = await h.app.inject({
     method: "POST",
     url: "/v1/events",
-    headers: agentAuth(h),
+    headers: agentJson(h),
     payload: {
       stream_id: `thread:${randomUUID().slice(0, 8)}`,
       idempotency_key: `turn-${randomUUID().slice(0, 8)}`,
@@ -174,8 +191,8 @@ describe("veritymem server", () => {
     const refused = await h.app.inject({
       method: "POST",
       url: "/v1/grants",
-      headers: agentAuth(h),
-      payload: grantBody,
+      headers: agentJson(h),
+        payload: grantBody,
     });
     assert.equal(refused.statusCode, 403, `expected 403 for an agent token, got ${refused.statusCode}: ${refused.body}`);
     const error = refused.json() as { error: { code: string; details?: { required_audience?: string } } };
@@ -187,8 +204,8 @@ describe("veritymem server", () => {
     const allowed = await h.app.inject({
       method: "POST",
       url: "/v1/grants",
-      headers: adminAuth(h),
-      payload: grantBody,
+      headers: adminJson(h),
+        payload: grantBody,
     });
     assert.equal(allowed.statusCode, 201, `expected 201 for an admin token, got ${allowed.statusCode}: ${allowed.body}`);
     const created = allowed.json() as { grant: { grant_id: string; tenant: string; purpose: string[] }; created: boolean };
@@ -202,8 +219,8 @@ describe("veritymem server", () => {
       const response = await h.app.inject({
         method: "POST",
         url,
-        headers: agentAuth(h),
-        payload: url === "/v1/forget" ? { subject_or_scope: { user: "alice" }, reason: "gdpr_art17" } : {},
+        headers: agentJson(h),
+            payload: url === "/v1/forget" ? { subject_or_scope: { user: "alice" }, reason: "gdpr_art17" } : {},
       });
       assert.equal(response.statusCode, 403, `${url} should refuse an agent token, got ${response.statusCode}`);
       assert.equal((response.json() as { error: { code: string } }).error.code, "audience_mismatch");
@@ -224,8 +241,8 @@ describe("veritymem server", () => {
     const unbound = await h.app.inject({
       method: "POST",
       url: "/v1/events",
-      headers: agentAuth(h),
-      payload: {
+      headers: agentJson(h),
+        payload: {
         stream_id: "thread:cross",
         origin: "user",
         actor_id: "user:alice",
@@ -249,8 +266,8 @@ describe("veritymem server", () => {
       const mismatched = await bound.app.inject({
         method: "POST",
         url: "/v1/forget",
-        headers: adminAuth(bound),
-        payload: { subject_or_scope: { tenant: "some-other-tenant", user: "alice" }, reason: "gdpr_art17" },
+        headers: adminJson(bound),
+            payload: { subject_or_scope: { tenant: "some-other-tenant", user: "alice" }, reason: "gdpr_art17" },
       });
       assert.equal(
         mismatched.statusCode,
@@ -265,8 +282,8 @@ describe("veritymem server", () => {
       const query = await bound.app.inject({
         method: "POST",
         url: "/v1/query",
-        headers: agentAuth(bound),
-        payload: {
+        headers: agentJson(bound),
+            payload: {
           query: "deploy window",
           scope: { tenant: "some-other-tenant", project: "payments" },
           purpose: "release_planning",
@@ -287,8 +304,8 @@ describe("veritymem server", () => {
     const queried = await h.app.inject({
       method: "POST",
       url: "/v1/query",
-      headers: agentAuth(h),
-      payload: {
+      headers: agentJson(h),
+        payload: {
         query: "Which deployment window did Alice approve?",
         scope: { tenant: h.tenant, project: h.project, user: h.user },
         purpose: h.purposes[0],
@@ -394,8 +411,8 @@ describe("veritymem server", () => {
     const gate = await h.app.inject({
       method: "POST",
       url: "/v1/actions/gate",
-      headers: agentAuth(h),
-      payload: {
+      headers: agentJson(h),
+        payload: {
         action: "merge_pull_request",
         action_risk: "high",
         scope: { tenant: h.tenant, project: h.project },
@@ -429,8 +446,8 @@ describe("veritymem server", () => {
     const low = await h.app.inject({
       method: "POST",
       url: "/v1/actions/gate",
-      headers: agentAuth(h),
-      payload: {
+      headers: agentJson(h),
+        payload: {
         action: "read_deploy_window",
         action_risk: "low",
         scope: { tenant: h.tenant, project: h.project },
@@ -451,8 +468,8 @@ describe("veritymem server", () => {
     const malformed = await h.app.inject({
       method: "POST",
       url: "/v1/events",
-      headers: agentAuth(h),
-      payload: { stream_id: "", origin: "nonsense", occurred_at: "yesterday" },
+      headers: agentJson(h),
+        payload: { stream_id: "", origin: "nonsense", occurred_at: "yesterday" },
     });
     assert.equal(malformed.statusCode, 400, malformed.body);
     const malformedBody = malformed.json() as { error: { code: string; message: string; details?: unknown } };
@@ -486,8 +503,8 @@ describe("veritymem server", () => {
     const composed = await h.app.inject({
       method: "POST",
       url: "/v1/context/compose",
-      headers: agentAuth(h),
-      payload: {
+      headers: agentJson(h),
+        payload: {
         query: "Which deployment window did Alice approve?",
         scope: { tenant: h.tenant, project: h.project, user: h.user },
         purpose: h.purposes[0],
@@ -592,8 +609,8 @@ describe("veritymem server", () => {
     const contributor = await h.app.inject({
       method: "POST",
       url: `/v1/candidates/${candidateId}/decisions`,
-      headers: agentAuth(h),
-      payload: { outcome: "accept", reason: "looks right" },
+      headers: agentJson(h),
+        payload: { outcome: "accept", reason: "looks right" },
     });
     assert.equal(contributor.statusCode, 403, contributor.body);
     assert.equal((contributor.json() as { error: { code: string } }).error.code, "profile_insufficient");
@@ -616,8 +633,8 @@ describe("veritymem server", () => {
     const decided = await h.app.inject({
       method: "POST",
       url: `/v1/candidates/${candidateId}/decisions`,
-      headers: adminAuth(h),
-      payload: { outcome: "reject", reason: "superseded by an explicit approval", approver: "ops:reviewer" },
+      headers: adminJson(h),
+        payload: { outcome: "reject", reason: "superseded by an explicit approval", approver: "ops:reviewer" },
     });
     assert.equal(decided.statusCode, 200, decided.body);
     const decision = decided.json() as { outcome: string; claim_created: boolean; approver: string };
@@ -648,8 +665,8 @@ describe("veritymem server", () => {
     const forget = await h.app.inject({
       method: "POST",
       url: "/v1/forget",
-      headers: adminAuth(h),
-      payload: { subject_or_scope: { user: h.user }, mode: "redact", reason: "gdpr_art17" },
+      headers: adminJson(h),
+        payload: { subject_or_scope: { user: h.user }, mode: "redact", reason: "gdpr_art17" },
     });
     assert.equal(forget.statusCode, 201, forget.body);
     const job = forget.json() as {
@@ -687,8 +704,8 @@ describe("veritymem server", () => {
       const gate = await h.app.inject({
         method: "POST",
         url: "/v1/actions/gate",
-        headers: agentAuth(h),
-        payload: {
+        headers: agentJson(h),
+            payload: {
           action: "read_deploy_window",
           action_risk: "low",
           scope: { tenant: h.tenant, project: h.project },
@@ -708,8 +725,8 @@ describe("veritymem server", () => {
     const queried = await h.app.inject({
       method: "POST",
       url: "/v1/query",
-      headers: agentAuth(h),
-      payload: {
+      headers: agentJson(h),
+        payload: {
         query: "Which deployment window did Alice approve?",
         scope: { tenant: h.tenant, project: h.project, user: h.user },
         purpose: h.purposes[0],
@@ -720,8 +737,8 @@ describe("veritymem server", () => {
     const feedback = await h.app.inject({
       method: "POST",
       url: "/v1/feedback",
-      headers: agentAuth(h),
-      payload: { trace_id: traceId, outcome: "incorrect", correction: "the window moved to Monday" },
+      headers: agentJson(h),
+        payload: { trace_id: traceId, outcome: "incorrect", correction: "the window moved to Monday" },
     });
     assert.equal(feedback.statusCode, 201, feedback.body);
     const body = feedback.json() as { feedback_event_id: string; trace_id: string; seq: number; outcome: string };
@@ -744,8 +761,8 @@ describe("veritymem server", () => {
     const bogus = await h.app.inject({
       method: "POST",
       url: "/v1/feedback",
-      headers: agentAuth(h),
-      payload: { trace_id: `qry_${"0".repeat(32)}`, outcome: "correct" },
+      headers: agentJson(h),
+        payload: { trace_id: `qry_${"0".repeat(32)}`, outcome: "correct" },
     });
     assert.equal(bogus.statusCode, 404, bogus.body);
   });
@@ -756,8 +773,8 @@ describe("veritymem server", () => {
     const replay = await h.app.inject({
       method: "POST",
       url: "/v1/replay",
-      headers: adminAuth(h),
-      payload: { mode: "verify" },
+      headers: adminJson(h),
+        payload: { mode: "verify" },
     });
     assert.equal(replay.statusCode, 200, replay.body);
     const body = replay.json() as {
@@ -780,8 +797,8 @@ describe("veritymem server", () => {
     const evaluation = await h.app.inject({
       method: "POST",
       url: "/v1/evaluations/runs",
-      headers: adminAuth(h),
-      payload: { suite: "ledgerbench", gate: "on", seed: 7 },
+      headers: adminJson(h),
+        payload: { suite: "ledgerbench", gate: "on", seed: 7 },
     });
     assert.equal(evaluation.statusCode, 202, evaluation.body);
     const run = evaluation.json() as { suite: string; seed: number; stages: unknown[]; notes: string[] };
@@ -817,8 +834,8 @@ describe("veritymem server", () => {
       const gate = await other.app.inject({
         method: "POST",
         url: "/v1/actions/gate",
-        headers: agentAuth(other),
-        payload: {
+        headers: agentJson(other),
+            payload: {
           action: "read_deploy_window",
           action_risk: "low",
           scope: { tenant: other.tenant, project: other.project },

@@ -29,7 +29,7 @@ import {
 } from "@veritymem/contracts";
 import { compose, type RetrievalDependencies } from "@veritymem/retrieval";
 import { requireTool } from "../auth.ts";
-import { resolveCallerTenant, withReadContext } from "../context.ts";
+import { resolveCallerTenant, tenantFromCredential, withReadContext } from "../context.ts";
 import type { ServerDeps } from "../config.ts";
 import { notFound } from "../errors.ts";
 import { renderMemoryPacket } from "../prose.ts";
@@ -158,11 +158,7 @@ export function registerQueryRoutes(app: FastifyInstance, options: QueryRouteOpt
     async (request, reply) => {
       const caller = requireTool(request, "memory.trace");
       const params = request.params as { trace_id: string };
-      const context = resolveCallerTenant({
-        identity: caller,
-        requestTenant: undefined,
-        what: "GET /v1/query-traces/{id}",
-      });
+      const context = tenantFromCredential({ identity: caller, what: "GET /v1/query-traces/{id}" });
 
       const trace = await withReadContext(deps, context, async (executor) => {
         const result = await executor.query<{
