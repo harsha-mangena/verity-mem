@@ -108,7 +108,7 @@ await gate.evaluate(executor, candidateForGate);
 // packages/retrieval — the read path, projections, retention, the action gate
 import { compose, evaluateAction, forget, rebuildProjections, projectClaim,
          digestLexicalProjection, HashEmbeddingBackend, createProjectionProcessor,
-         planQuery, resolveScopes, RBAC_EXAMPLE } from "@veritymem/retrieval";
+         planQuery, resolveScopes } from "@veritymem/retrieval";
 
 const deps = { db, ledger, embeddings, ids, clock, gateBackend };
 

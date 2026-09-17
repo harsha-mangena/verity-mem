@@ -98,6 +98,16 @@ importers:
       '@veritymem/ledger':
         specifier: workspace:*
         version: link:../ledger
+    devDependencies:
+      '@veritymem/gate':
+        specifier: workspace:*
+        version: link:../gate
+      '@veritymem/model-adapters':
+        specifier: workspace:*
+        version: link:../model-adapters
+      '@veritymem/testkit':
+        specifier: workspace:*
+        version: link:../testkit
 
   packages/contracts:
     dependencies:

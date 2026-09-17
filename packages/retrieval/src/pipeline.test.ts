@@ -22,6 +22,7 @@ import {
   type QueryExecutor,
 } from "@veritymem/ledger";
 import { CommitGate, LexicalEntailmentBackend } from "@veritymem/gate";
+import { applyStatus } from "@veritymem/claims";
 import { DETERMINISTIC_EXTRACTORS, IngestPipeline } from "@veritymem/model-adapters";
 import { Db as _Db } from "@veritymem/ledger";
 import { createTestContext, type TestContext } from "@veritymem/testkit";
@@ -423,16 +424,22 @@ describe("read path", () => {
       `this test is about revocation, so the write must be admitted first; reasons: ${written.reasons.join(" | ")}`,
     );
     const claimId = written.claimIds[0]!;
-    await h.ctx.db.withSystemContext(
-      { tenant: h.tenantId, actor: "operator:test" },
-      async (executor) => {
-        await executor.query(
-          `UPDATE claims SET status = 'revoked', valid_to = now() WHERE claim_id = $1::uuid`,
-          [claimId.replace(/^clm_/, "").replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, "$1-$2-$3-$4-$5")],
-        );
-        await deindexClaim(executor, claimId);
-      },
-    );
+    // Revocation goes through the documented path, which writes a decision row.
+    // A bare `UPDATE claims SET status = ...` is refused by
+    // `veritymem.guard_claim_mutation`, and that refusal is asserted separately in
+    // the claims test — the point here is that the legitimate path works.
+    await h.ctx.db.withSystemContext({ tenant: h.tenantId, actor: "operator:test" }, async (executor) => {
+      await applyStatus(
+        executor,
+        { claimId, status: "revoked", reasonCodes: [REASON_CODES.USE_REVOKED] },
+        {
+          decisionId: h.ctx.ids.next("dec"),
+          policyVersion: "revocation-v1",
+          approver: "operator:test",
+        },
+      );
+      await deindexClaim(executor, claimId);
+    });
     const result = await query(h, "deadline 2026-11-01");
     assert.ok(
       !result.packet.claims.some((claim) => claim.claim_id === claimId),

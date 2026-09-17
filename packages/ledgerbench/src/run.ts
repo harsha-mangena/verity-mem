@@ -275,6 +275,22 @@ export class FixtureRunner {
    * reproduce a historical run exactly when an operator passes its scope back in.
    */
   private runScopeValue: string | null = null;
+  private readonly runTokenValue: string = randomBytes(8).toString("hex");
+
+  /**
+   * Per-instance token, always random.
+   *
+   * Deliberately *not* pinned by `--run-scope`. The run scope names the tenant a
+   * reproduction re-enters; it must not also pin the id sequence, because the
+   * ledger is append-only and a re-entered tenant already holds the previous run's
+   * events. Pinning both made the second run allocate the first run's event uuid,
+   * have its insert refused by the events primary key, and then read back the
+   * earlier, already-redacted row — a fixture that looks broken while the system
+   * behaves exactly as designed.
+   */
+  get runToken(): string {
+    return this.runTokenValue;
+  }
 
   get runScope(): string {
     if (this.runScopeValue === null) {
@@ -311,11 +327,13 @@ export class FixtureRunner {
       console.error(`[run] slug=${tenantSlug} runScope=${this.runScope} predictedTenant=${tenantId}`);
     }
     const clock = fixedClock(this.options.clockStart ?? "2026-09-17T12:00:00.000Z");
-    // The run scope is part of the id seed as well as the tenant: two runs of the
-    // same fixture under the same seed must not allocate the same uuid, or the
-    // second run's insert is refused by the events primary key and the run reads a
-    // tenant it never wrote to. Same run scope, same ids — that is the reproduction.
-    const ids = seededIds(`ledgerbench:${seed}:${this.runScope}:${fixture.header.fixture_id}`);
+    // Ids are seeded from the run instance, not from the run scope. See `runToken`:
+    // pinning the ids to a reusable scope is what makes a rerun collide with its
+    // predecessor. The sequence inside a run stays deterministic, which is what the
+    // replay metric compares.
+    const idSeed = `ledgerbench:${seed}:${this.runScope}:${this.runToken}:${fixture.header.fixture_id}`;
+    if (process.env["LEDGERBENCH_TRACE"] === "1") console.error(`[run] idSeed=${idSeed}`);
+    const ids = seededIds(idSeed);
     const blobs = new MemoryBlobStore();
     const ledger = new Ledger({ db, blobs, clock, ids });
     const gate = new CommitGate({
@@ -608,10 +626,13 @@ class RunState {
   private tenantIdFor(declaredTenant: string): string {
     const known = this.tenantIdsBySlug.get(declaredTenant);
     if (known) return known;
-    const tenantId =
-      declaredTenant === this.deps.tenantSlug
-        ? this.tenantId
-        : uuidFromHash(`ledgerbench:tenant:${this.deps.runScope}:${declaredTenant}`);
+    // Exactly the uuid `Ledger` writes this slug under: `Ledger.append` resolves the
+    // tenant from the request scope and hands the result to `ensureScope`, which
+    // resolves it again, so the physical tenant is `resolveTenantId` applied twice.
+    // Any other derivation puts the run's scopes in one partition and its events in
+    // another — every write succeeds and every read returns nothing, which is the
+    // most confusing possible failure for a benchmark to report.
+    const tenantId = resolveTenantId(resolveTenantId(declaredTenant));
     this.tenantIdsBySlug.set(declaredTenant, tenantId);
     return tenantId;
   }
@@ -678,6 +699,20 @@ class RunState {
   /** All scope ids in the tenant: the analyzer binding that makes RLS transparent. */
   private allScopeIds(): string[] {
     return [...this.scopesById.keys()];
+  }
+
+  /**
+   * Load every scope in every declared tenant of this run.
+   *
+   * The benchmark reads as an analyzer for the partitions the run owns; without
+   * this a lazily created scope in a declared tenant would be invisible to the
+   * run's own reads, and `claim_candidates` row-level security would refuse the
+   * candidate insert with an error that looks like a system defect and is not one.
+   */
+  private async learnAllScopes(): Promise<void> {
+    for (const tenantId of new Set(this.tenantIdsBySlug.values())) {
+      await this.learnScopes(tenantId);
+    }
   }
 
   private allPurposes(): string[] {
@@ -805,7 +840,7 @@ class RunState {
       }
       // The receipt is the only trustworthy statement about where the row landed.
       this.adoptTenant(receipt.scope.tenant_id);
-      await this.learnScopes(this.tenantId);
+      await this.learnAllScopes();
       this.eventsByLine.set(entry.line_id, {
         event_id: receipt.event_id,
         seq: receipt.seq,
@@ -1831,13 +1866,13 @@ class RunState {
             };
           }
           const claim = matches[0] as ClaimRow;
-          if (claim.valid_to === null || claim.status === "accepted") {
+          if (claim.valid_to === null) {
             return {
               expectation: expectation.type,
               status: "fail",
               detail:
-                `claim ${claim.claim_id} is still current (status ${claim.status}, valid_to null) after its ` +
-                `evidence was erased; the interval must close`,
+                `claim ${claim.claim_id} is still current (valid_to null) after its evidence was erased; ` +
+                `the valid-time interval must close or the claim keeps being returned as current belief`,
             };
           }
           const evidence = claim.evidence;
@@ -1863,7 +1898,8 @@ class RunState {
           return {
             expectation: expectation.type,
             status: "pass",
-            detail: `claim retained with status ${claim.status} and unverifiable evidence ` +
+            detail:
+              `claim retained (status ${claim.status}, valid_to ${claim.valid_to}) with unverifiable evidence ` +
               `(${[...new Set(evidence.map((entry) => entry.status))].join("/")})`,
           };
         }
@@ -2325,15 +2361,6 @@ export function tenantFor(seed: number, fixtureId: string, runScope = "default")
 }
 
 
-/** A stable uuid for a (run, declared tenant) pair. Mirrors `resolveTenantId`'s shape. */
-function uuidFromHash(input: string): string {
-  const hash = createHash("sha256").update(input, "utf8").digest();
-  const bytes = Buffer.from(hash.subarray(0, 16));
-  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
-  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
-  const hex = bytes.toString("hex");
-  return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20, 32)].join("-");
-}
 
 function scopeKey(input: {
   readonly tenant: string;

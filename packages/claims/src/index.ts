@@ -314,16 +314,36 @@ export interface StatusChange {
 }
 
 /**
- * Apply a status transition.
+ * Apply a status transition, with the decision row that authorises it.
  *
- * The database enforces the lifecycle: `veritymem.enforce_claim_transition`
- * rejects an illegal edge, so this function does not have to be the only guard
- * against one. It exists to record the decision that accompanied the transition.
+ * Two database guards make this the only legal way to move a claim's status:
+ * `veritymem.enforce_claim_transition` rejects an illegal lifecycle edge, and
+ * `veritymem.guard_claim_mutation` refuses a status change that has no matching
+ * decision row. So this function is not a convenience wrapper — it is the write
+ * path the schema expects, and a bare `UPDATE claims SET status = ...` will fail.
+ *
+ * The decision is written before the claim so that the guard sees it in the same
+ * transaction, and so that a crash between the two leaves a decision with no
+ * transition rather than a transition with no decision.
  */
 export async function applyStatus(
   executor: QueryExecutor,
   change: StatusChange,
+  context: { readonly decisionId: string; readonly policyVersion: string; readonly approver: string | null },
 ): Promise<void> {
+  await executor.query(
+    `INSERT INTO decisions (decision_id, tenant_id, claim_id, policy_version, outcome, reason_codes, approver)
+     SELECT $1::uuid, c.tenant_id, c.claim_id, $2, $3::decision_outcome, $4::text[], $5
+       FROM claims c WHERE c.claim_id = $6::uuid`,
+    [
+      stripPrefix(context.decisionId),
+      context.policyVersion,
+      outcomeForStatus(change.status),
+      [...change.reasonCodes],
+      context.approver,
+      stripPrefix(change.claimId),
+    ],
+  );
   await executor.query(
     `UPDATE claims
         SET status = $2::claim_status,
@@ -335,6 +355,36 @@ export async function applyStatus(
       WHERE claim_id = $1::uuid`,
     [stripPrefix(change.claimId), change.status, change.validTo ?? null],
   );
+}
+
+/**
+ * The decision outcome that authorises a given status.
+ *
+ * The mapping is many-to-one and lives here rather than at each call site, because
+ * the database guard compares against it: two mappings that disagree would produce a
+ * transition the guard rejects for a reason the caller cannot see.
+ */
+export function outcomeForStatus(status: ClaimStatus): string {
+  switch (status) {
+    case "accepted":
+      return "accept";
+    case "revoked":
+      return "revoke";
+    case "rejected":
+      return "reject";
+    case "superseded":
+      return "accept";
+    case "disputed":
+      return "needs_review";
+    case "expired":
+      return "accept";
+    case "proposed":
+      return "needs_review";
+    default: {
+      const exhaustive: never = status;
+      throw new Error(`unmapped claim status: ${String(exhaustive)}`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

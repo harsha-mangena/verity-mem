@@ -228,17 +228,41 @@ async function runForget(
     method: "dense projection rows deleted; the projection is rebuildable so this is not a data loss",
   });
 
-  const revoked = await executor.query(
-    `UPDATE claims
-        SET status = 'revoked', valid_to = COALESCE(valid_to, now())
-      WHERE claim_id = ANY($1::uuid[])
-        AND status <> 'revoked'`,
-    [affectedClaims.rows.map((row) => row.claim_id)],
-  );
+  // Each revocation is written with its own decision row: erasure is an authorised
+  // act, so it belongs in the audit trail, and `veritymem.guard_claim_mutation`
+  // refuses a status change that has no decision behind it. One decision per claim
+  // rather than one for the batch, because the question "why is this claim revoked"
+  // must be answerable per claim.
+  const revokedClaimIds = affectedClaims.rows.map((row) => row.claim_id);
+  let revokedCount = 0;
+  for (const claimId of revokedClaimIds) {
+    const decisionId = dependencies.ids.next("dec");
+    const inserted = await executor.query(
+      `INSERT INTO decisions (decision_id, tenant_id, claim_id, policy_version, outcome, reason_codes, approver)
+       SELECT $1::uuid, c.tenant_id, c.claim_id, $2, 'revoke', $3::text[], $4
+         FROM claims c WHERE c.claim_id = $5::uuid AND c.status <> 'revoked'`,
+      [
+        stripPrefix(decisionId),
+        "retention-v1",
+        [REASON_CODES.RETENTION_LEDGER_PRESERVED, REASON_CODES.USE_REVOKED],
+        `retention:${request.reason}`,
+        claimId,
+      ],
+    );
+    if ((inserted.rowCount ?? 0) === 0) continue;
+    const updated = await executor.query(
+      `UPDATE claims
+          SET status = 'revoked', valid_to = COALESCE(valid_to, now())
+        WHERE claim_id = $1::uuid AND status <> 'revoked'`,
+      [claimId],
+    );
+    revokedCount += updated.rowCount ?? 0;
+  }
   stores.push({
     store: "claims",
-    rows_affected: revoked.rowCount ?? 0,
-    method: "status set to revoked with valid_to closed; claims are never deleted, because a hole in the claim store cannot be audited",
+    rows_affected: revokedCount,
+    method:
+      "status set to revoked with valid_to closed, each with a decision row recording the retention reason; claims are never deleted, because a hole in the claim store cannot be audited",
   });
 
   const aliases = await executor.query(
@@ -350,7 +374,7 @@ async function runForget(
     mode,
     reason: request.reason,
     stores,
-    claims_affected: revoked.rowCount ?? 0,
+    claims_affected: revokedCount,
     events_redacted: affectedEvents.rows.length,
     started_at: startedAt,
     completed_at: completedAt,

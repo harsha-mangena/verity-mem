@@ -12,6 +12,7 @@ import { after, before, describe, it } from "node:test";
 import { DEFAULT_COMMIT_POLICY, REASON_CODES } from "@veritymem/contracts";
 import { CommitGate, LexicalEntailmentBackend } from "@veritymem/gate";
 import { DETERMINISTIC_EXTRACTORS, IngestPipeline } from "@veritymem/model-adapters";
+import { applyStatus } from "@veritymem/claims";
 import { createTestContext, type TestContext } from "@veritymem/testkit";
 import { resolveTenantId } from "@veritymem/ledger";
 import {
@@ -258,9 +259,11 @@ describe("action gate", () => {
     // Revoke between the query and the action. The gate must re-read, not trust the
     // earlier verdict — this is the whole reason it does not accept a packet.
     await h.ctx.db.withSystemContext({ tenant: h.tenantId, actor: "operator:test" }, async (executor) => {
-      await executor.query(`UPDATE claims SET status = 'revoked', valid_to = now() WHERE claim_id = $1::uuid`, [
-        uuidOf(doomed),
-      ]);
+      await applyStatus(
+        executor,
+        { claimId: doomed, status: "revoked", reasonCodes: [REASON_CODES.USE_REVOKED] },
+        { decisionId: h.ctx.ids.next("dec"), policyVersion: "revocation-v1", approver: "operator:test" },
+      );
     });
 
     const after = await evaluateAction(
