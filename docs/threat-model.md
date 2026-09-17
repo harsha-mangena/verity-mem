@@ -1125,6 +1125,12 @@ build as a whole. It checks, in order:
   isolation claim is worthless and requires an external red team. An in-house suite can
   show that no cross-tenant *write* is admitted; it cannot show that no cross-tenant
   *read* is possible, and it is reported as unmeasured rather than as zero.
+
+  `docs/isolation-assessment.md` now specifies the assessment: the required environment, an
+  attack plan in seven classes with the failure signal for each, and an executable corpus of
+  nine cases with positive controls (`packages/retrieval/src/isolation-corpus.test.ts`). The
+  corpus is a regression net. It is not the assessment, and the exit target stays unmeasured
+  until a team that did not write this system publishes a report.
 - **p95 latency is unmeasured.** It requires a published reference machine at one
   million accepted claims.
 - **Four evaluation stages are `not_implemented`** rather than scored zero:

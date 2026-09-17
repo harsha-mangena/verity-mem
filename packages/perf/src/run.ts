@@ -166,6 +166,7 @@ export async function runBenchmark(options: RunOptions): Promise<RunOutcome> {
     total: options.workloadSize,
     limit: options.limit,
     corpusSeed: options.tenantSlug,
+    tenantId,
     anchor,
   });
 

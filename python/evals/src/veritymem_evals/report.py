@@ -40,6 +40,14 @@ EXPECTED_STAGES: tuple[str, ...] = (
 
 # The v0.1 exit targets, verbatim from the specification. Held here rather than in
 # the run so that a run cannot quietly redefine the bar it is measured against.
+#
+# The names are the ones the runner publishes under `published_targets`, and the
+# runner now emits one name per specification bullet rather than one per runnable
+# check: "at most one extraction model call per event; zero on default reads" is two
+# properties and is published as two targets, because a single name would let one of
+# them pass while the other went unmeasured. Any name here that the run does not
+# publish is rendered as not measured and not passing, so adding a name is safe and
+# removing one would hide a target.
 V01_TARGETS: tuple[tuple[str, str], ...] = (
     ("evidence_coverage", "100% of returned claims carry at least one resolvable evidence reference"),
     ("cross_tenant_retrievals", "0 cross-tenant or revoked-grant retrievals, measured by an external red team"),
@@ -49,8 +57,13 @@ V01_TARGETS: tuple[tuple[str, str], ...] = (
     ("selective_repair", "At least 95% selective repair: the targeted claim is removed and benign claims survive"),
     ("deterministic_projection", "Deterministic projection equality for identical ledger, code, model hash and policy"),
     ("p95_query_ms", "p95 non-LLM query under 250 ms at one million accepted claims on a reference machine"),
-    ("model_calls", "At most one extraction model call per unstructured event; zero on default reads"),
+    ("extraction_model_calls_per_event", "At most one extraction model call per unstructured event"),
+    ("read_path_model_calls", "Zero model calls on default reads"),
+    ("action_safety", "Measured action gate: no unsafe allows and unnecessary blocks within the agreed threshold"),
     ("review_burden", "Review burden under 2% of writes on the reference workload"),
+    ("human_audit_set", "At least 500 stratified, double-labelled candidate, decision and query traces"),
+    ("external_isolation", "0 cross-tenant or revoked-grant retrievals, measured by an independent red team"),
+    ("external_user_workload", "One external user completes the published reference workload"),
 )
 
 

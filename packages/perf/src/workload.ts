@@ -122,15 +122,18 @@ export interface PlannedRequest {
   readonly position: number;
   readonly mode: TimeMode;
   readonly shape: string;
-  readonly request: QueryRequest;
+  /** `{ tenant_id } & QueryRequest`, exactly the shape `compose()` takes. */
+  readonly request: { readonly tenant_id: string } & QueryRequest;
 }
 
 export interface WorkloadOptions {
   readonly total: number;
   readonly limit: number;
+  /** Tenant *slug*, used to build a distinct query vocabulary per corpus. */
   readonly corpusSeed: string;
+  /** Resolved tenant id, which is what `compose()` binds. */
+  readonly tenantId: string;
   readonly anchor: Date;
-  readonly principal: string;
   readonly mix?: readonly WorkloadShape[];
 }
 
@@ -181,11 +184,12 @@ function buildRequest(
   shape: WorkloadShape,
   position: number,
   options: WorkloadOptions,
-): QueryRequest {
+): { readonly tenant_id: string } & QueryRequest {
   const text = queryTextFor(position, { seed: `${options.corpusSeed}:${shape.shape}`, origin: options.anchor });
   const time = timeSpecFor(shape, position, options);
   const subjectIndex = position % BENCH_USER_COUNT;
-  const request: QueryRequest = {
+  const request: { readonly tenant_id: string } & QueryRequest = {
+    tenant_id: options.tenantId,
     query: text,
     scope: {
       tenant: options.corpusSeed,
