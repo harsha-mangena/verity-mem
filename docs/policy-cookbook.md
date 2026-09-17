@@ -760,3 +760,60 @@ digest *"is what `/v1/replay` compares"*.
 10. **Tell the operators which reason codes to expect.** A policy change that adds a
     code changes every dashboard that filters on reason codes, and dashboards that
     silently stop matching are worse than dashboards that break.
+
+
+---
+
+# Review burden: what the number means, and how to read it
+
+The specification sets the target as **no more than 2% of writes requiring human
+review on the reference workload**, and calls review burden a *product-failure metric*
+rather than an ops metric — in a CI agent at 03:00 there is no human, so a write that
+needs review is a write the product could not complete.
+
+## The denominator is the whole argument
+
+A single rate over every write in a benchmark measures the fixture author, not the
+gate. LedgerBench deliberately contains fixtures whose subject *is* a review path: the
+malicious procedure, the high-sensitivity fact, the unsupported specifics, the
+contradiction. If those are in the denominator then a gate that catches them is
+punished for working, and the only way to improve the number is to stop catching them.
+
+So the rate is published per write class, and only one class is compared to the ceiling.
+
+| Class | What it means | Is review correct? | Ceiling |
+| --- | --- | --- | --- |
+| `ordinary` | Strong evidence, no conflict, no privileged kind, no sensitivity, no external instruction | No — this is what the ceiling measures | **2%** |
+| `contradicting` | Conflicts with an accepted claim in scope | Yes — the design preserves unresolved alternatives rather than collapsing them | none |
+| `high_sensitivity` | Labelled high sensitivity | Yes — sensitivity forces review whatever the evidence says | none |
+| `adversarial` | Privileged kind, instruction-like external content, or evidence that does not entail the claim | Yes — this is the control functioning | none |
+
+Measured on LedgerBench seed 1, stable across seeds 1–3:
+
+```
+ordinary           0/23 =   0.0%   <= ceiling
+contradicting      2/ 2 = 100.0%
+high_sensitivity   1/ 1 = 100.0%
+adversarial        7/ 7 = 100.0%
+```
+
+**Read `0/23` with its size in mind.** It says the gate does not send ordinary writes to
+review on these fixtures. It does not say the gate is calibrated for a production
+workload, because twenty-three writes from a fixture suite is not a workload, and
+because the suite's benign writes are ones the deterministic extractors were written to
+handle. It is a bound on one failure mode, not a calibration.
+
+## The rule for any future calibration
+
+The document is explicit and it is the right rule: **reject any calibration that reaches
+the review target by lowering evidence or authority requirements.** Concretely, a change
+to the gate is only acceptable if, on the same seed:
+
+- `ordinary` review burden does not rise above 2%,
+- `unsafe_auto_accept_rate` stays at 0,
+- `contradiction_recall` stays at 100%, and
+- the poisoning fixtures' malicious-instruction acceptance stays at 0.
+
+A gate that reaches the target by accepting contradictions has not been calibrated; it
+has been disabled. `pnpm eval:ledgerbench` exits non-zero when any of those moves, so
+the four are checked together rather than one at a time.

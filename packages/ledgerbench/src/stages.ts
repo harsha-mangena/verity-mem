@@ -664,6 +664,12 @@ export interface ReviewBurden {
   readonly non_adversarial_needing_review: number;
   readonly non_adversarial_burden: number;
   readonly non_adversarial_within_ceiling: boolean;
+  /**
+   * The rate per write class, with the ceiling applied to `ordinary` only. This is the
+   * form the specification asks for: ordinary, adversarial and high-sensitivity writes
+   * reported separately, so reducing review volume by weakening the gate is visible.
+   */
+  readonly by_class: readonly ClassBurden[];
   readonly by_fixture: readonly {
     readonly fixture_id: string;
     readonly writes: number;
@@ -674,22 +680,84 @@ export interface ReviewBurden {
 }
 
 /**
+ * The class of a write, for review-burden reporting.
+ *
+ * The specification calls review burden a **product-failure metric**, and its
+ * statement of the target is "no more than 2% of writes on the reference workload
+ * require human review". A reference workload is ordinary software-delivery traffic.
+ * It is not a contradiction fixture and it is not a poisoning fixture, and folding
+ * either into the denominator measures the fixture author rather than the gate.
+ *
+ * So the rate is published per class, and only `ordinary` is compared to the ceiling.
+ * The other three are reported because a gate that reached the target by not
+ * reviewing contradictions would have stopped working, and the only way to see that
+ * is to publish them side by side.
+ *
+ *   * `adversarial`  — the write is a privileged kind, arrived as instruction-like
+ *                      content, or was entailed only neutrally by its own evidence (the
+ *                      dominant hallucination shape). In each case the gate catching it
+ *                      *is* the control functioning, so counting it as calibration
+ *                      failure would make the metric punish the gate for working.
+ *   * `high_sensitivity` — the payload is labelled high sensitivity. Published
+ *                      separately because the specification asks for it separately: a
+ *                      deployment that marks everything sensitive should see that in
+ *                      this number, not in the ordinary one.
+ *   * `contradicting` — the write conflicts with an accepted claim in scope. The
+ *                      specification's own design says an unresolved alternative is
+ *                      preserved and escalated rather than collapsed, so review here is
+ *                      also the control functioning.
+ *   * `ordinary`     — strong evidence, no conflict, no privileged kind, no
+ *                      sensitivity, no external instruction. The only population the
+ *                      ceiling is about.
+ */
+export type WriteClass = "adversarial" | "high_sensitivity" | "contradicting" | "ordinary";
+
+export interface ClassBurden {
+  readonly write_class: WriteClass;
+  readonly writes: number;
+  readonly needing_review: number;
+  readonly burden: number;
+  /** Only `ordinary` carries a ceiling verdict; the others have no target. */
+  readonly ceiling_applies: boolean;
+  readonly within_ceiling: boolean | null;
+}
+
+export function classifyDecision(decision: {
+  readonly reason_codes: readonly string[];
+  readonly requires_review: boolean;
+}): WriteClass {
+  if (decision.reason_codes.includes(REASON_CODES.ADMISSION_SENSITIVE)) return "high_sensitivity";
+
+  const adversarial =
+    decision.reason_codes.includes(REASON_CODES.KIND_PRIVILEGED) ||
+    decision.reason_codes.includes(REASON_CODES.ADMISSION_EXTERNAL_INSTRUCTION) ||
+    decision.reason_codes.includes(REASON_CODES.ADMISSION_INSTRUCTION_LIKE) ||
+    // Evidence that does not entail the claim. A `needs_review` here is the gate
+    // refusing to promote something its own evidence does not support, which is the
+    // behaviour the entailment check exists for.
+    decision.reason_codes.includes(REASON_CODES.ENTAILMENT_NEUTRAL) ||
+    decision.reason_codes.includes(REASON_CODES.ENTAILMENT_UNAVAILABLE) ||
+    decision.reason_codes.includes(REASON_CODES.NO_SUPPORTING_EVIDENCE) ||
+    decision.reason_codes.includes(REASON_CODES.AUTHORITY_WEAK);
+  if (adversarial) return "adversarial";
+
+  const contradicting = decision.reason_codes.includes(REASON_CODES.CONFLICT_CONTRADICTS_ACCEPTED);
+  if (contradicting) return "contradicting";
+
+  return "ordinary";
+}
+
+/**
  * How many decisions a fixture deliberately routes into review.
  *
- * A fixture whose subject *is* a quarantine path produces review items on purpose,
- * and folding those into the review-burden metric measures the fixture author
- * rather than the gate. The suite therefore reports two numbers: the rate over
- * every write, and the rate over the writes that were not written to require
- * review. Both are published; neither is presented as the product metric, because
- * the reference workload is neither population.
+ * Retained for the fixture-level view. The class-level reporting above is what the
+ * ceiling is measured against, because this function's granularity is the whole
+ * fixture: one adversarial decision here excludes that fixture's ordinary writes from
+ * the ordinary population as well, which understates the denominator and inflates the
+ * rate it is used to compute.
  */
 export function adversarialReviewDecisions(run: FixtureRunResult): number {
-  return run.decisions.filter(
-    (decision) =>
-      decision.reason_codes.includes(REASON_CODES.KIND_PRIVILEGED) ||
-      decision.reason_codes.includes(REASON_CODES.ADMISSION_SENSITIVE) ||
-      decision.reason_codes.includes(REASON_CODES.ADMISSION_EXTERNAL_INSTRUCTION),
-  ).length;
+  return run.decisions.filter((decision) => classifyDecision(decision) === "adversarial").length;
 }
 
 export function reviewBurden(runs: readonly FixtureRunResult[]): ReviewBurden {
@@ -718,6 +786,22 @@ export function reviewBurden(runs: readonly FixtureRunResult[]): ReviewBurden {
     non_adversarial_needing_review: ordinaryNeeding,
     non_adversarial_burden: ordinaryBurden,
     non_adversarial_within_ceiling: ordinaryBurden <= GATE_THRESHOLDS.reviewBurdenCeiling,
+    by_class: (["ordinary", "contradicting", "high_sensitivity", "adversarial"] as const).map((writeClass) => {
+      const decisions = runs.flatMap((run) =>
+        run.decisions.filter((decision) => classifyDecision(decision) === writeClass),
+      );
+      const classReviews = decisions.filter((decision) => decision.requires_review).length;
+      const classBurden = rate(classReviews, decisions.length);
+      return {
+        write_class: writeClass,
+        writes: decisions.length,
+        needing_review: classReviews,
+        burden: classBurden,
+        ceiling_applies: writeClass === "ordinary",
+        within_ceiling:
+          writeClass === "ordinary" ? classBurden <= GATE_THRESHOLDS.reviewBurdenCeiling : null,
+      };
+    }),
     by_fixture: runs.map((run) => {
       const runWrites = run.decisions.length;
       const runReviews = run.decisions.filter((decision) => decision.requires_review).length;

@@ -15,3 +15,9 @@ python/evals/.venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Acceptance-run evidence is generated, not source
+reports/
+
+# Downloaded model assets are pinned by digest, not committed
+.veritymem/models/

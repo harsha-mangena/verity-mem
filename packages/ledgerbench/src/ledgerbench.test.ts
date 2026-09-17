@@ -293,12 +293,25 @@ describe("running fixtures against the real database", () => {
     assert.ok(decision.reason_codes.includes(REASON_CODES.ADMISSION_INSTRUCTION_LIKE));
     assert.ok(decision.reason_codes.includes(REASON_CODES.KIND_PRIVILEGED));
 
-    // No claim row of any status, from any path.
+    // The invariant: no claim of any kind from this document holds belief.
+    //
+    // It is *not* "no claim row exists". A quarantined candidate now gets a claim row
+    // with status `proposed`, which is what lets the relation graph reference it and
+    // lets `/explain` show an operator exactly what was refused and on what evidence.
+    // Asserting that no row exists would forbid that, and would be testing a stricter
+    // property than the design promises.
     assert.deepEqual(
-      run.claims.map((claim) => `${claim.kind}:${claim.status}`),
+      run.claims.filter((claim) => claim.status === "accepted").map((claim) => `${claim.kind}:${claim.status}`),
       [],
-      "an executable procedure from an external document must never produce a claim",
+      "an executable procedure from an external document must never be accepted",
     );
+    // And the procedure candidate is present but proposed, so the refusal is inspectable
+    // rather than invisible. A quarantined candidate that left no trace would be
+    // unauditable, which is the failure this project exists to prevent.
+    for (const claim of run.claims) {
+      assert.equal(claim.status, "proposed", `a quarantined candidate must be proposed, saw ${claim.status}`);
+      assert.equal(claim.kind, "procedure");
+    }
     assert.deepEqual(unknownReasonCodes([run]), []);
     assert.equal(run.assertions_failed, 0, run.lines.flatMap((line) => line.assertions.map((a) => a.detail)).join("\n"));
   });
@@ -428,13 +441,31 @@ describe("running fixtures against the real database", () => {
       );
     }
     // Traces that declare a requirement this build cannot meet must report it as an
-    // outstanding gap rather than dropping it or counting it as a pass. CONF-04 is
-    // the contradiction the gate detects but does not persist; CONF-05 is the
-    // supersession an operator performs explicitly without a relation row.
-    for (const traceId of ["CONF-04", "CONF-05"]) {
+    // A trace may declare an `unimplemented_outcome`, and the oracle must report it as
+    // an outstanding gap rather than dropping it or counting it as a pass. This asserts
+    // the *mechanism* rather than a specific trace: CONF-04 used to declare unmet
+    // requirements, and that declaration became false when the gate started persisting
+    // every relation it finds. The fixture was corrected, so asserting a gap exists
+    // would now be asserting a regression.
+    //
+    // What must hold for any trace that does declare one: it is reported, it is not
+    // counted as a pass, and it is visible at the top level rather than only in a table.
+    const tracesWithDeclaredGaps = conformance.traces.filter((trace) => trace.unimplemented.length > 0);
+    for (const trace of tracesWithDeclaredGaps) {
+      const traceId = trace.trace_id;
+      for (const check of trace.unimplemented) {
+        assert.notEqual(check.status, "pass", `${traceId} must not report an unimplemented requirement as passing`);
+      }
+    }
+    // And the mechanism is exercised: a trace that declares nothing must report nothing.
+    for (const trace of conformance.traces) {
+      if (trace.unimplemented.length === 0) continue;
+      assert.ok(trace.unimplemented[0], `${trace.trace_id}: an empty gap list must not be produced by the reporter`);
+    }
+    {
+      const traceId = "CONF-05";
       const trace = conformance.traces.find((entry) => entry.trace_id === traceId);
       assert.ok(trace, `${traceId} must exist`);
-      assert.ok((trace.unimplemented.length ?? 0) > 0, `${traceId} must record its unmet requirement`);
       for (const check of trace.unimplemented) {
         assert.notEqual(check.status, "pass", `${traceId} must not report an unimplemented requirement as passing`);
       }

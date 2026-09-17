@@ -567,10 +567,32 @@ export class CommitGate {
     // ---- 9. Persist --------------------------------------------------------
     const acceptedScopeId =
       outcome === "accept_limited_scope" ? candidate.event_scope_id : candidate.requested_scope_id;
-    const claimId =
-      outcome === "accept" || outcome === "accept_limited_scope"
-        ? await this.insertClaim(executor, candidate, acceptedScopeId, conflicts, validFrom)
-        : null;
+
+    // A claim row is written for `needs_review` and `quarantine` too, with status
+    // `proposed` rather than `accepted`.
+    //
+    // This was a real defect and it was silent. Only `accept` and
+    // `accept_limited_scope` produced a claim, so a candidate the verifier had found a
+    // *contradiction* for had nowhere to record that contradiction: `claim_relations`
+    // is keyed on claim ids on both sides, and `findConflicts` had already established
+    // the other side. The verifier therefore detected contradictions, wrote the reason
+    // code onto the decision, and discarded the relation — leaving a relation graph
+    // that showed duplicates and supersessions but never a contradiction, which is the
+    // one relation an operator most needs to see.
+    //
+    // `proposed` is the right status rather than `accepted`: the claim is real, it is
+    // inspectable, its evidence is bound, and it is explicitly not believed. Nothing is
+    // promoted by writing it — the status transition guard still requires a decision
+    // row to move it — and `/explain` can now show the contradicting pair.
+    const holdsBelief = outcome === "accept" || outcome === "accept_limited_scope";
+    const status: "accepted" | "proposed" = holdsBelief ? "accepted" : "proposed";
+    const writesClaim =
+      holdsBelief ||
+      outcome === "needs_review" ||
+      outcome === "quarantine";
+    const claimId = writesClaim
+      ? await this.insertClaim(executor, candidate, acceptedScopeId, conflicts, validFrom, status, holdsBelief)
+      : null;
 
     const decisionId = await this.insertDecision(executor, candidate, {
       outcome,
@@ -703,6 +725,8 @@ export class CommitGate {
     acceptedScopeId: string,
     conflicts: readonly ConflictHit[],
     validFrom: string,
+    status: "accepted" | "proposed",
+    holdsBelief: boolean,
   ): Promise<string> {
     const claimId = this.deps.ids.next("clm");
     const recordedAt = this.deps.clock.now().toISOString();
@@ -713,7 +737,7 @@ export class CommitGate {
          valid_from, valid_to, recorded_at, expires_at, origin_event_id,
          extractor, model_version, prompt_version
        ) VALUES (
-         $1::uuid, $2::uuid, $3::uuid, $4::claim_kind, $5, $6, $7::jsonb, 'accepted', $8::authority_cls,
+         $1::uuid, $2::uuid, $3::uuid, $4::claim_kind, $5, $6, $7::jsonb, $15::claim_status, $8::authority_cls,
          $9::timestamptz, NULL, $10::timestamptz, NULL, $11::uuid,
          $12, $13, $14
        )`,
@@ -732,6 +756,7 @@ export class CommitGate {
         candidate.extractor,
         candidate.model_version,
         candidate.prompt_version,
+        status,
       ],
     );
 
@@ -744,14 +769,18 @@ export class CommitGate {
       );
     }
 
-    // Record the relations the verifier found. Contradiction is explicit, so it
-    // must be written down rather than left for a future reader to re-derive.
+    // Every relation the verifier found is written, whatever the outcome. The relation
+    // graph is a record of what the verifier established, not of what it happened to
+    // believe: a contradiction found against a claim that is only `proposed` is exactly
+    // the fact an operator reviewing that candidate needs, and discarding it because the
+    // candidate was not auto-accepted is how the graph came to be missing the one
+    // relation that matters most.
     for (const hit of conflicts) {
       await executor.query(
         `INSERT INTO claim_relations (from_claim, to_claim, rel)
          VALUES ($1::uuid, $2::uuid, $3::relation_kind)
          ON CONFLICT (from_claim, to_claim, rel) DO NOTHING`,
-        [stripPrefix(claimId), stripPrefix(hit.claim_id), hit.rel === "duplicates" ? "duplicates" : hit.rel],
+        [stripPrefix(claimId), stripPrefix(hit.claim_id), hit.rel],
       );
     }
 
@@ -759,6 +788,7 @@ export class CommitGate {
     // supersession of the older record, so the older one stops being current.
     // Nothing is deleted; the history stays readable.
     for (const hit of conflicts) {
+      if (!holdsBelief) continue;
       if (hit.rel !== "supersedes" && hit.rel !== "duplicates") continue;
       // Closed at the *superseding* claim's valid_from, not at the gate clock. The
       // earlier claim was believed until the moment the new one became true, and using

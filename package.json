@@ -21,7 +21,7 @@
     "dev:server": "node --experimental-strip-types --watch apps/server/src/main.ts",
     "dev:worker": "node --experimental-strip-types --watch apps/worker/src/main.ts",
     "demo": "node --experimental-strip-types apps/reference-dev-agent/src/main.ts",
-    "eval:ledgerbench": "node --experimental-strip-types scripts/ledgerbench.ts"
+    "eval:ledgerbench": "node --experimental-strip-types packages/ledgerbench/src/cli.ts"
   },
   "devDependencies": {
     "@types/node": "22.18.1",

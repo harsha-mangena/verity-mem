@@ -188,7 +188,25 @@ describe("/explain", () => {
       hostile.outcomes.includes("quarantine"),
       `the hostile procedure must be quarantined, saw ${hostile.outcomes.join(", ") || "no candidates"}`,
     );
-    assert.equal(hostile.claimId, null, "a quarantined procedure never becomes a claim");
+
+    // A quarantined candidate now produces a claim row with status `proposed`, and this
+    // test's original assertion — that it produces none — was testing a stricter
+    // property than the design promises. What matters is that it holds no belief, and
+    // that the refusal is inspectable: a quarantined candidate that left no trace would
+    // be unauditable.
+    assert.ok(hostile.claimId, "a quarantined candidate must leave an inspectable record");
+    const quarantined = await explainClaim(
+      h.deps,
+      { tenantId: h.tenantId, scopeIds: [h.scopeId], purposes: ["release_planning"] },
+      hostile.claimId,
+    );
+    assert.ok(quarantined, "a quarantined claim must be explainable — that is when an operator needs it");
+    assert.equal(quarantined.explanation.claim.status, "proposed", "quarantine must never hold belief");
+    assert.equal(quarantined.explanation.claim.kind, "procedure");
+    assert.ok(
+      quarantined.explanation.claim.promotion.reason_codes.includes(REASON_CODES.KIND_PRIVILEGED),
+      "and the explanation must say why it was refused",
+    );
 
     const decisions = await h.ctx.db.withSystemContext({ tenant: h.tenantId, actor: "test" }, (executor) =>
       executor.query<{ reason_codes: string[]; outcome: string }>(
