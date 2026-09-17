@@ -345,7 +345,20 @@ export class FixtureRunner {
     });
 
     const state = new RunState(
-      { options: this.options, runScope: this.runScope, fixture, tenantSlug, tenantId, seed, ledger, gate, db, clock, ids },
+      {
+        options: this.options,
+        runScope: this.runScope,
+        runToken: this.runToken,
+        fixture,
+        tenantSlug,
+        tenantId,
+        seed,
+        ledger,
+        gate,
+        db,
+        clock,
+        ids,
+      },
       blobs,
     );
 
@@ -433,6 +446,8 @@ interface RunStateDeps {
   readonly options: FixtureRunnerOptions;
   /** The run's scope token; part of every derived partition and id seed. */
   readonly runScope: string;
+  /** The run's per-instance token; part of the id seed and the idempotency keys. */
+  readonly runToken: string;
   readonly fixture: FixtureFile;
   readonly tenantSlug: string;
   readonly tenantId: string;
@@ -623,18 +638,18 @@ class RunState {
    * isolated per run; any other declared tenant is derived so a fixture's rival
    * tenant is stable across runs of that fixture.
    */
-  private tenantIdFor(declaredTenant: string): string {
-    const known = this.tenantIdsBySlug.get(declaredTenant);
-    if (known) return known;
-    // Exactly the uuid `Ledger` writes this slug under: `Ledger.append` resolves the
-    // tenant from the request scope and hands the result to `ensureScope`, which
-    // resolves it again, so the physical tenant is `resolveTenantId` applied twice.
-    // Any other derivation puts the run's scopes in one partition and its events in
-    // another — every write succeeds and every read returns nothing, which is the
-    // most confusing possible failure for a benchmark to report.
-    const tenantId = resolveTenantId(resolveTenantId(declaredTenant));
-    this.tenantIdsBySlug.set(declaredTenant, tenantId);
-    return tenantId;
+  /**
+   * The tenant every one of this run's scopes lives in.
+   *
+   * A fixture's tenant strings are labels for scope resolution inside the run; the
+   * physical partition is the run's own slug, which carries the run token. That is
+   * the only arrangement that works against an append-only ledger: a fixture that
+   * reused a fixed partition across runs would find its idempotency keys already
+   * spent and its events already redacted by the previous run, and would report a
+   * broken system where the system was behaving exactly as designed.
+   */
+  private tenantIdFor(_declaredTenant: string): string {
+    return this.tenantId;
   }
 
   private rememberScope(scope: ResolvedScope, declaredSlug: string): void {
@@ -831,7 +846,8 @@ class RunState {
       // The ledger binds its own request context, so the append happens outside the
       // tenant-wide binding: an ingress request must not inherit the analyzer's
       // reach, or the benchmark would be testing a write path that does not ship.
-      const receipt = await this.deps.ledger.append(entry.event, { principal: entry.event.actor_id });
+      const request = this.runScoped(entry);
+      const receipt = await this.deps.ledger.append(request, { principal: request.actor_id });
       if (process.env["LEDGERBENCH_TRACE"] === "1") {
         console.error(
           `[append] declared=${JSON.stringify(entry.event.scope.tenant)} receiptTenant=${receipt.scope.tenant_id} ` +
@@ -898,6 +914,33 @@ class RunState {
         assertions,
       });
     }
+  }
+
+  /**
+   * The event as this run appends it.
+   *
+   * Two substitutions, both of which exist because the ledger is append-only:
+   *
+   *  - **tenant** becomes the run's own slug. A fixture cannot own a tenant across
+   *    runs, and a fixture that tried to would collide with its own previous run.
+   *  - **idempotency_key** gains the run token. An idempotency key is unique per
+   *    tenant, so a fixed key plus a fixed tenant means the second run's append is
+   *    answered by the first run's event — the classic way a benchmark reports a
+   *    failure that is its own fault.
+   *
+   * Everything else, including the content and therefore every byte offset, is
+   * untouched.
+   */
+  private runScoped(entry: Extract<FixtureBodyLine, { kind: "append_event" }>): EventAppendRequest {
+    const event = entry.event;
+    const rewritten: EventAppendRequest = {
+      ...event,
+      scope: { ...event.scope, tenant: this.deps.tenantSlug },
+      ...(event.idempotency_key !== undefined
+        ? { idempotency_key: `${event.idempotency_key}#${this.deps.runToken.slice(0, 8)}` }
+        : {}),
+    };
+    return rewritten;
   }
 
   /**

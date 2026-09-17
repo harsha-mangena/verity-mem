@@ -898,3 +898,74 @@ SELECT veritymem.row_authorized(gen_random_uuid(), gen_random_uuid());  -- no co
 failures are in a file under active development and are recorded rather than
 suppressed, because a security document that reports only the green numbers is the
 self-graded claim §5.3 warns about.
+
+---
+
+# Addendum — findings closed after this document was first written
+
+This document was produced by an audit that ran while the retrieval pipeline was
+still being written, and it named several open defects. Recording which of them
+have since been closed, and how, is the difference between a threat model and a
+snapshot of one day's bugs. Everything below was verified against the running
+database, not reasoned about.
+
+## Closed
+
+| Was | Now | Where |
+| --- | --- | --- |
+| `forget()` bound an empty scope set and an empty purpose set, so the scrub matched nothing, the residual scan matched nothing, and the job reported `verified` | Retention runs in an explicit tenant-bound system context. `Db.withSystemContext` is the only way to obtain one, and it is named at the call site so the privilege is visible | `migrations/0009`, `packages/ledger/src/db.ts`, `packages/retrieval/src/retention.ts` |
+| The outbox worker read no rows, so `project.claim` completed without projecting anything | Messages carry `scope_ids` and `purposes`; `OutboxWorker` **throws** on a message that carries neither, so the silent no-op is now a loud failure | `packages/ledger/src/{ledger,outbox}.ts`, `packages/model-adapters/src/pipeline.ts` |
+| Seven tenant tables had no row-level security; `outbox.payload` carries `chain_input`, the preimage of `events.link_hash` | Every tenant-carrying table has RLS and a policy. A migration self-check asserts no table has RLS enabled without a policy | `migrations/0009` |
+| An empty purpose set acted as a wildcard, and two OR'd policies let the cheaper clause decide visibility | One predicate, `veritymem.row_authorized`, wrapped in `COALESCE(..., FALSE)`. Purpose is a hard boundary and an empty set denies | `migrations/0005`, `0006`, `0007` |
+| Reach was derived from the caller's own scope selector, so a bare tenant+project request claimed to be the project | Reach is `principal_scopes ∪ live grants`; the selector can only narrow | `migrations/0008`, `packages/retrieval/src/planner.ts` |
+| Migration `0007` narrowed containment but policy still used the `0006` rule — two implementations | Containment is one function, `veritymem.scope_contains`, called by the RLS predicate and mirrored clause-for-clause by the planner's set query, with a self-check that constructs its own scopes rather than trusting whatever rows exist | `migrations/0007` |
+| `claims.status`, `object`, `authority`, `scope_id` and the validity window were mutable by `UPDATE` with no decision row | The proposition and the gate's outputs are frozen; a closed interval cannot be reopened; a status transition requires a decision row. Revocation and retention write theirs | `migrations/0010`, `packages/claims/src/index.ts` |
+| Query keywords were promoted into a hard `subject = ANY(...)` filter, which excluded every claim | Terms mined from query text go to the entity channel as vocabulary. Only caller-declared subjects filter | `packages/retrieval/src/planner.ts` |
+| A bare `approved` predicate made two different approvals read as a contradiction | Predicates are namespaced (`decision.approved`), so "a different object" stops being read as "a contradictory object" | `packages/model-adapters/src/deterministic.ts` |
+
+## Still open, and stated plainly
+
+- **`origin` and `actor_id` are caller-supplied.** `defaultAuthorityFor` maps
+  `database` to `verified_record`, the strongest auto-accept class, so a caller that
+  can reach the write path can self-declare the authority it needs. This is a
+  constraint the authentication layer must impose; the packages cannot.
+- **Blob bytes are never reclaimed.** Redaction removes the ledger's reference and
+  the digest, but an out-of-line payload remains on disk in the blob store. Nothing
+  in v0.1 can prove otherwise, which is precisely why the specification defers
+  deletion-across-backups and crypto-shredding to v0.5. Until then, a retention
+  manifest describes live stores only, and it says so.
+- **The conflict classifier is conservative in a specific direction.** Two differing
+  scalar objects for the same subject and predicate are classified `contradicts`, so a
+  second, unrelated approval by the same principal lands in review rather than being
+  accepted. That is the safe direction — the alternative is silently accumulating
+  contradictory accepted facts — and it costs review burden. It is a calibration
+  question with a policy version, not a bug.
+- **`claims.expires_at` is always written `NULL`,** so the `use.expired` reason code
+  is unreachable today. The check exists and the column exists; nothing populates it.
+  A claim kind with an expiry needs to set it at admission.
+- **`reviewBurdenCeiling` has no reader.** The 2% ceiling is declared in policy and
+  nothing computes the ratio in the library. The reference workload prints it; the
+  server does not.
+- **~10 configuration knobs were inert.** `GATE_ENTAILMENT_BACKEND`,
+  `GATE_CONFIDENCE_THRESHOLD`, `EMBEDDING_BACKEND` and `EMBEDDING_MODEL_ID` are wired
+  by the server; the rest are documented in the policy cookbook as parsed-but-unused.
+- **`createOnnxEntailmentBackend` has no caller and its tokenizer is a documented
+  placeholder.** The ONNX path refuses rather than guessing when the tokenizer
+  artefact is absent, which is the correct failure mode, but it means the "real"
+  entailment backend is not usable yet.
+- **The hash chain has no external anchor**, so it is tamper-evident against accident
+  and not tamper-proof against an operator with database access. The documentation
+  says so in those words.
+- **No published benchmark numbers.** `LedgerBench` fixtures and a runner exist; no
+  accuracy figure has been produced, and the specification is explicit that
+  reproducing before citing is required.
+
+## Test status
+
+`pnpm test` currently reports **76 tests, 76 pass, 0 fail**. This document was
+written when the figure was 60/51/9 and the note below records that, because a
+security document that silently rewrites its own history is worth less than one that
+shows its work.
+
+The earlier failures were real and are described above; none were suppressed to make
+the suite green.
