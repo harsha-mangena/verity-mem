@@ -4,10 +4,32 @@
 # pinned environment, with the reports retained as artifacts so a green result can be
 # inspected rather than taken on trust.
 #
-# Two properties are deliberate and both were absent before this file existed:
+# Three properties are deliberate:
+#
+#   * **The database is the shipped deployment, not a second encoding of it.** The
+#     Postgres the job runs is `deploy/compose/docker-compose.yml`, brought up with
+#     `docker compose`. An earlier revision of this file declared a `services:` block
+#     instead, and that was wrong twice over:
+#
+#       - The runner passes `options:` straight to `docker create` ahead of the image, so
+#         `-c shared_preload_libraries=...` was parsed by the *Docker CLI* as `--cpu-shares`
+#         and the container was never created:
+#             invalid argument "shared_preload_libraries=pg_stat_statements"
+#             for "-c, --cpu-shares" flag: strconv.ParseInt: parsing
+#             "shared_preload_libraries=pg_stat_statements": invalid syntax
+#         A `services:` block has no way to pass postmaster arguments at all (no `command:`
+#         key exists for services), so the observability configuration the threat model
+#         depends on was unreachable from CI.
+#       - `scripts/verify.sh` asserts against the Compose-managed container by name,
+#         `docker exec veritymem-postgres ...`. A service container has a generated name,
+#         so the gate would have failed on its own environment check.
+#
+#     Using Compose removes both problems and means CI cannot silently drift from the
+#     documented deployment, because there is only one definition.
 #
 #   * **The services are pinned by tag, not by `latest`.** A green run against an
 #     undeclared PostgreSQL is not evidence about the PostgreSQL anyone will deploy.
+#
 #   * **A missing tool fails the job.** The verification script refuses to skip a step,
 #     so a partial environment produces a red job rather than a green one with a hole in
 #     it. `uv` is installed explicitly for the same reason.
@@ -28,7 +50,6 @@ env:
   NODE_VERSION: "22.18.0"
   PNPM_VERSION: "9.15.9"
   PYTHON_VERSION: "3.12"
-  POSTGRES_IMAGE: "pgvector/pgvector:0.8.6-pg17-trixie"
   DATABASE_URL: "postgres://veritymem_app:veritymem_app@127.0.0.1:55432/veritymem"
   MIGRATION_DATABASE_URL: "postgres://verity:verity@127.0.0.1:55432/veritymem"
 
@@ -37,21 +58,6 @@ jobs:
     name: acceptance (node ${{ env.NODE_VERSION }}, pg17 + pgvector 0.8.6)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-
-    services:
-      postgres:
-        image: pgvector/pgvector:0.8.6-pg17-trixie
-        env:
-          POSTGRES_USER: verity
-          POSTGRES_PASSWORD: verity
-          POSTGRES_DB: veritymem
-          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
-        ports: ["55432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U verity -d veritymem"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
 
     steps:
       - uses: actions/checkout@v4
@@ -75,33 +81,111 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile -r
 
-      # The application role the policies bind to is created by the compose init scripts
-      # locally. In CI the service container starts from the same image without them, so
-      # the role is created here from the same definition rather than by granting the
-      # tests a superuser.
-      - name: Create the application role
+      # A hosted runner is clean, but `down -v` makes the job idempotent on a self-hosted
+      # runner too, where a leftover `veritymem-postgres` from an earlier run would
+      # otherwise be reused and the acceptance result would describe the wrong database.
+      - name: Clear any previous database
+        run: docker compose -f deploy/compose/docker-compose.yml down -v --remove-orphans
+
+      - name: Start the reference deployment
+        run: docker compose -f deploy/compose/docker-compose.yml up -d postgres
+
+      # The Compose file declares a healthcheck; this waits for it rather than sleeping
+      # for a guessed interval, and fails loudly instead of letting migrations race the
+      # server's first start.
+      - name: Wait for Postgres to report healthy
         run: |
-          PGPASSWORD=verity psql -h 127.0.0.1 -p 55432 -U verity -d veritymem -v ON_ERROR_STOP=1 <<'SQL'
-          CREATE EXTENSION IF NOT EXISTS vector;
-          CREATE EXTENSION IF NOT EXISTS pg_trgm;
+          for _ in $(seq 1 60); do
+            status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' veritymem-postgres 2>/dev/null || echo missing)"
+            case "$status" in
+              healthy) echo "postgres is healthy"; exit 0 ;;
+              unhealthy) echo "postgres reported unhealthy"; docker logs veritymem-postgres; exit 1 ;;
+              missing) echo "the container does not exist"; exit 1 ;;
+            esac
+            sleep 2
+          done
+          echo "postgres did not become healthy within 120s"
+          docker logs veritymem-postgres
+          exit 1
+
+      # The Compose file above and the environment the tests assume are two things that
+      # can drift, so the properties the tests actually depend on are asserted here by the
+      # server itself. An earlier comment in this file claimed the application role was
+      # "created here"; it is created by `deploy/compose/initdb/01-extensions.sql`, and
+      # this step is what proves that happened.
+      #
+      # Each check raises rather than printing a value for a human to compare: a check
+      # whose failure mode is a log line is not a check, and the non-zero exit is the gate.
+      - name: Assert the server matches the documented environment
+        run: |
+          docker exec -i veritymem-postgres psql -U verity -d veritymem -v ON_ERROR_STOP=1 <<'SQL'
           DO $$
+          DECLARE
+            v_major   text;
+            v_collate text;
+            v_vector  text;
+            v_trgm    text;
+            v_stats   text;
+            v_super   boolean;
+            v_bypass  boolean;
+            v_preload text;
           BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'veritymem_app') THEN
-              CREATE ROLE veritymem_app LOGIN PASSWORD 'veritymem_app'
-                NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+            SELECT split_part(current_setting('server_version'), '.', 1) INTO v_major;
+            IF v_major <> '17' THEN
+              RAISE EXCEPTION 'expected PostgreSQL 17, server is %', current_setting('server_version');
             END IF;
+
+            SELECT datcollate INTO v_collate FROM pg_database WHERE datname = current_database();
+            IF v_collate <> 'C' THEN
+              RAISE EXCEPTION 'expected collation C (replay equality depends on it), got %', v_collate;
+            END IF;
+
+            SELECT extversion INTO v_vector FROM pg_extension WHERE extname = 'vector';
+            IF v_vector IS DISTINCT FROM '0.8.6' THEN
+              RAISE EXCEPTION 'expected pgvector 0.8.6, got %', COALESCE(v_vector, '<absent>');
+            END IF;
+
+            SELECT extversion INTO v_trgm FROM pg_extension WHERE extname = 'pg_trgm';
+            IF v_trgm IS NULL THEN
+              RAISE EXCEPTION 'pg_trgm is absent; the lexical channel depends on it';
+            END IF;
+
+            SELECT extversion INTO v_stats FROM pg_extension WHERE extname = 'pg_stat_statements';
+            IF v_stats IS NULL THEN
+              RAISE EXCEPTION 'pg_stat_statements is absent; it is the documented observability path';
+            END IF;
+
+            SELECT current_setting('shared_preload_libraries') INTO v_preload;
+            IF v_preload NOT LIKE '%pg_stat_statements%' THEN
+              RAISE EXCEPTION 'pg_stat_statements is not preloaded; shared_preload_libraries=%', v_preload;
+            END IF;
+
+            SELECT rolsuper, rolbypassrls INTO v_super, v_bypass
+              FROM pg_roles WHERE rolname = 'veritymem_app';
+            IF v_super IS NULL THEN
+              RAISE EXCEPTION 'role veritymem_app does not exist';
+            END IF;
+            IF v_super OR v_bypass THEN
+              RAISE EXCEPTION 'veritymem_app is superuser=% bypassrls=%: RLS would not bind to it',
+                v_super, v_bypass;
+            END IF;
+
+            RAISE NOTICE 'environment asserted: pg %, collation %, vector %, pg_trgm %, pg_stat_statements %, app role unprivileged, stats preloaded',
+              current_setting('server_version'), v_collate, v_vector, v_trgm, v_stats;
           END
           $$;
-          GRANT CONNECT ON DATABASE veritymem TO veritymem_app;
-          GRANT USAGE ON SCHEMA public TO veritymem_app;
+
+          -- Reading the view proves the extension is not merely installed but usable: a
+          -- preload misconfiguration fails this row even when CREATE EXTENSION succeeded.
+          SELECT count(*) AS extension_usable FROM pg_stat_statements;
           SQL
 
       - name: Migrate
         run: pnpm migrate
 
-      # `verify.sh` needs Docker for its own service assertions, which is not available to
-      # a service container in the same way. The script detects and reports; the CI job
-      # runs the same steps it can and the script's exit code is the gate.
+      # The gate. `--fast` drops the two end-to-end steps that need more wall clock than a
+      # pull request should spend; every other step runs, and the script's exit code is the
+      # result. A full run is `bash scripts/verify.sh` with no argument.
       - name: Acceptance
         run: bash scripts/verify.sh --fast
 
@@ -113,3 +197,10 @@ jobs:
           path: reports/
           retention-days: 90
           if-no-files-found: error
+
+      # Without this a failed job leaves the container running and the log unread, which is
+      # the least useful possible outcome for the person who has to fix it.
+      - name: Postgres logs on failure
+        if: failure()
+        run: docker logs veritymem-postgres || true
+

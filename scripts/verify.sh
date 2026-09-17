@@ -48,7 +48,53 @@ mkdir -p "$REPORTS_DIR"
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
 note() { printf '   %s\n' "$1"; }
-fail() { printf '\n\033[31mFAILED: %s\033[0m\n' "$1" >&2; exit 1; }
+
+# Every failure writes a record before exiting. Without this a failed run left
+# `reports/` holding only the steps that happened to run first, and the CI job's
+# artifact upload -- which is configured to fail when it finds nothing -- turned a red
+# gate into a red *upload*, so the evidence for the failure was the one thing missing.
+# The record states `complete: false`, so a partial report cannot be mistaken for a
+# finished one that simply omitted fields.
+record_failure() {
+  local reason="$1"
+  mkdir -p "$REPORTS_DIR"
+  # A completed run wrote summary.json; a failure after that point must not replace the
+  # fuller record with a stub.
+  if [[ -f "$REPORTS_DIR/summary.json" ]]; then
+    printf '%s\n' "$reason" >> "$REPORTS_DIR/summary.json.failure"
+    return 0
+  fi
+  # The reason reaches the child through `export`, not as a trailing `VAR=value`
+  # argument: `node -e '...' VAR=value` passes the assignment as *argv* to the script, so
+  # the first version of this function wrote a record with no `failure` field at all. The
+  # same mistake is called out in step 9 below, which is where it was first made.
+  VERITYMEM_FAILURE="$reason" REPORTS_DIR="$REPORTS_DIR" node -e '
+  const fs = require("node:fs");
+  const { execSync } = require("node:child_process");
+  const git = (cmd, fallback) => { try { return execSync(cmd).toString().trim(); } catch { return fallback; } };
+  const record = {
+    complete: false,
+    outcome: "failed",
+    generated_at: new Date().toISOString(),
+    failure: process.env.VERITYMEM_FAILURE,
+    commit: git("git rev-parse HEAD", "unknown"),
+    commit_short: git("git rev-parse --short HEAD", "unknown"),
+    node: process.version,
+    full_run: process.env.VERITYMEM_FAST === "0",
+    note: "This run stopped early. The steps that completed wrote their own reports; anything absent was not run.",
+  };
+  fs.writeFileSync(process.env.REPORTS_DIR + "/acceptance-failure.json", JSON.stringify(record, null, 2) + "\n");
+  ' 2>/dev/null \
+    || printf '{\n  "complete": false,\n  "outcome": "failed",\n  "failure": "node was unavailable while recording the failure; see stdout",\n  "generated_at": "%s"\n}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+         > "$REPORTS_DIR/acceptance-failure.json"
+}
+
+fail() {
+  printf '\n\033[31mFAILED: %s\033[0m\n' "$1" >&2
+  record_failure "$1"
+  printf 'A failure record was written to %s/acceptance-failure.json.\n' "$REPORTS_DIR" >&2
+  exit 1
+}
 
 # A tool that is needed and absent is a failure. Never a skip.
 require() {
@@ -130,10 +176,21 @@ step "6. LedgerBench"
 # The exit code is the gate, not the output. This is the command the release gate
 # names, and it was pointing at a file that did not exist until this script was
 # rewritten to check it.
-pnpm eval:ledgerbench --seed 1 \
+# A red gate is recorded and the run continues, so the retained artifact contains every
+# step rather than only the ones that preceded the failure. `GATE_RED` makes the script
+# exit non-zero at the end: continuing is not the same as passing, and the exit code is
+# still the release decision.
+GATE_RED=0
+GATE_REASON=""
+if ! pnpm eval:ledgerbench --seed 1 \
   --out "$REPORTS_DIR/ledgerbench.json" \
   --jsonl "$REPORTS_DIR/ledgerbench-raw.jsonl" 2>&1 \
-  | tee "$REPORTS_DIR/ledgerbench.txt" || fail "LedgerBench reported a failing gate"
+  | tee "$REPORTS_DIR/ledgerbench.txt"; then
+  GATE_RED=1
+  GATE_REASON="$(sed -n '/release gate FAILED/,$p' "$REPORTS_DIR/ledgerbench.txt" | head -1)"
+  note "LedgerBench gate: RED — ${GATE_REASON:-see reports/ledgerbench.txt}"
+  note "continuing so the retained report is complete; this run still exits non-zero"
+fi
 
 # ---------------------------------------------------------------------------
 step "6b. The production entailment verifier"
@@ -176,7 +233,7 @@ step "9. Evidence summary"
 # Exported rather than appended after the command: `node -e '...' VAR=value` passes the
 # assignment as an argument to the script, not into its environment, and the first
 # version of this step silently wrote a summary of nulls and zeros.
-export PG_VERSION PGVECTOR_VERSION MIGRATION_COUNT RLS_TABLES POLICIES TESTS_PASSED GATE_STATE
+export PG_VERSION PGVECTOR_VERSION MIGRATION_COUNT RLS_TABLES POLICIES TESTS_PASSED GATE_STATE GATE_RED GATE_REASON
 export VERITYMEM_FAST="$FAST"
 
 node -e '
@@ -196,10 +253,21 @@ const summary = {
   tests_passed: Number(process.env.TESTS_PASSED || 0),
   production_entailment_verifier: process.env.GATE_STATE,
   full_run: process.env.VERITYMEM_FAST === "0",
+  // Stated in the machine-readable record as well as on stdout: a reader of the artifact
+  // alone must be able to tell a green gate from a red one.
+  release_gate: process.env.GATE_RED === "1" ? "failed" : "passed",
+  release_gate_reason: process.env.GATE_REASON || null,
 };
 fs.writeFileSync(`${process.env.REPORTS_DIR}/summary.json`, JSON.stringify(summary, null, 2) + "\n");
 console.log(JSON.stringify(summary, null, 2));
 '
+
+if [[ "$GATE_RED" == "1" ]]; then
+  printf '\n\033[31mAcceptance checks failed: the LedgerBench release gate is red.\033[0m\n'
+  printf '%s\n' "${GATE_REASON:-see reports/ledgerbench.txt}"
+  printf 'Reports retained in %s/ for commit %s.\n' "$REPORTS_DIR" "$(git rev-parse --short HEAD)"
+  exit 1
+fi
 
 printf '\n\033[32mAcceptance checks passed.\033[0m\n'
 printf 'Reports retained in %s/ for commit %s.\n' "$REPORTS_DIR" "$(git rev-parse --short HEAD)"
