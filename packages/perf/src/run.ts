@@ -85,6 +85,12 @@ export interface RunOptions {
   readonly blobDir: string;
   readonly anchor: Date | null;
   readonly referenceMachineDeclared: boolean;
+  /**
+   * Overrides for the connection strings. Set when the benchmark is pointed at an
+   * isolated database; left unset for the reference database from `.env`.
+   */
+  readonly databaseUrl?: string;
+  readonly migrationUrl?: string;
   readonly log: (message: string) => void;
 }
 
@@ -115,6 +121,8 @@ export const DEFAULT_ANCHOR = "2026-09-17T12:00:00.000Z";
 
 export async function runBenchmark(options: RunOptions): Promise<RunOutcome> {
   const env = loadEnv();
+  const migrationUrl = options.migrationUrl ?? env.migrationDatabaseUrl ?? env.databaseUrl;
+  const databaseUrl = options.databaseUrl ?? env.databaseUrl;
   const tenantId = resolveTenantId(options.tenantSlug);
   const anchor = defaultAnchor(options.anchor);
   const backend = new HashEmbeddingBackend({
@@ -133,7 +141,7 @@ export async function runBenchmark(options: RunOptions): Promise<RunOutcome> {
     options.log(`loading ${options.claims.toLocaleString("en-US")} claims ...`);
     let lastLog = 0;
     const loaded = await loadCorpus({
-      migrationUrl: env.migrationDatabaseUrl ?? env.databaseUrl,
+      migrationUrl,
       tenantId,
       tenantSlug: options.tenantSlug,
       claims: options.claims,
@@ -158,10 +166,10 @@ export async function runBenchmark(options: RunOptions): Promise<RunOutcome> {
     loadElapsed = loaded.elapsed_ms;
     resumedFrom = loaded.resumed_from;
     options.log(`load done   ${(loaded.elapsed_ms / 1000).toFixed(1)} s`);
-    await syncStreams(env.migrationDatabaseUrl ?? env.databaseUrl, tenantId);
+    await syncStreams(migrationUrl, tenantId);
   }
 
-  const counts = await countAll(env.migrationDatabaseUrl ?? env.databaseUrl, tenantId);
+  const counts = await countAll(migrationUrl, tenantId);
   const claimsMeasured = counts.find((entry) => entry.table === "claims")?.rows ?? 0;
   if (claimsMeasured === 0) {
     throw new Error(
@@ -180,7 +188,7 @@ export async function runBenchmark(options: RunOptions): Promise<RunOutcome> {
   });
 
   const db = new Db({
-    connectionString: env.databaseUrl,
+    connectionString: databaseUrl,
     // `compose()` has two bounded read lanes (ordinary and dense). Size for both
     // so a benchmark measures the database rather than self-inflicted pool waits.
     max: Math.max(2, options.concurrency * 2),
@@ -241,7 +249,12 @@ export async function runBenchmark(options: RunOptions): Promise<RunOutcome> {
       if (!primed && pass.state === "warm") {
         // No cold pass ran, so "warm" would be an unearned label. Warm it explicitly
         // with a half-size priming pass that is not measured.
-        await warmUp(dependencies, workload, Math.max(1, Math.floor(workload.requests.length / 2)));
+        await warmUp(
+          dependencies,
+          workload,
+          Math.max(1, Math.floor(workload.requests.length / 2)),
+          options.log,
+        );
         primed = true;
       }
       const result = await issuePass(db, dependencies, workload, {
@@ -257,8 +270,9 @@ export async function runBenchmark(options: RunOptions): Promise<RunOutcome> {
     await db.close();
   }
 
-  const digest = await corpusDigest(env.migrationDatabaseUrl ?? env.databaseUrl, tenantId, 2_000);
+  const digest = await corpusDigest(migrationUrl, tenantId, 2_000);
   const dataset = await buildDatasetFact({
+    migrationUrl,
     tenantSlug: options.tenantSlug,
     tenantId,
     corpusSeed: options.corpusSeed,
@@ -340,14 +354,25 @@ interface PassOptions {
   readonly poolErrors: readonly string[];
 }
 
-/** Prime the caches without recording anything, for a run that skips the cold pass. */
+/**
+ * Prime the caches, for a run that skips the cold pass.
+ *
+ * Errors are swallowed on purpose. A priming request that times out has told us the
+ * corpus is slow, which is the measurement's business and not a reason to abort before
+ * the measurement starts; the recorded pass will hit the same query and record it.
+ */
 async function warmUp(
   dependencies: RetrievalDependenciesLike,
   workload: WorkloadPlan,
   count: number,
+  log: (message: string) => void,
 ): Promise<void> {
   for (const entry of workload.requests.slice(0, count)) {
-    await compose(dependencies, entry.request, { principal: BENCH_PRINCIPAL });
+    try {
+      await compose(dependencies, entry.request, { principal: BENCH_PRINCIPAL });
+    } catch (error) {
+      log(`warmup      ${entry.shape} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 }
 
@@ -385,19 +410,44 @@ async function issuePass(
       if (!entry) return;
       const atSeconds = (performance.now() - started) / 1000;
       const requestStarted = performance.now();
-      const result = await compose(dependencies, entry.request, { principal: BENCH_PRINCIPAL });
-      const latency = (performance.now() - requestStarted) * 1000;
-      samples.push({
-        position: entry.position,
-        mode: entry.mode,
-        shape: entry.shape,
-        latency_us: latency,
-        returned: result.packet.claims.length,
-        candidates_considered: result.packet.coverage.candidates_considered,
-        decision: result.packet.decision,
-        empty: result.packet.claims.length === 0,
-        at_s: atSeconds,
-      });
+      try {
+        const result = await compose(dependencies, entry.request, { principal: BENCH_PRINCIPAL });
+        const latency = (performance.now() - requestStarted) * 1000;
+        samples.push({
+          position: entry.position,
+          mode: entry.mode,
+          shape: entry.shape,
+          latency_us: latency,
+          returned: result.packet.claims.length,
+          candidates_considered: result.packet.coverage.candidates_considered,
+          decision: result.packet.decision,
+          empty: result.packet.claims.length === 0,
+          error: null,
+          at_s: atSeconds,
+          channels: Object.fromEntries(
+            result.channels.map((channel) => [channel.channel, channel.duration_ms]),
+          ),
+        });
+      } catch (error) {
+        // Recorded, not dropped. A request that hit the server's `statement_timeout`
+        // is a latency observation, and the alternative — letting it kill the pass —
+        // loses every sample already taken. The elapsed time is kept, so the errored
+        // sample sits in the distribution at the timeout value it actually reached,
+        // and the per-mode error count says how many did.
+        samples.push({
+          position: entry.position,
+          mode: entry.mode,
+          shape: entry.shape,
+          latency_us: (performance.now() - requestStarted) * 1000,
+          returned: 0,
+          candidates_considered: 0,
+          decision: "error",
+          empty: true,
+          error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+          at_s: atSeconds,
+          channels: {},
+        });
+      }
     }
   };
 
@@ -418,6 +468,7 @@ async function issuePass(
     all: summary.all,
     content: summary.content,
     by_shape: summary.by_shape,
+    channels: summary.channels,
     buffers: { before, after, delta: diffBuffers(before, after) },
     pool_errors: [...options.poolErrors].slice(poolErrorBase),
   };
@@ -449,6 +500,7 @@ function diffBuffers(before: BufferStats, after: BufferStats): BufferStats {
 }
 
 interface DatasetFactInput {
+  readonly migrationUrl: string;
   readonly tenantSlug: string;
   readonly tenantId: string;
   readonly corpusSeed: string;
@@ -464,7 +516,7 @@ interface DatasetFactInput {
 }
 
 async function buildDatasetFact(input: DatasetFactInput): Promise<DatasetFact> {
-  const probe = await probeTemporalShape(input.tenantSlug, input.anchor.getTime());
+  const probe = await probeTemporalShape(input.migrationUrl, input.tenantSlug, input.anchor.getTime());
   // Read the accepted count back from the database rather than deriving it from the
   // generator's stated 21/25 mix: the target is stated in accepted claims, so the
   // number that decides "is this the target size" has to be a measurement.
@@ -526,9 +578,12 @@ interface TemporalProbe {
  * `as_of` and `during` percentiles are only meaningful if those queries really do
  * return a historical set rather than the whole table under a different predicate.
  */
-async function probeTemporalShape(tenantSlug: string, anchorMs: number): Promise<TemporalProbe> {
-  const env = loadEnv();
-  const pool = new Pool({ connectionString: env.migrationDatabaseUrl ?? env.databaseUrl, max: 1 });
+async function probeTemporalShape(
+  migrationUrl: string,
+  tenantSlug: string,
+  anchorMs: number,
+): Promise<TemporalProbe> {
+  const pool = new Pool({ connectionString: migrationUrl, max: 1 });
   const tenantId = resolveTenantId(tenantSlug);
   try {
     const status = await pool.query<{ status: string; n: number }>(

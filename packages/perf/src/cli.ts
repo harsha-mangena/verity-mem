@@ -21,12 +21,13 @@ import { randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import { loadEnv, resolveTenantId } from "@veritymem/ledger";
 import { HashEmbeddingBackend } from "@veritymem/retrieval";
+import { bootstrapDatabase } from "./isolated.ts";
 import { countAll, loadCorpus, syncStreams } from "./load.ts";
 import { TARGET_CLAIMS } from "./report.ts";
 import { DEFAULT_ANCHOR, defaultAnchor, runBenchmark } from "./run.ts";
 
 export interface CliOptions {
-  readonly command: "bench" | "load" | "status";
+  readonly command: "bench" | "load" | "status" | "isolated";
   readonly claims: number;
   /** Accepted claims the corpus was sized from, or null when `--claims` set the size directly. */
   readonly acceptedRequested: number | null;
@@ -42,6 +43,14 @@ export interface CliOptions {
   readonly stateDir: string;
   readonly anchor: Date | null;
   readonly referenceMachineDeclared: boolean;
+  /** Superuser connection used by `isolated` to create the benchmark database. */
+  readonly adminUrl: string;
+  readonly isolatedDatabase: string;
+  readonly fastEmbed: boolean;
+  /** Explicit connection overrides; unset means "use .env". */
+  readonly databaseUrl: string | null;
+  readonly migrationUrl: string | null;
+  readonly migrationsDir: string | null;
 }
 
 /**
@@ -51,6 +60,19 @@ export interface CliOptions {
  */
 export const OPEN_CLAIM_FRACTION = 21 / 25;
 
+/**
+ * The tenant slug a corpus lives under.
+ *
+ * Keyed on the *corpus size*, not on how the size was requested. `--accepted 1000000`
+ * and `--claims 1190477` name the same corpus, so they must resolve to the same tenant
+ * or the second command silently measures an empty dataset — which is exactly what
+ * happened on the first attempt at this benchmark, because `--accepted` rounded the size
+ * up to a number the plain `--claims` form did not produce.
+ */
+export function corpusSlug(corpusSeed: string, claims: number): string {
+  return `perf-bench-${corpusSeed}-${claims}`;
+}
+
 export const USAGE = `VerityMem one-million-claim performance benchmark
 
 Usage: node --experimental-strip-types packages/perf/src/main.ts [bench|load|status] [options]
@@ -58,6 +80,10 @@ Usage: node --experimental-strip-types packages/perf/src/main.ts [bench|load|sta
   bench (default)      load if needed, then measure and write the report
   load                 load the corpus only
   status               print the row counts for the benchmark tenant
+  isolated             create and migrate a benchmark-only database, then exit. Use this
+                       when the shared database already holds other corpora: the HNSW
+                       index is global, so a tenant sharing it with unrelated vectors
+                       measures its neighbours as well as itself.
 
 Dataset
   --claims <n>         total claims in the corpus (default ${TARGET_CLAIMS}). Roughly 84%
@@ -82,18 +108,30 @@ Measurement
   --warmup <n>         requests issued before a warm pass without being recorded (default 50)
   --skip-load          measure the dataset already in the database
   --skip-cold          skip the cold-cache pass (the warm pass is primed explicitly)
+  --fast-embed         drop the HNSW index while the embeddings load and rebuild it once
+                       afterwards, instead of maintaining it per insert. The final schema
+                       is identical; only the loading time changes.
 
 Output
   --reports <dir>      report directory (default <repo>/reports)
   --state <dir>        loader checkpoint directory (default <repo>/.veritymem/perf)
   --reference-machine  record that a reference machine was declared for this run. It does
                        NOT make the machine published; the report says so either way.
+
+Where the benchmark runs
+  --db-url <url>       read path connection (RLS-bound application role)
+  --migration-url <url> loader and fact-reading connection (owner role)
+  --admin-url <url>    superuser connection used by the isolated command (default: the
+                       .env migration URL)
+  --database <name>    name for the isolated database (default veritymem_perf)
+  --migrations <dir>   migrations directory for the isolated command (default <repo>/migrations)
+
   -h, --help           this message
 `;
 
 export function parseArgs(argv: readonly string[]): CliOptions {
   const command: CliOptions["command"] =
-    argv[0] === "load" || argv[0] === "status" ? argv[0] : "bench";
+    argv[0] === "load" || argv[0] === "status" || argv[0] === "isolated" ? argv[0] : "bench";
   const rest = command === "bench" && argv[0] !== "bench" ? argv : argv.slice(1);
 
   let claims = TARGET_CLAIMS;
@@ -111,6 +149,12 @@ export function parseArgs(argv: readonly string[]): CliOptions {
   let anchor: Date | null = null;
   let referenceMachineDeclared = false;
   let newDataset = false;
+  let adminUrl: string | null = null;
+  let isolatedDatabase = "veritymem_perf";
+  let fastEmbed = false;
+  let databaseUrl: string | null = null;
+  let migrationUrl: string | null = null;
+  let migrationsDir: string | null = null;
 
   for (let index = 0; index < rest.length; index += 1) {
     const arg = rest[index];
@@ -175,6 +219,24 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       case "--new-dataset":
         newDataset = true;
         break;
+      case "--fast-embed":
+        fastEmbed = true;
+        break;
+      case "--admin-url":
+        adminUrl = next();
+        break;
+      case "--database":
+        isolatedDatabase = next();
+        break;
+      case "--db-url":
+        databaseUrl = next();
+        break;
+      case "--migration-url":
+        migrationUrl = next();
+        break;
+      case "--migrations":
+        migrationsDir = resolve(next());
+        break;
       case "--help":
       case "-h":
         process.stdout.write(USAGE);
@@ -202,9 +264,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     corpusSeed,
     tenantSlug:
       tenantSlug ??
-      (newDataset
-        ? `perf-bench-${corpusSeed}-${claims}-${randomBytes(3).toString("hex")}`
-        : `perf-bench-${corpusSeed}-${claims}`),
+      (newDataset ? `${corpusSlug(corpusSeed, claims)}-${randomBytes(3).toString("hex")}` : corpusSlug(corpusSeed, claims)),
     workloadSize,
     concurrency,
     limit,
@@ -215,7 +275,23 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     stateDir,
     anchor,
     referenceMachineDeclared,
+    adminUrl: adminUrl ?? env0().migrationDatabaseUrl ?? env0().databaseUrl,
+    isolatedDatabase,
+    fastEmbed,
+    databaseUrl,
+    migrationUrl,
+    migrationsDir,
   };
+}
+
+/**
+ * `.env` values, read at argument-parse time only for a default that depends on them.
+ *
+ * Kept as a function because `loadEnv()` re-reads the file and is not free, and because
+ * argument parsing should not depend on the database being reachable.
+ */
+function env0(): { readonly databaseUrl: string; readonly migrationDatabaseUrl: string | null } {
+  return loadEnv();
 }
 
 /** Run the CLI. Returns the process exit code. */
@@ -227,12 +303,30 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   };
   const anchor = defaultAnchor(options.anchor);
   const statePath = resolve(options.stateDir, `${options.tenantSlug}.load-state.json`);
-  const migrationUrl = env.migrationDatabaseUrl ?? env.databaseUrl;
+  const migrationUrl = options.migrationUrl ?? env.migrationDatabaseUrl ?? env.databaseUrl;
   const tenantId = resolveTenantId(options.tenantSlug);
   const backend = new HashEmbeddingBackend({
     dimensions: env.embedding.dimensions,
     modelId: env.embedding.modelId,
   });
+
+  if (options.command === "isolated") {
+    const result = await bootstrapDatabase({
+      adminUrl: options.adminUrl,
+      databaseName: options.isolatedDatabase,
+      migrationsDir: options.migrationsDir ?? resolve(env.repoRoot, "migrations"),
+      log,
+    });
+    log("");
+    log(`isolated database ready: ${result.database}${result.created ? " (created)" : " (existing)"}`);
+    log(`  migrations applied now      ${result.migrationsApplied.length}`);
+    log(`  migrations already applied  ${result.migrationsAlreadyApplied}`);
+    log("");
+    log("Load and benchmark against it with:");
+    log(`  pnpm eval:perf load  --accepted 1000000 --fast-embed --migration-url '${result.migrationUrl}'`);
+    log(`  pnpm eval:perf bench --skip-load --db-url '${result.databaseUrl}' --migration-url '${result.migrationUrl}'`);
+    return 0;
+  }
 
   if (options.command === "status") {
     const counts = await countAll(migrationUrl, tenantId);
@@ -252,20 +346,26 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       embeddingModelId: backend.model_id,
       embeddingDimensions: backend.dimensions,
       statePath,
+      ...(options.fastEmbed ? { indexStrategy: "defer" as const } : {}),
       onProgress: (progress) => {
-        // The `load` subcommand is interactive, so every batch reports. The default
-        // `bench` path reports once per phase instead: a million-row load emits
-        // thousands of batches and a wall of progress lines is not progress.
+        // One line per phase. A million-row load emits thousands of batches, and a wall
+        // of progress lines is not progress; `status` is how a stalled load is diagnosed.
         if (progress.done < progress.total) return;
         log(
-          `  ${progress.phase.padEnd(15)} ${progress.done.toLocaleString("en-US").padStart(9)} claims  ` +
-            `${(progress.elapsed_ms / 1000).toFixed(1)}s  ` +
-            `${progress.rows_per_second.toLocaleString("en-US")} claims/s`,
+          `  ${progress.phase.padEnd(15)} ${(progress.elapsed_ms / 1000).toFixed(1).padStart(7)}s  ` +
+            `${progress.rows_per_second.toLocaleString("en-US").padStart(9)} claims/s  ` +
+            `(${progress.total.toLocaleString("en-US")} of ${progress.total.toLocaleString("en-US")})`,
         );
       },
     });
     await syncStreams(migrationUrl, loaded.tenant_id);
     log(`loaded in ${(loaded.elapsed_ms / 1000).toFixed(1)} s`);
+    if (loaded.index_rebuild_ms !== null) {
+      log(
+        `  HNSW index rebuilt after the embeddings phase in ${(loaded.index_rebuild_ms / 1000).toFixed(1)} s ` +
+          `(strategy: ${loaded.index_strategy})`,
+      );
+    }
     for (const count of loaded.counts) log(`  ${count.table.padEnd(18)} ${count.rows.toLocaleString("en-US")}`);
     return 0;
   }
@@ -275,6 +375,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       `sizing      ${options.acceptedRequested.toLocaleString("en-US")} accepted claims -> ` +
         `${options.claims.toLocaleString("en-US")} total claims in the corpus`,
     );
+    log(`tenant slug ${options.tenantSlug}  (pass --tenant with this to reuse the corpus later)`);
   }
   const outcome = await runBenchmark({
     claims: options.claims,
@@ -291,6 +392,8 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     blobDir: resolve(".veritymem/blobs"),
     anchor: options.anchor,
     referenceMachineDeclared: options.referenceMachineDeclared,
+    ...(options.databaseUrl !== null ? { databaseUrl: options.databaseUrl } : {}),
+    ...(options.migrationUrl !== null ? { migrationUrl: options.migrationUrl } : {}),
     log,
   });
 

@@ -58,6 +58,67 @@ work on a held-out corpus, not a code change, and it is not done.
 
 ## Measurements that do not exist
 
+- **The RLS policy defeats the selective index, which is why the read path times out at
+  scale.** Two independent costs were measured on the 1,190,477-claim isolated corpus, and
+  they have different fixes.
+
+  **One is fixed.** Every retrieval channel's `WHERE` clause came from
+  `reachableScopeIdsExpression()`, which referenced `c.tenant_id` — `c` being the *outer*
+  claims table — making the aggregate correlated so PostgreSQL re-evaluated it once per
+  candidate row. With the argument bound to the request's own tenant:
+  `rs.tenant_id = c.tenant_id` **13,862 ms** versus `rs.tenant_id = $1::uuid` **286 ms**.
+  Fixed in `packages/retrieval/src/channels.ts`; it is equivalent because `channelWhere`
+  already asserts `c.tenant_id = $1::uuid`.
+
+  **The second now has a structural fix, but not yet a scale result.** Before this PR,
+  the same query that ran in 8 ms as the owner was cancelled at the statement timeout
+  as the RLS-bound application role, because the policy changed the plan:
+
+  ```
+  Nested Loop
+    ->  Seq Scan on scopes s
+    ->  Bitmap Heap Scan on claims c            <- claims_scope_idx, not the text index
+          Filter: (tenant_id = ...)
+            AND (... OR veritymem.scope_reachable(scope_id, veritymem.current_purposes()))
+            AND (search_tsv @@ websearch_to_tsquery(...))
+  ```
+
+  `row_authorized` is OR'd into the per-row filter, so the `claims_tsv_gin` index that
+  answers the text search is not used as the driving path, and `scope_reachable` is
+  evaluated over the rows the scope bitmap returns. The predicate itself is not the
+  problem — 10,000 direct calls take 0.8-1.6 ms, so the cost is call *volume*. The
+  practical consequence is that at reference scale a free-text query is bounded by the
+  policy evaluation rather than by the search.
+
+  **Rewriting `scope_reachable` in SQL was tried and did not work.** The reasoning was
+  that PL/pgSQL hides `caller_scopes()` from the planner, which therefore cannot hoist it
+  as an initplan. A temporary, subsequently reverted migration rewrote the function
+  clause-for-clause in SQL, preserving the semantics, and it was measured rather than
+  assumed:
+
+  | configuration | app-role query, same corpus |
+  | --- | --- |
+  | PL/pgSQL `scope_reachable` | cancelled at the 120 s timeout |
+  | SQL `scope_reachable` | cancelled at the 120 s timeout; a longer run took **231,335 ms** |
+
+  It passed the isolation gate (22/22, `isolation.test.ts`,
+  `isolation-corpus.test.ts`, `rest-isolation.test.ts`) and is **semantically equivalent**
+  — but it is not faster, and it *loses* the PL/pgSQL version's early exit on the purpose
+  check, which returns before touching `caller_scopes()` when the row's scope declares a
+  purpose the caller did not. It was therefore reverted in the same session rather than
+  merged: a change to an authorization predicate must buy something, and this one bought
+  nothing. The predicate was never the cost — 20,000 direct calls take 1.5 ms.
+  **The remaining cost is planner path selection, and this attempted fix did not address it.**
+
+  The plan showed that the policy had to stop invoking reachability for every candidate.
+  Migration `0014_precomputed_scope_context.sql` therefore changes request binding rather
+  than merely rewriting the predicate: `set_request_context` computes the reachable scope
+  IDs once into a transaction-local setting, and both RLS and retrieval use UUID-array
+  membership. This removes the per-row function call while preserving the isolation
+  contract. It is covered by the isolation and query-shape tests, but it has not yet been
+  rerun on the recorded 1,190,477-claim corpus. Until that run publishes an app-role plan
+  and latency distribution, this is a fix under test rather than evidence that the target
+  is met.
 - **At one million claims the read path does not complete inside its own statement
   timeout.** A complete corpus now exists
   (`perf-ref-1190477-<suffix>`, 1,190,477 claims, events, spans, evidence rows and
