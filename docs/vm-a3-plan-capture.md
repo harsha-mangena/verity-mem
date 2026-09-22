@@ -120,7 +120,16 @@ exit 0
 | | |
 | --- | --- |
 | artifact | `reports/vm-a3-plan-capture.json` |
-| SHA-256 | `9ee311a7a797c1bc450fa480c14fdf5a6ce9fff5b22ec12899111e2df8cb814e` |
+| SHA-256 | `da043d93dfb5eb36fd6a960949bc61636481c83098c3dcee74d5861aac96d29d` |
+
+**The whole-file hash changes on every run and the digests do not**, which is the
+distinction the digest exists to make. `generated_at`, `commit` and every captured
+timing differ between two runs of the same command on the same data, so the file
+hash is not a fingerprint of the plans. The eleven `structural_plan_digest` values
+below *are* stable: two consecutive runs produced byte-identical digests for all
+eleven stages while the file hash moved from `9ee311a7…` to `da043d93…`. A change in
+a digest is therefore a change in plan shape, and a change in the file hash is not
+evidence of anything.
 | schema | `vm-a3.plan-capture.1` |
 | PostgreSQL | 17.11 (Debian 17.11-1.pgdg13+2) |
 | pgvector | 0.8.6 |
@@ -149,7 +158,8 @@ projection_watermark  890a040970367f07e61e25c8407e8308f5bdf15d92de0f0423050c8287
 
 `reports/` is gitignored, so the artifact is not committed. It is reproducible with
 the command above against any populated tenant; the digests are recorded here so a
-change is visible even without the file.
+change is visible even without the file — and, unlike the file hash, they are
+comparable between runs.
 
 ## What is not in the artifact
 
