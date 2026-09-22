@@ -86,6 +86,13 @@ export interface ComposeResult {
   readonly candidates_denied_by_authz: number;
 }
 
+interface ComposePhaseTimings {
+  readonly planning_ms: number;
+  readonly channel_wall_ms: number;
+  readonly fusion_ms: number;
+  readonly hydration_ms: number;
+}
+
 /**
  * Answer a query.
  *
@@ -104,6 +111,7 @@ export async function compose(
 
   // ---- 1. Plan -----------------------------------------------------------
   const entityTerms = extractEntityTerms(query.query);
+  const planningStarted = performance.now();
   const planned = await dependencies.db.withRequest(
     {
       tenant: request.tenant_id,
@@ -118,6 +126,7 @@ export async function compose(
     },
     async (executor) => planQuery(executor, { tenant_id: request.tenant_id, principal: options.principal, query }, { entitySubjects: entityTerms }),
   );
+  const planningMs = round(performance.now() - planningStarted);
 
   if (planned.authorized_scope_ids.length === 0) {
     // Nothing is reachable. The packet is empty and says so, and the reason is a
@@ -127,7 +136,12 @@ export async function compose(
     const traceId = dependencies.ids.next("qry");
     const latency = round(performance.now() - started);
     const packet = emptyPacket(planned, traceId, latency, dependencies);
-    await writeTrace(dependencies, request.tenant_id, options.principal, planned, [], [], packet, latency);
+    await writeTrace(dependencies, request.tenant_id, options.principal, planned, [], [], packet, latency, {
+      planning_ms: planningMs,
+      channel_wall_ms: 0,
+      fusion_ms: 0,
+      hydration_ms: 0,
+    });
     return { packet, plan: planned, channels: [], fused: [], candidates_denied_by_authz: 0 };
   }
 
@@ -145,78 +159,91 @@ export async function compose(
     now,
   };
 
-  const { channels, candidateCount, deniedCount } = await dependencies.db.withRequest(
-    {
-      tenant: request.tenant_id,
-      principal: options.principal,
-      scopeIds: planned.authorized_scope_ids,
-      purposes: [query.purpose],
-      action: "query:read",
-    },
-    async (executor) => {
-      const results = await runChannels(dependencies, executor, planned, channelQuery);
-      const considered = new Set(results.flatMap((result) => result.hits.map((hit) => hit.claim_id)));
-      return { channels: results, candidateCount: considered.size, deniedCount: 0 };
-    },
-    { readOnly: true },
+  const channelsStarted = performance.now();
+  const channels = await runChannels(
+    dependencies,
+    planned,
+    channelQuery,
+    options.principal,
   );
+  const channelWallMs = round(performance.now() - channelsStarted);
+  const candidateCount = new Set(
+    channels.flatMap((result) => result.hits.map((hit) => hit.claim_id)),
+  ).size;
+  const deniedCount = 0;
 
   // ---- 4. Fuse -----------------------------------------------------------
+  const fusionStarted = performance.now();
   let fused = fuseResults(channels, { limit: planned.limit * 3 });
   if (options.rerank) {
     fused = [...(await options.rerank(fused, planned))];
   }
+  const fusionMs = round(performance.now() - fusionStarted);
 
-  // ---- 5 and 6. Hydrate and evaluate use policy --------------------------
-  const packetClaims = await dependencies.db.withRequest(
+  // ---- 5–7. Hydrate, evaluate, compose and persist the trace -------------
+  // Hydration and the trace share one request transaction. The previous shape
+  // committed the read, checked out another connection, rebound the identical
+  // RLS context, and opened a fifth transaction just to insert one trace row.
+  const packet = await dependencies.db.withRequest(
     {
       tenant: request.tenant_id,
       principal: options.principal,
       scopeIds: planned.authorized_scope_ids,
       purposes: [query.purpose],
-      action: "query:read",
+      action: "query:compose",
     },
-    async (executor) => hydrate(dependencies, executor, planned, fused, query, now),
-    { readOnly: true },
-  );
+    async (executor) => {
+      const hydrationStarted = performance.now();
+      const packetClaims = await hydrate(dependencies, executor, planned, fused, query, now);
+      // This is projection progress, not ledger progress. Reading max(events.seq)
+      // made a stale projection look current and paid for a separate privileged
+      // transaction on every query.
+      const watermark = await readProjectionWatermark(executor, request.tenant_id);
+      const hydrationMs = round(performance.now() - hydrationStarted);
+      const returned = packetClaims.slice(0, planned.limit);
+      const decision = combineDecisions(returned.map((claim) => claim.use));
+      const latency = round(performance.now() - started);
+      const traceId = dependencies.ids.next("qry");
 
-  // ---- 7. Compose and trace ---------------------------------------------
-  const returned = packetClaims.slice(0, planned.limit);
-  const decision = combineDecisions(returned.map((claim) => claim.use));
-  const latency = round(performance.now() - started);
-  const traceId = dependencies.ids.next("qry");
-  const watermark = await readWatermark(dependencies, request.tenant_id);
+      const composed: MemoryPacket = {
+        trace_id: traceId,
+        decision,
+        decision_reason_codes: [...new Set(returned.flatMap((claim) => claim.use_reason_codes))],
+        claims: returned,
+        missing: describeGaps(returned, planned, candidateCount),
+        coverage: {
+          channels_used: channels.filter((result) => result.ran).map((result) => result.channel),
+          candidates_considered: candidateCount,
+          candidates_after_authz: candidateCount,
+          candidates_returned: returned.length,
+          candidates_denied_by_authz: deniedCount,
+          time_mode: planned.time.mode,
+        },
+        projection_watermark: watermark,
+        policy_version: planned.policy_version,
+        gate_backend: dependencies.gateBackend ?? "unknown",
+        model_calls: dependencies.embeddings.isModelCall ? 1 : 0,
+        latency_ms: latency,
+      };
 
-  const packet: MemoryPacket = {
-    trace_id: traceId,
-    decision,
-    decision_reason_codes: [...new Set(returned.flatMap((claim) => claim.use_reason_codes))],
-    claims: returned,
-    missing: describeGaps(returned, planned, candidateCount),
-    coverage: {
-      channels_used: channels.filter((result) => result.ran).map((result) => result.channel),
-      candidates_considered: candidateCount,
-      candidates_after_authz: candidateCount,
-      candidates_returned: returned.length,
-      candidates_denied_by_authz: deniedCount,
-      time_mode: planned.time.mode,
+      await insertTrace(
+        executor,
+        request.tenant_id,
+        options.principal,
+        planned,
+        channels,
+        fused,
+        composed,
+        latency,
+        {
+          planning_ms: planningMs,
+          channel_wall_ms: channelWallMs,
+          fusion_ms: fusionMs,
+          hydration_ms: hydrationMs,
+        },
+      );
+      return composed;
     },
-    projection_watermark: watermark,
-    policy_version: planned.policy_version,
-    gate_backend: dependencies.gateBackend ?? "unknown",
-    model_calls: dependencies.embeddings.isModelCall ? 1 : 0,
-    latency_ms: latency,
-  };
-
-  await writeTrace(
-    dependencies,
-    request.tenant_id,
-    options.principal,
-    planned,
-    channels,
-    fused,
-    packet,
-    latency,
   );
 
   return { packet, plan: planned, channels, fused, candidates_denied_by_authz: deniedCount };
@@ -224,20 +251,84 @@ export async function compose(
 
 async function runChannels(
   dependencies: RetrievalDependencies,
-  executor: QueryExecutor,
   plan: QueryPlan,
   query: ChannelQuery,
+  principal: string,
 ): Promise<ChannelResult[]> {
-  // Run sequentially on the single request connection: parallel queries on one
-  // connection would interleave, and opening more connections would move the
-  // authorization context off the transaction that enforces it.
-  const results: ChannelResult[] = [];
-  if (plan.channels.includes("lexical")) results.push(await lexicalChannel(executor, query));
-  if (plan.channels.includes("dense")) results.push(await denseChannel(executor, query, dependencies.embeddings));
-  if (plan.channels.includes("entity")) results.push(await entityChannel(executor, query));
-  if (plan.channels.includes("temporal")) results.push(await temporalChannel(executor, query));
-  if (plan.channels.includes("relation")) results.push(await relationChannel(executor, query));
-  return results;
+  const binding = {
+    tenant: query.tenant_id,
+    principal,
+    scopeIds: plan.authorized_scope_ids,
+    purposes: [plan.purpose],
+    action: "query:read",
+  } as const;
+
+  // Two independently RLS-bound lanes. A single `pg` connection cannot execute
+  // concurrent statements, but that does not require every channel to be serial:
+  // each lane has its own transaction and binds the same database-validated scope
+  // closure before it sees a candidate. The dense lane is separated because it is
+  // normally the expensive branch; lexical/entity/temporal/relation stay together
+  // to cap one request at two connections instead of one connection per channel.
+  //
+  // Start embedding before checking out the dense connection. A hosted embedder may
+  // take hundreds of milliseconds, and holding an idle database transaction across
+  // that network call turns model latency into pool starvation.
+  const denseStarted = performance.now();
+  const vectorPromise = plan.channels.includes("dense")
+    ? dependencies.embeddings.embed([query.text])
+    : Promise.resolve([] as number[][]);
+
+  const ordinaryLane = dependencies.db.withRequest(
+    binding,
+    async (executor) => {
+      const results: ChannelResult[] = [];
+      if (plan.channels.includes("lexical")) results.push(await lexicalChannel(executor, query));
+      if (plan.channels.includes("entity")) results.push(await entityChannel(executor, query));
+      if (plan.channels.includes("temporal")) results.push(await temporalChannel(executor, query));
+      if (plan.channels.includes("relation")) results.push(await relationChannel(executor, query));
+      return results;
+    },
+    { readOnly: true },
+  );
+
+  const denseLane = (async (): Promise<ChannelResult | null> => {
+    if (!plan.channels.includes("dense")) return null;
+    const [vector] = await vectorPromise;
+    if (!vector) {
+      return {
+        channel: "dense",
+        hits: [],
+        ran: false,
+        note: "embedding backend returned no vector",
+        duration_ms: round(performance.now() - denseStarted),
+      };
+    }
+    const result = await dependencies.db.withRequest(
+      binding,
+      async (executor) => denseChannel(executor, query, dependencies.embeddings, vector),
+      { readOnly: true },
+    );
+    return {
+      ...result,
+      duration_ms: round(performance.now() - denseStarted),
+    };
+  })();
+
+  // Wait for both lanes even when one fails. `Promise.all` would reject as soon as
+  // (for example) a hosted embedding call failed while leaving the ordinary lane's
+  // database transaction running in the background, which turns repeated upstream
+  // failures into unexplained pool pressure.
+  const [ordinaryOutcome, denseOutcome] = await Promise.allSettled([ordinaryLane, denseLane]);
+  if (ordinaryOutcome.status === "rejected") throw ordinaryOutcome.reason;
+  if (denseOutcome.status === "rejected") throw denseOutcome.reason;
+  const ordinary = ordinaryOutcome.value;
+  const dense = denseOutcome.value;
+  const byChannel = new Map(ordinary.map((result) => [result.channel, result]));
+  if (dense) byChannel.set(dense.channel, dense);
+  return plan.channels.flatMap((channel) => {
+    const result = byChannel.get(channel);
+    return result ? [result] : [];
+  });
 }
 
 /**
@@ -497,12 +588,12 @@ function emptyPacket(
 }
 
 /**
- * Persist the trace.
+ * Persist the trace for an early empty-scope result.
  *
  * The trace records the *candidate set and the returned set*, which is what makes
- * "why did the system return this" answerable after the fact. It is written in its
- * own transaction bound to the tenant, so it is subject to the same row-level
- * security as everything else.
+ * "why did the system return this" answerable after the fact. The normal path calls
+ * `insertTrace` inside its hydration transaction; this wrapper is for the early
+ * authorization-deny path, which has no hydration transaction to reuse.
  */
 async function writeTrace(
   dependencies: RetrievalDependencies,
@@ -513,6 +604,7 @@ async function writeTrace(
   fused: readonly FusedCandidate[],
   packet: MemoryPacket,
   latency: number,
+  timings: ComposePhaseTimings,
 ): Promise<void> {
   await dependencies.db.withRequest(
     {
@@ -522,67 +614,78 @@ async function writeTrace(
       purposes: [plan.purpose],
       action: "query:trace",
     },
-    async (executor) => {
-      await executor.query(
-        `INSERT INTO query_traces (
-           trace_id, tenant_id, caller, query, policy_version, resolved_scope_ids,
-           candidates, returned, projection_watermark, model_calls, latency_ms
-         ) VALUES ($1::uuid, $2::uuid, $3, $4::jsonb, $5, $6::uuid[], $7::jsonb, $8::jsonb, $9, $10, $11)`,
-        [
-          stripPrefix(packet.trace_id),
-          tenantId,
-          principal,
-          JSON.stringify({
-            text: plan.text,
-            purpose: plan.purpose,
-            action_risk: plan.action_risk,
-            time: plan.time,
-            scope_resolution: plan.scope_resolution,
-            channels: channels.map((result) => ({
-              channel: result.channel,
-              ran: result.ran,
-              hits: result.hits.length,
-              note: result.note,
-              duration_ms: result.duration_ms,
-            })),
-          }),
-          plan.policy_version,
-          plan.authorized_scope_ids,
-          JSON.stringify(
-            fused.slice(0, 50).map((candidate) => ({
-              claim_id: toPublicId("clm", candidate.claim_id),
-              fuse_score: candidate.fuse_score,
-              channels: [...candidate.channels],
-            })),
-          ),
-          JSON.stringify(
-            packet.claims.map((claim) => ({
-              claim_id: claim.claim_id,
-              use: claim.use,
-              authority: claim.authority,
-              fuse_score: claim.fuse_score,
-            })),
-          ),
-          packet.projection_watermark,
-          packet.model_calls,
-          Math.round(latency),
-        ],
-      );
-    },
+    (executor) => insertTrace(executor, tenantId, principal, plan, channels, fused, packet, latency, timings),
   );
 }
 
-async function readWatermark(dependencies: RetrievalDependencies, tenantId: string): Promise<number> {
-  return dependencies.db.withSystemContext(
-    { tenant: tenantId, actor: "system:watermark" },
-    async (executor) => {
-      const result = await executor.query<{ watermark: number }>(
-        `SELECT COALESCE(max(seq), 0)::int AS watermark FROM events WHERE tenant_id = $1::uuid`,
-        [tenantId],
-      );
-      return Number(result.rows[0]?.watermark ?? 0);
-    },
+/** Insert a trace on an already-bound transaction. */
+async function insertTrace(
+  executor: QueryExecutor,
+  tenantId: string,
+  principal: string,
+  plan: QueryPlan,
+  channels: readonly ChannelResult[],
+  fused: readonly FusedCandidate[],
+  packet: MemoryPacket,
+  latency: number,
+  timings: ComposePhaseTimings,
+): Promise<void> {
+  await executor.query(
+    `INSERT INTO query_traces (
+       trace_id, tenant_id, caller, query, policy_version, resolved_scope_ids,
+       candidates, returned, projection_watermark, model_calls, latency_ms
+     ) VALUES ($1::uuid, $2::uuid, $3, $4::jsonb, $5, $6::uuid[], $7::jsonb, $8::jsonb, $9, $10, $11)`,
+    [
+      stripPrefix(packet.trace_id),
+      tenantId,
+      principal,
+      JSON.stringify({
+        text: plan.text,
+        purpose: plan.purpose,
+        action_risk: plan.action_risk,
+        time: plan.time,
+        scope_resolution: plan.scope_resolution,
+        phase_timings: timings,
+        channels: channels.map((result) => ({
+          channel: result.channel,
+          ran: result.ran,
+          hits: result.hits.length,
+          note: result.note,
+          duration_ms: result.duration_ms,
+        })),
+      }),
+      plan.policy_version,
+      plan.authorized_scope_ids,
+      JSON.stringify(
+        fused.slice(0, 50).map((candidate) => ({
+          claim_id: toPublicId("clm", candidate.claim_id),
+          fuse_score: candidate.fuse_score,
+          channels: [...candidate.channels],
+        })),
+      ),
+      JSON.stringify(
+        packet.claims.map((claim) => ({
+          claim_id: claim.claim_id,
+          use: claim.use,
+          authority: claim.authority,
+          fuse_score: claim.fuse_score,
+        })),
+      ),
+      packet.projection_watermark,
+      packet.model_calls,
+      Math.round(latency),
+    ],
   );
+}
+
+async function readProjectionWatermark(executor: QueryExecutor, tenantId: string): Promise<number> {
+  const result = await executor.query<{ watermark: number }>(
+    `SELECT COALESCE(max(ledger_watermark), 0)::int AS watermark
+       FROM projection_versions
+      WHERE tenant_id = $1::uuid`,
+    [tenantId],
+  );
+  return Number(result.rows[0]?.watermark ?? 0);
 }
 
 function round(value: number): number {

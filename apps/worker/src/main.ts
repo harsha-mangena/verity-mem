@@ -35,7 +35,7 @@ import {
 import { HashEmbeddingBackend, HostedEmbeddingBackend, createProjectionProcessor } from "@veritymem/retrieval";
 import { loadWorkerConfig, type WorkerConfig } from "./config.ts";
 import { createLogger, describeError, type Logger } from "./log.ts";
-import { createOutboxRunner } from "./outbox-runner.ts";
+import { createOutboxRunner, type CycleSummary } from "./outbox-runner.ts";
 import {
   createEntailmentBackend,
   createGate,
@@ -86,7 +86,7 @@ export function startWorker(config: WorkerConfig, logger: Logger): WorkerHandle 
 
   let runner: ReturnType<typeof createOutboxRunner> | null = null;
   let closing = false;
-  let inFlight: Promise<void> | null = null;
+  let inFlight: Promise<CycleSummary | null> | null = null;
 
   /**
    * One batch for every configured tenant, then the lag reading.
@@ -95,8 +95,8 @@ export function startWorker(config: WorkerConfig, logger: Logger): WorkerHandle 
    * can call it: a `const` would be in its temporal dead zone while the loop's
    * first iteration ran.
    */
-  async function runCycleOnce(): Promise<void> {
-    if (runner === null) return;
+  async function runCycleOnce(): Promise<CycleSummary | null> {
+    if (runner === null) return null;
     try {
       const summary = await runner.runCycle();
       logger.info("worker.batch", {
@@ -106,11 +106,13 @@ export function startWorker(config: WorkerConfig, logger: Logger): WorkerHandle 
         kinds: summary.kinds,
         projection_lag_pending: summary.projection_lag,
       });
+      return summary;
     } catch (error) {
       // A cycle-level failure is a database or configuration problem, not a message
       // problem — message failures are already recorded per row by the outbox. The
       // loop keeps running so a transient outage does not stop the worker.
       logger.error("worker.cycle_failed", { ...describeError(error) });
+      return null;
     }
   }
 
@@ -184,10 +186,17 @@ export function startWorker(config: WorkerConfig, logger: Logger): WorkerHandle 
     while (!closing) {
       const cycle = runCycleOnce();
       inFlight = cycle;
-      await cycle;
+      const summary = await cycle;
       inFlight = null;
       if (closing) break;
-      await sleep(config.pollIntervalMs);
+      // Polling is an idle-backoff, not a throttle. Sleeping after every full
+      // batch makes a two-stage ingest -> project pipeline add one second per
+      // batch even while work is visibly queued. A zero-claim cycle still backs
+      // off even when lag is non-zero: those rows may be waiting for retry, and
+      // spinning until next_attempt_at would burn a CPU core.
+      if (shouldBackOff(summary)) {
+        await sleep(config.pollIntervalMs);
+      }
     }
   })().catch((error: unknown) => {
     logger.error("worker.loop_failed", { ...describeError(error) });
@@ -254,6 +263,11 @@ export function installSignalHandlers(handle: WorkerHandle, logger: Logger): voi
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Whether the worker should idle before its next claim attempt. */
+export function shouldBackOff(summary: CycleSummary | null): boolean {
+  return summary === null || summary.claimed === 0 || summary.projection_lag === 0;
 }
 
 async function main(): Promise<void> {

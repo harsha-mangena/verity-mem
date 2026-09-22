@@ -49,6 +49,7 @@ export const RETENTION_STORES = [
   "claim_evidence",
   "claim_embeddings",
   "entity_aliases",
+  "claim_entities",
   "query_traces",
 ] as const;
 
@@ -314,6 +315,16 @@ async function runForget(
     method: "alias rows deleted; unlike claim projections these carry the subject string itself",
   });
 
+  const entityClaims = await executor.query(
+    `DELETE FROM claim_entities WHERE claim_id = ANY($1::uuid[])`,
+    [affectedClaims.rows.map((row) => row.claim_id)],
+  );
+  stores.push({
+    store: "claim_entities",
+    rows_affected: entityClaims.rowCount ?? 0,
+    method: "canonical-to-claim entity projection rows deleted",
+  });
+
   const traces = await executor.query(
     `UPDATE query_traces
         SET candidates = '[]'::jsonb,
@@ -399,6 +410,18 @@ async function runForget(
       WHERE tenant_id = $1::uuid
         AND ($2::text IS NULL OR alias = lower($2))`,
     [tenantId, selector.user ?? selector.subject ?? null],
+  );
+
+  await scan(
+    "claim_entities",
+    `SELECT count(*)::int AS matches
+       FROM claim_entities ce
+      JOIN claims c ON c.claim_id = ce.claim_id
+      JOIN scopes s ON s.scope_id = c.scope_id
+      WHERE ce.tenant_id = $1::uuid
+        AND ($2::text IS NULL OR s.user_id = $2)
+        AND ($3::text IS NULL OR c.subject = $3 OR ce.canonical = lower($3))`,
+    [tenantId, scopeFilter.user, selector.subject ?? null],
   );
 
   // The physical store is scanned by asking it what it holds, not by asking the database

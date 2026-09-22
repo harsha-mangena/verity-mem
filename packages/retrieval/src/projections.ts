@@ -6,7 +6,8 @@
  *   search   — the full-text projection. The `search_tsv` column is maintained by
  *              a database trigger so it cannot drift from the row it describes.
  *   dense    — pgvector embeddings, written only in this module.
- *   entities — alias resolution built from claim subjects and objects.
+ *   entities — an alias dictionary plus a canonical-to-claim inverted index built
+ *              from claim subjects and objects.
  *
  * The rule this module enforces: **only accepted claims are projected.** A
  * quarantined or proposed claim is not indexed and then filtered at query time —
@@ -18,7 +19,7 @@ import type { OutboxMessage, OutboxProcessor, QueryExecutor, Db } from "@veritym
 import { canonicalize } from "@veritymem/ledger";
 import { toVectorLiteral, type EmbeddingBackend } from "./embeddings.ts";
 
-export const PROJECTION_CODE_VERSION = "projections@1";
+export const PROJECTION_CODE_VERSION = "projections@2";
 
 export interface ProjectionDependencies {
   readonly db: Db;
@@ -32,6 +33,7 @@ export interface ClaimProjectionRow {
   readonly predicate: string;
   readonly object: unknown;
   readonly status: string;
+  readonly origin_seq: number;
   readonly [column: string]: unknown;
 }
 
@@ -47,10 +49,14 @@ export async function projectClaim(
   executor: QueryExecutor,
   dependencies: ProjectionDependencies,
   claimId: string,
+  options: { readonly recordVersion?: boolean } = {},
 ): Promise<{ projected: boolean; reason: string; entities: number }> {
   const result = await executor.query<ClaimProjectionRow>(
-    `SELECT claim_id, tenant_id, subject, predicate, object, status
-       FROM claims WHERE claim_id = $1::uuid`,
+    `SELECT c.claim_id, c.tenant_id, c.subject, c.predicate, c.object, c.status,
+            COALESCE(e.seq, 0)::bigint AS origin_seq
+       FROM claims c
+       LEFT JOIN events e ON e.event_id = c.origin_event_id
+      WHERE c.claim_id = $1::uuid`,
     [stripPrefix(claimId)],
   );
   const claim = result.rows[0];
@@ -84,21 +90,14 @@ export async function projectClaim(
 
   const entities = await projectEntities(executor, claim);
 
-  // Keyed by (projection, tenant), so one tenant's rebuild cannot overwrite another's
-  // recorded model. The earlier table was keyed on `projection` alone, which made it a
-  // single global row: asking which model wrote *this* tenant's projection answered with
-  // whichever tenant rebuilt most recently, and the health check for a model mismatch would
-  // report `ok` on the strength of another deployment's state.
-  await executor.query(
-    `INSERT INTO projection_versions (projection, tenant_id, code_version, model_version, ledger_watermark, updated_at)
-     VALUES ($1, $2::uuid, $3, $4, COALESCE((SELECT COALESCE(max(seq), 0) FROM events WHERE tenant_id = $2::uuid), 0), now())
-     ON CONFLICT (projection, COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid)) DO UPDATE
-       SET code_version = EXCLUDED.code_version,
-           model_version = EXCLUDED.model_version,
-           ledger_watermark = GREATEST(projection_versions.ledger_watermark, EXCLUDED.ledger_watermark),
-           updated_at = now()`,
-    ["dense", claim.tenant_id, PROJECTION_CODE_VERSION, dependencies.embeddings.model_id],
-  );
+  if (options.recordVersion !== false) {
+    await recordProjectionVersion(
+      executor,
+      claim.tenant_id,
+      dependencies.embeddings.model_id,
+      claim.origin_seq,
+    );
+  }
 
   return { projected: true, reason: "projected", entities };
 }
@@ -117,7 +116,13 @@ export async function projectClaim(
  * pretending otherwise here would trade a leak for a missing-alias bug.
  */
 export async function deindexClaim(executor: QueryExecutor, claimId: string): Promise<void> {
-  await executor.query(`DELETE FROM claim_embeddings WHERE claim_id = $1::uuid`, [stripPrefix(claimId)]);
+  await executor.query(
+    `WITH removed_embedding AS (
+       DELETE FROM claim_embeddings WHERE claim_id = $1::uuid RETURNING claim_id
+     )
+     DELETE FROM claim_entities WHERE claim_id = $1::uuid`,
+    [stripPrefix(claimId)],
+  );
 }
 
 /** Text that represents the claim in the dense channel. Subject and key first. */
@@ -148,19 +153,29 @@ export async function projectEntities(
     if (value.length > 0 && value.length <= 200) candidates.add(value.toLowerCase());
   }
 
-  let written = 0;
-  for (const alias of candidates) {
-    // The canonical form is the alias itself; a real resolver would cluster these,
-    // and saying so here is better than pretending this is entity resolution.
-    const result = await executor.query(
-      `INSERT INTO entity_aliases (tenant_id, alias, canonical, source, confidence)
-       VALUES ($1::uuid, $2, $2, $3, $4)
-       ON CONFLICT (tenant_id, alias, canonical) DO NOTHING`,
-      [claim.tenant_id, alias, "claim_projection", 1.0],
-    );
-    written += result.rowCount ?? 0;
-  }
-  return written;
+  const aliases = [...candidates];
+  if (aliases.length === 0) return 0;
+
+  // The canonical form is the alias itself; a real resolver would cluster these,
+  // and saying so here is better than pretending this is entity resolution. Both
+  // projections are batched so a claim with two entities costs two statements, not
+  // four round trips.
+  const dictionary = await executor.query(
+    `INSERT INTO entity_aliases (tenant_id, alias, canonical, source, confidence)
+     SELECT $1::uuid, alias, alias, 'claim_projection', 1.0
+       FROM unnest($2::text[]) AS aliases(alias)
+     ON CONFLICT (tenant_id, alias, canonical) DO NOTHING`,
+    [claim.tenant_id, aliases],
+  );
+  await executor.query(
+    `INSERT INTO claim_entities (tenant_id, canonical, claim_id, source, confidence)
+     SELECT $1::uuid, canonical, $2::uuid, 'claim_projection', 1.0
+       FROM unnest($3::text[]) AS entities(canonical)
+     ON CONFLICT (tenant_id, canonical, claim_id) DO UPDATE
+       SET source = EXCLUDED.source, confidence = EXCLUDED.confidence`,
+    [claim.tenant_id, claim.claim_id, aliases],
+  );
+  return dictionary.rowCount ?? 0;
 }
 
 /**
@@ -213,17 +228,22 @@ export async function rebuildProjections(
   options: { tenantId: string; truncate?: boolean } = { tenantId: "" },
 ): Promise<RebuildReport> {
   const claims = await executor.query<ClaimProjectionRow>(
-    `SELECT claim_id, tenant_id, subject, predicate, object, status
-       FROM claims
-      WHERE tenant_id = $1::uuid
-        AND status IN ('accepted','disputed')
-      ORDER BY claim_id ASC`,
+    `SELECT c.claim_id, c.tenant_id, c.subject, c.predicate, c.object, c.status,
+            COALESCE(e.seq, 0)::bigint AS origin_seq
+       FROM claims c
+       LEFT JOIN events e ON e.event_id = c.origin_event_id
+      WHERE c.tenant_id = $1::uuid
+        AND c.status IN ('accepted','disputed')
+      ORDER BY c.claim_id ASC`,
     [options.tenantId],
   );
 
   if (options.truncate !== false) {
     await executor.query(
-      `DELETE FROM claim_embeddings WHERE tenant_id = $1::uuid`,
+      `WITH removed_embeddings AS (
+         DELETE FROM claim_embeddings WHERE tenant_id = $1::uuid RETURNING claim_id
+       )
+       DELETE FROM claim_entities WHERE tenant_id = $1::uuid`,
       [options.tenantId],
     );
   }
@@ -232,11 +252,26 @@ export async function rebuildProjections(
   let skipped = 0;
   let entities = 0;
   for (const claim of claims.rows) {
-    const outcome = await projectClaim(executor, dependencies, toPublicId("clm", claim.claim_id));
+    const outcome = await projectClaim(
+      executor,
+      dependencies,
+      toPublicId("clm", claim.claim_id),
+      { recordVersion: false },
+    );
     if (outcome.projected) projected += 1;
     else skipped += 1;
     entities += outcome.entities;
   }
+
+  // One version write for the rebuild, not one UPSERT per claim. On a million-claim
+  // rebuild the old shape performed a million writes to the same row and recomputed
+  // the tenant watermark a million times.
+  await recordProjectionVersion(
+    executor,
+    options.tenantId,
+    dependencies.embeddings.model_id,
+    claims.rows.reduce((max, claim) => Math.max(max, Number(claim.origin_seq)), 0),
+  );
 
   const rows = await executor.query<{ claim_id: string; model_id: string; subject: string; predicate: string; object: unknown }>(
     `SELECT e.claim_id, e.model_id, c.subject, c.predicate, c.object
@@ -264,6 +299,27 @@ export async function rebuildProjections(
     digest: digest.digest,
     rows: digest.rows,
   };
+}
+
+/** Record which code/model produced a tenant's dense projection. */
+async function recordProjectionVersion(
+  executor: QueryExecutor,
+  tenantId: string,
+  modelId: string,
+  watermark: number,
+): Promise<void> {
+  // Keyed by (projection, tenant), so one tenant's rebuild cannot overwrite another's
+  // recorded model. `GREATEST` makes out-of-order worker delivery monotonic.
+  await executor.query(
+    `INSERT INTO projection_versions (projection, tenant_id, code_version, model_version, ledger_watermark, updated_at)
+     VALUES ($1, $2::uuid, $3, $4, $5, now())
+     ON CONFLICT (projection, COALESCE(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid)) DO UPDATE
+       SET code_version = EXCLUDED.code_version,
+           model_version = EXCLUDED.model_version,
+           ledger_watermark = GREATEST(projection_versions.ledger_watermark, EXCLUDED.ledger_watermark),
+           updated_at = now()`,
+    ["dense", tenantId, PROJECTION_CODE_VERSION, modelId, watermark],
+  );
 }
 
 /** Digest of the lexical projection, read back from the trigger-maintained column. */

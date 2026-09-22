@@ -67,81 +67,22 @@ interface BuildResult {
   readonly params: unknown[];
 }
 
-const EMPTY_SCOPE = "00000000-0000-0000-0000-000000000000";
-
-function scopeArray(query: ChannelQuery): string[] {
-  return query.authorized_scopes.length > 0
-    ? query.authorized_scopes.map((scope) => scope.scope_id)
-    : [EMPTY_SCOPE];
-}
-
-/**
- * SQL that computes the caller's reachable scope set.
- *
- * Because the containment rule is a directional predicate rather than a
- * transitive closure (see migration 0007), "everything this caller can reach" is
- * expressible as a single set-returning subquery: the caller's own scopes, plus
- * every scope those reach. For a project-scoped caller in a project with three
- * hundred user scopes that is three hundred and one ids, computed by the database
- * and tested with an array operator — a GIN-indexable predicate, and far cheaper
- * than calling a containment function once per candidate row on the read path.
- *
- * The dimension rule mirrors `veritymem.scope_contains` exactly. It is repeated in
- * SQL rather than called per row because the retrieval path cannot afford a
- * function call per candidate; the migration's self-check is what keeps the two
- * definitions honest.
- */
-function reachableScopeIdsExpression(): string {
-  // `rs.tenant_id = $1::uuid` rather than `= c.tenant_id`, and the difference is the
-  // whole cost of the read path at scale.
-  //
-  // `c` is the *outer* claims table, so referencing it here made this expression
-  // correlated: PostgreSQL re-evaluated the aggregate once per candidate row. Every
-  // channel builds its WHERE clause from this expression, so every channel paid it.
-  // Measured on a 1,190,477-claim corpus with the argument bound to the request's own
-  // tenant:
-  //
-  //     rs.tenant_id = c.tenant_id   -> 13,862 ms   (loops=1000001)
-  //     rs.tenant_id = $1::uuid      ->     286 ms
-  //
-  // It is also *equivalent*: the outer clauses already assert `c.tenant_id = $1::uuid`
-  // (see `channelWhere`), so scopes belonging to any other tenant could never match.
-  // `$1` is bound by `channelWhere` and is always the request's tenant.
-  //
-  // `$2` was already a parameter, which is why the reach set itself was cheap and the
-  // correlation was invisible: the subquery looks parameterised, and the one reference
-  // that made it per-row is a single column name.
-  return `(
-    SELECT array_agg(rs.scope_id)
-      FROM scopes rs
-     WHERE rs.tenant_id = $1::uuid
-       AND EXISTS (
-         SELECT 1
-           FROM unnest($2::uuid[]) AS owned(scope_id)
-           JOIN scopes os ON os.scope_id = owned.scope_id
-          WHERE os.tenant_id = rs.tenant_id
-            AND (os.project    IS NULL OR rs.project    IS NULL OR os.project    = rs.project)
-            AND (os.user_id    IS NULL OR rs.user_id    IS NULL OR os.user_id    = rs.user_id)
-            AND (os.agent_id   IS NULL OR rs.agent_id   IS NULL OR os.agent_id   = rs.agent_id)
-            AND (os.session_id IS NULL OR rs.session_id IS NULL OR os.session_id = rs.session_id)
-       )
-  )`;
-}
-
 function channelWhere(query: ChannelQuery): BuildResult {
   // Parameters are appended positionally as each clause is added, so no channel
   // has to know how many placeholders another clause consumed. That is the whole
   // reason this builder exists rather than each channel assembling its own SQL: a
   // channel that miscounts a placeholder fails loudly, but a channel that forgets
   // the authorization clause fails silently and leaks.
-  const params: unknown[] = [query.tenant_id, scopeArray(query), [...query.purposes]];
+  const params: unknown[] = [query.tenant_id, [...query.purposes]];
   const clauses: string[] = [
     "c.tenant_id = $1::uuid",
     // Authorization, applied as a set membership test against the caller's
-    // containment closure. This runs *before* any relevance ranking, and the
-    // channels never see a candidate outside it.
-    `c.scope_id = ANY(${reachableScopeIdsExpression()}::uuid[])`,
-    "s.purpose && $3::text[]",
+    // containment closure. Migration 0014 computes this closure once when the
+    // transaction is bound. The previous correlated subquery recomputed the same
+    // closure in every channel and disagreed with the directional RLS rule for
+    // NULL inner dimensions.
+    "c.scope_id = ANY(veritymem.current_reachable_scope_ids())",
+    "s.purpose && $2::text[]",
     buildTimeClause(query.time, params),
   ];
 
@@ -256,9 +197,11 @@ export async function denseChannel(
   executor: QueryExecutor,
   query: ChannelQuery,
   embeddings: EmbeddingBackend,
+  preparedVector?: readonly number[],
 ): Promise<ChannelResult> {
   const started = performance.now();
-  const [vector] = await embeddings.embed([query.text]);
+  const [embedded] = preparedVector === undefined ? await embeddings.embed([query.text]) : [];
+  const vector = preparedVector ?? embedded;
   if (!vector) {
     return {
       channel: "dense",
@@ -284,7 +227,10 @@ export async function denseChannel(
   // `projection_versions` table records the model that wrote the projection; if it
   // disagrees with the configured reader, the channel says so and does not run.
   const projection = await executor.query<{ model_version: string | null; ledger_watermark: number }>(
-    `SELECT model_version, ledger_watermark FROM projection_versions WHERE projection = 'dense'`,
+    `SELECT model_version, ledger_watermark
+       FROM projection_versions
+      WHERE projection = 'dense' AND tenant_id = $1::uuid`,
+    [query.tenant_id],
   );
   const projectedModel = projection.rows[0]?.model_version ?? null;
   if (projectedModel !== null && projectedModel !== embeddings.model_id) {
@@ -314,8 +260,9 @@ export async function denseChannel(
     `SELECT c.claim_id, 1 - (e.embedding <=> $${vectorIndex}::vector) AS score
        FROM claims c
        JOIN scopes s ON s.scope_id = c.scope_id
-       JOIN claim_embeddings e ON e.claim_id = c.claim_id
+       JOIN claim_embeddings e ON e.claim_id = c.claim_id AND e.tenant_id = c.tenant_id
       WHERE ${where}
+        AND e.tenant_id = $1::uuid
         AND e.model_id = $${modelIndex}
       ORDER BY e.embedding <=> $${vectorIndex}::vector ASC, c.claim_id ASC
       LIMIT $${limitIndex}`,
@@ -366,11 +313,14 @@ export async function entityChannel(
 
   const result = await executor.query<{ claim_id: string; score: number }>(
     `SELECT c.claim_id, count(DISTINCT a.alias)::float8 AS score
-       FROM claims c
+       FROM entity_aliases a
+       JOIN claim_entities ce
+         ON ce.tenant_id = a.tenant_id AND ce.canonical = a.canonical
+       JOIN claims c ON c.claim_id = ce.claim_id AND c.tenant_id = ce.tenant_id
        JOIN scopes s ON s.scope_id = c.scope_id
-       JOIN entity_aliases a ON a.tenant_id = c.tenant_id
-      WHERE ${where}
-        AND (a.alias = ANY($${termsIndex}::text[]) AND (a.canonical = c.subject OR a.canonical = lower(c.object::text)))
+      WHERE a.tenant_id = $1::uuid
+        AND a.alias = ANY($${termsIndex}::text[])
+        AND ${where}
       GROUP BY c.claim_id
       ORDER BY score DESC, c.claim_id ASC
       LIMIT $${limitIndex}`,

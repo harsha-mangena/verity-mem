@@ -20,10 +20,9 @@ async function main(): Promise<void> {
   const db = new Db({
     connectionString: config.env.databaseUrl,
     applicationName: "veritymem-server",
-    // The pool must exceed the nesting depth any single request reaches. Every read
-    // discovers the caller's reach in one transaction and then performs the read in a
-    // second, so one request occupies at most one connection at a time by design; the
-    // headroom here is for concurrency, not for depth.
+    // Retrieval uses two bounded lanes while channels run (ordinary + dense), then
+    // releases both before hydration and trace writes. Twelve connections therefore
+    // sustain up to six simultaneous channel phases without an internal pool wait.
     max: 12,
   });
 

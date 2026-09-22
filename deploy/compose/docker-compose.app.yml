@@ -30,6 +30,22 @@ services:
       interval: 3s
       timeout: 3s
       retries: 30
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-512MB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-2GB}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:-16MB}
+      - -c
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-256MB}
 
   # Content-addressed blob storage, so the reference deployment exercises the same store shape
   # a real one would. The filesystem store is the default and is equally valid; this exists to

@@ -70,8 +70,9 @@ work on a held-out corpus, not a code change, and it is not done.
   Fixed in `packages/retrieval/src/channels.ts`; it is equivalent because `channelWhere`
   already asserts `c.tenant_id = $1::uuid`.
 
-  **One is open.** As the RLS-bound application role, the same query that runs in 8 ms as
-  the owner is cancelled at the statement timeout, because the policy changes the plan:
+  **The second now has a structural fix, but not yet a scale result.** Before this PR,
+  the same query that ran in 8 ms as the owner was cancelled at the statement timeout
+  as the RLS-bound application role, because the policy changed the plan:
 
   ```
   Nested Loop
@@ -89,10 +90,11 @@ work on a held-out corpus, not a code change, and it is not done.
   practical consequence is that at reference scale a free-text query is bounded by the
   policy evaluation rather than by the search.
 
-  **Rewriting `scope_reachable` in SQL was tried and does not work.** The reasoning was
+  **Rewriting `scope_reachable` in SQL was tried and did not work.** The reasoning was
   that PL/pgSQL hides `caller_scopes()` from the planner, which therefore cannot hoist it
-  as an initplan. Migration `0014` rewrote the function clause-for-clause in SQL,
-  preserving the semantics, and it was measured rather than assumed:
+  as an initplan. A temporary, subsequently reverted migration rewrote the function
+  clause-for-clause in SQL, preserving the semantics, and it was measured rather than
+  assumed:
 
   | configuration | app-role query, same corpus |
   | --- | --- |
@@ -108,16 +110,15 @@ work on a held-out corpus, not a code change, and it is not done.
   nothing. The predicate was never the cost — 20,000 direct calls take 1.5 ms.
   **The remaining cost is planner path selection, and this attempted fix did not address it.**
 
-  What the plan shows, and what a real fix needs: with the policy active the planner
-  drives from `claims_scope_idx` and evaluates `veritymem.scope_reachable` as part of the
-  per-row filter, so `claims_tsv_gin` — the index that answers the text search in 8 ms as
-  the owner — is never the driving path. Since the predicate is cheap per call, the
-  problem is that it is *reached* for far more rows than the search selects. Making that
-  better requires either a form the planner can push below the scan, or evaluating the
-  caller's reachable set once per statement and having the policy read it, which means
-  changing how the request context is bound rather than how the predicate is written.
-  Both are design changes to the authorization path, and `docs/isolation-assessment.md`'s
-  external review should see either before it lands.
+  The plan showed that the policy had to stop invoking reachability for every candidate.
+  Migration `0014_precomputed_scope_context.sql` therefore changes request binding rather
+  than merely rewriting the predicate: `set_request_context` computes the reachable scope
+  IDs once into a transaction-local setting, and both RLS and retrieval use UUID-array
+  membership. This removes the per-row function call while preserving the isolation
+  contract. It is covered by the isolation and query-shape tests, but it has not yet been
+  rerun on the recorded 1,190,477-claim corpus. Until that run publishes an app-role plan
+  and latency distribution, this is a fix under test rather than evidence that the target
+  is met.
 - **At one million claims the read path does not complete inside its own statement
   timeout.** A complete corpus now exists
   (`perf-ref-1190477-<suffix>`, 1,190,477 claims, events, spans, evidence rows and
@@ -128,9 +129,11 @@ work on a held-out corpus, not a code change, and it is not done.
   250 ms, so this is not a near miss; on this configuration the read path does not
   complete at the scale the target names.
 
-  The cause is a working set that cannot be cached, not a slow query in isolation.
-  Each measured in isolation against the same corpus, with `SET statement_timeout`
-  raised:
+  The original report attributed the failure to a working set that could not be
+  cached, but that attribution was too strong: it isolated lexical, dense and one
+  join, while the real request also ran an entity query and a row-security function
+  that consulted `scopes` for every candidate row. The measurements below remain
+  useful evidence of cache pressure; they do not prove it was the only cause.
 
   | piece | time |
   | --- | --- |
@@ -153,19 +156,18 @@ work on a held-out corpus, not a code change, and it is not done.
   index-driven access on `claims` for a parallel sequential scan, and concurrent
   requests evict each other. Four concurrent readers each sat at 16-30 s per query.
 
-  This is recorded as a configuration and design finding, not as a benchmark result:
-  the published deploy configuration has never been tuned for the scale its own target
-  names, and the honest statement is that **the one-million-claim p95 is unknown
-  because the workload does not finish**. Raising `shared_buffers`,
-  `effective_cache_size`, `work_mem` and `hnsw.ef_search`, and deciding between a
-  global HNSW index and a per-tenant one, are the work that would make the number
-  measurable. The target also still requires a *published reference machine*, which
-  this is not.
+  The subsequent read-path hardening precomputes the reachable scope closure once per
+  transaction, replaces the entity cross-join with a canonical-to-claim index, runs
+  dense retrieval alongside the ordinary lane, and gives the Compose deployment
+  explicit memory defaults. Those changes have not yet been run on the recorded
+  million-claim corpus, so they are fixes under test, not a passing benchmark. The
+  honest statement remains that **the one-million-claim p95 is unknown because the
+  workload did not finish**. A rerun on a published reference machine is required.
 - **The dense channel's ANN search is global across tenants.** `claim_embeddings_hnsw_idx`
-  indexes the bare `embedding` column with no tenant key, and the dense channel orders by
-  `e.embedding <=> $vector` over a join that is filtered by `c.tenant_id` afterwards, so
-  the index scan considers every tenant's vectors and the tenant predicate is applied to
-  the candidates it returns. On the reference corpus that index holds 1,011,129 vectors
+  indexes the bare `embedding` column with no tenant key. The dense query now carries
+  explicit tenant predicates on both `claims` and `claim_embeddings`, but pgvector applies
+  ordinary filters after an approximate index scan, so the global graph can still consider
+  other tenants' vectors before filtering. On the reference corpus that index holds 1,011,129 vectors
   from 1,217 tenants at the time of measurement. Beyond the latency consequence above,
   this is the "filtering after vector search leaks through counts, timing, and generated
   summaries" case that `docs/isolation-assessment.md` names: the number of candidates
@@ -179,7 +181,7 @@ work on a held-out corpus, not a code change, and it is not done.
   recorded model for that tenant. A latency measurement over it exercises a retrieval
   path with a partially populated vector index. The loader now refuses to report a
   corpus that did not land (see below), but this dataset predates that check and was
-  produced by an interrupted load whose phases checkpoint independently. Re-running
+  produced by an interrupted load whose phases checkpoint independently.
   Re-running `pnpm eval:perf bench --skip-load` for that tenant cannot repair it: the
   loader's checkpoint for it is gone (`.veritymem/` is generated state, not committed),
   so a resume restarts from the first phase rather than filling the remainder, and
