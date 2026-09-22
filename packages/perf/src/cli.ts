@@ -20,10 +20,12 @@
 import { randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import { loadEnv, resolveTenantId } from "@veritymem/ledger";
+import type { TimeSpec } from "@veritymem/contracts";
 import { HashEmbeddingBackend } from "@veritymem/retrieval";
 import { bootstrapDatabase } from "./isolated.ts";
 import { countAll, loadCorpus, syncStreams } from "./load.ts";
 import { capturePlans, PlanCaptureRefusal } from "./plan-capture.ts";
+import { FIXTURE_FROM, FIXTURE_TO, provisionFixture } from "./plan-fixture.ts";
 import { TARGET_CLAIMS } from "./report.ts";
 import { DEFAULT_ANCHOR, defaultAnchor, runBenchmark } from "./run.ts";
 
@@ -319,6 +321,9 @@ Optional
   --time-mode <mode>     current | as_of | during (default current). Only 'during' makes
                          the temporal channel issue a statement; the mode is recorded in
                          the artifact so a missing stage can be read correctly.
+  --as-of <timestamp>    required for --time-mode as_of; rejected otherwise
+  --from <timestamp>     required for --time-mode during; rejected otherwise
+  --to <timestamp>       required for --time-mode during; rejected otherwise
   --force                overwrite an existing artifact
 
 Exit codes: 0 captured; 1 refused (see the message); 2 could not run.
@@ -334,7 +339,8 @@ interface ExplainArgs {
   readonly purpose: string;
   readonly principal: string | null;
   readonly subjects: readonly string[];
-  readonly timeMode: "current" | "as_of" | "during";
+  /** The complete TimeSpec, validated. Never assembled from loose option strings. */
+  readonly time: TimeSpec;
   readonly force: boolean;
 }
 
@@ -355,7 +361,10 @@ function parseExplainArgs(argv: readonly string[]): ExplainArgs {
   let purpose = "release_planning";
   let principal: string | null = null;
   const subjects: string[] = [];
-  let timeMode: "current" | "as_of" | "during" = "current";
+  let timeMode: string | null = null;
+  let asOf: string | null = null;
+  let from: string | null = null;
+  let to: string | null = null;
   let force = false;
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -373,14 +382,10 @@ function parseExplainArgs(argv: readonly string[]): ExplainArgs {
       case "--purpose": purpose = next(); break;
       case "--principal": principal = next(); break;
       case "--subject": subjects.push(next()); break;
-      case "--time-mode": {
-        const value = next();
-        if (value !== "current" && value !== "as_of" && value !== "during") {
-          throw new Error("--time-mode must be current, as_of or during");
-        }
-        timeMode = value;
-        break;
-      }
+      case "--time-mode": timeMode = next(); break;
+      case "--as-of": asOf = next(); break;
+      case "--from": from = next(); break;
+      case "--to": to = next(); break;
       case "--limit": limit = Number.parseInt(next(), 10); break;
       case "--database-url": databaseUrl = next(); break;
       case "--migration-url": migrationUrl = next(); break;
@@ -401,7 +406,145 @@ function parseExplainArgs(argv: readonly string[]): ExplainArgs {
   if (limit === undefined || !Number.isFinite(limit) || limit < 1 || limit > 100) {
     throw new Error("--limit is required and must be 1..100 (the contract's maximum)");
   }
-  return { tenant, query, limit, output, databaseUrl, migrationUrl, purpose, principal, subjects, timeMode, force };
+  return {
+    tenant,
+    query,
+    limit,
+    output,
+    databaseUrl,
+    migrationUrl,
+    purpose,
+    principal,
+    subjects,
+    time: buildTimeSpec({ timeMode, asOf, from, to }),
+    force,
+  };
+}
+
+/**
+ * Build the `TimeSpec` the contract defines, or refuse.
+ *
+ * The three modes are a discriminated union, not a mode plus optional fields: `as_of`
+ * carries exactly one instant and `during` exactly one interval, so a request cannot express
+ * "during with no window" or "current with an as-of instant". Producing that union from
+ * command-line strings means every way of getting it wrong has to be rejected here, because
+ * a `TimeSpec` built by casting would pass an invalid request into `compose` and the planner
+ * would then either throw somewhere less legible or, worse, quietly plan a different query
+ * than the caller asked for.
+ *
+ * The rejections, and why each is not merely pedantic:
+ *
+ *   * **a mode-specific option given without its mode** — `--from/--to` with `current`, or
+ *     `--as-of` with `during`. Accepting these silently would produce an artifact whose
+ *     recorded `time_mode` disagrees with the window the caller believed they set, and the
+ *     plan inside would be for a query they did not ask for.
+ *   * **a missing required value** — the mode is meaningless without it.
+ *   * **an unparseable timestamp** — `new Date("yesterday")` is not an error in JavaScript,
+ *     it is `Invalid Date`, and it would reach PostgreSQL as a string. The check is that the
+ *     input parses *and* round-trips, so `2026-13-45` is refused rather than normalised.
+ *   * **`from >= to`** — an empty or inverted window. The temporal channel's range predicate
+ *     would match nothing and the capture would record a successful plan over an empty set.
+ */
+function buildTimeSpec(input: {
+  readonly timeMode: string | null;
+  readonly asOf: string | null;
+  readonly from: string | null;
+  readonly to: string | null;
+}): TimeSpec {
+  const mode = input.timeMode ?? "current";
+
+  const parse = (label: string, value: string): string => {
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) {
+      throw new Error(`${label} must be an ISO-8601 timestamp; '${value}' could not be parsed`);
+    }
+    // Round-trip: `2026-02-31` parses to March, which is a *different* instant than the
+    // caller wrote. Comparing the day back catches that class rather than accepting it.
+    const iso = parsed.toISOString();
+    if (!value.startsWith(iso.slice(0, 10)) && !value.startsWith(iso.slice(0, 7))) {
+      throw new Error(`${label} '${value}' is not a real instant; it normalises to ${iso}`);
+    }
+    return iso;
+  };
+
+  if (mode === "current") {
+    if (input.asOf !== null) throw new Error("--as-of is only valid with --time-mode as_of");
+    if (input.from !== null || input.to !== null) {
+      throw new Error("--from and --to are only valid with --time-mode during");
+    }
+    return { mode: "current" };
+  }
+
+  if (mode === "as_of") {
+    if (input.from !== null || input.to !== null) {
+      throw new Error("--from and --to are only valid with --time-mode during");
+    }
+    if (input.asOf === null) throw new Error("--time-mode as_of requires --as-of <ISO-8601 timestamp>");
+    return { mode: "as_of", as_of: parse("--as-of", input.asOf) };
+  }
+
+  if (mode === "during") {
+    if (input.asOf !== null) throw new Error("--as-of is only valid with --time-mode as_of");
+    if (input.from === null) throw new Error("--time-mode during requires --from <ISO-8601 timestamp>");
+    if (input.to === null) throw new Error("--time-mode during requires --to <ISO-8601 timestamp>");
+    const fromIso = parse("--from", input.from);
+    const toIso = parse("--to", input.to);
+    if (fromIso >= toIso) {
+      throw new Error(
+        `--from (${fromIso}) must be strictly before --to (${toIso}); an empty or inverted ` +
+          `window matches nothing and the temporal channel's plan would be over an empty set`,
+      );
+    }
+    return { mode: "during", from: fromIso, to: toIso };
+  }
+
+  throw new Error(`--time-mode must be current, as_of or during; got '${mode}'`);
+}
+
+/**
+ * Provision the plan-capture fixture.
+ *
+ * A command rather than something the test file does behind the scenes, because provisioning
+ * a corpus is a minutes-long, database-writing act and a test suite is the wrong place to
+ * hide one. The tests call the same function, so the fixture they assert against is the one
+ * this command produces.
+ *
+ * Idempotent: an already-complete fixture is returned without loading anything, so running it
+ * twice is free and deterministic.
+ */
+async function runFixtureCommand(argv: readonly string[]): Promise<number> {
+  const log = (message: string): void => {
+    process.stdout.write(`${message}\n`);
+  };
+  const force = argv.includes("--force");
+  if (argv.includes("--help") || argv.includes("-h")) {
+    process.stdout.write(
+      `Plan-capture fixture
+
+Usage: pnpm eval:perf fixture [--force]
+
+Provisions a deterministic tenant with a row for every retrieval stage: accepted claims,
+events, spans, claim evidence, dense embeddings, a projection version, relations, entity
+aliases and entity projections, plus a validity interval overlapping the during window.
+
+  --force   reload the corpus even if the fixture already looks complete
+
+Idempotent without --force: an already-complete fixture costs nothing.
+`,
+    );
+    return 0;
+  }
+
+  const fixture = await provisionFixture({ log, force });
+  log("");
+  log(`fixture     ${fixture.tenantSlug}${fixture.reused ? " (reused)" : " (loaded)"}`);
+  log(`principal   ${fixture.principal}`);
+  log(`subject     ${fixture.subject}`);
+  log(`during      ${FIXTURE_FROM} .. ${FIXTURE_TO}`);
+  for (const [field, count] of Object.entries(fixture.counts)) {
+    log(`  ${field.padEnd(20)} ${count}`);
+  }
+  return 0;
 }
 
 /** Run `explain`. Returns the process exit code. */
@@ -418,21 +561,33 @@ async function runExplainCommand(argv: readonly string[]): Promise<number> {
   }
 
   try {
-    const { artifact, output } = await capturePlans({ ...args, log });
+    const { artifact, output, completion } = await capturePlans({ ...args, log });
     const parsed = artifact as {
       stages: readonly { stage: string; success: boolean; structural_plan_digest: string | null }[];
     };
-    const failed = parsed.stages.filter((stage) => !stage.success);
-    const missing = (artifact as { capture: { missing_stages: readonly string[] } }).capture.missing_stages;
     log("");
     log(`artifact    ${output}`);
     for (const stage of parsed.stages) {
       const digest = stage.structural_plan_digest;
       log(`  ${stage.success ? "ok  " : "FAIL"} ${stage.stage.padEnd(20)} ${digest?.slice(0, 16) ?? "-"}`);
     }
-    if (missing.length > 0) log(`missing     ${missing.join(", ")}`);
-    if (failed.length > 0) {
-      log(`\n${failed.length} stage(s) could not be captured. See the artifact's raw entries.`);
+    if (completion.missing.length > 0) {
+      const conditional = completion.missing.filter(
+        (stage) => !completion.unexpected_missing.includes(stage),
+      );
+      if (conditional.length > 0) {
+        log(`not selected ${conditional.join(", ")}  (the request did not ask for these)`);
+      }
+    }
+    log(`complete    ${completion.complete ? "yes" : "NO"}`);
+
+    // A capture that is not complete exits non-zero. Every reason is named, because the
+    // operator's next action differs per reason: a failed plan is a database problem, a
+    // duplicated stage is a labelling bug, and an unlabelled statement is a seam that did
+    // not report itself.
+    if (!completion.complete) {
+      log("");
+      for (const reason of completion.reasons) log(`INCOMPLETE  ${reason}`);
       return 1;
     }
     return 0;
@@ -457,6 +612,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   // `parseArgs` would have meant its required arguments were optional to the benchmark and
   // the benchmark's were optional to it.
   if (argv.includes("explain")) return runExplainCommand(argv.filter((arg) => arg !== "explain"));
+  if (argv.includes("fixture")) return runFixtureCommand(argv.filter((arg) => arg !== "fixture"));
 
   const options = parseArgs(argv);
   const env = loadEnv();

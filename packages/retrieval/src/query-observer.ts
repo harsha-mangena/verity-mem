@@ -71,6 +71,15 @@ export interface ObservedQuery {
   readonly plan: readonly unknown[] | null;
   /** A sanitized message when the capture failed; null on success. */
   readonly error: string | null;
+  /**
+   * The parameter types PostgreSQL inferred for *this* statement, as `pg_prepared_statements`
+   * reports them, or an empty array when they could not be determined.
+   *
+   * Carried on the observation rather than looked up afterwards, because a lookup needs a key
+   * and every key is wrong: SQL length collides between different statements, and the stage
+   * name is not unique when a stage issues more than one statement.
+   */
+  readonly parameterTypes: readonly string[];
 }
 
 export interface QueryObserver {
@@ -116,6 +125,14 @@ export interface ExplainingExecutorOptions {
    * not a read.
    */
   readonly shouldCapture?: (sql: string) => boolean;
+  /**
+   * The parameter types PostgreSQL inferred for a statement, or an empty array.
+   *
+   * Supplied by the caller because this module has no database driver: determining the types
+   * means asking the server to prepare the statement. Called once per captured statement, on
+   * the same connection as the statement itself.
+   */
+  readonly parameterTypes?: (sql: string, params: readonly unknown[]) => Promise<readonly string[]>;
 }
 
 /**
@@ -164,15 +181,23 @@ export function withObservation(
 
       let plan: readonly unknown[] | null = null;
       let error: string | null = null;
+      let parameterTypes: readonly string[] = [];
       try {
         plan = await options.explain(text, params);
       } catch (cause) {
         // A statement that cannot be explained — a plan the database refuses, a timeout —
-        // must not fail the capture run. It is recorded as a failed stage with a sanitized
-        // message, which is what the artifact's `success: false` entry is for.
+        // must not fail the capture run. It is recorded as a failed stage with a message the
+        // observer sanitizes, which is what the artifact's `success: false` entry is for.
         error = (cause as Error).message;
       }
-      options.observer.observed({ stage, sql: text, params, plan, error });
+      try {
+        parameterTypes = (await options.parameterTypes?.(text, params)) ?? [];
+      } catch {
+        // Types are diagnostic, not load-bearing for the capture; an absent record is
+        // reported as an empty list rather than failing a stage that otherwise has a plan.
+        parameterTypes = [];
+      }
+      options.observer.observed({ stage, sql: text, params, plan, error, parameterTypes });
       return result;
     },
   };

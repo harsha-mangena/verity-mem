@@ -21,6 +21,13 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./initdb:/docker-entrypoint-initdb.d:ro
+    # Docker's default `/dev/shm` is 64 MB. PostgreSQL allocates dynamic shared memory for
+    # parallel workers and for a parallel index build, and PostgreSQL's own documentation
+    # recommends 1 GB for a container running a real workload. At 64 MB a parallel index
+    # rebuild over a corpus fails with
+    #   dsm_impl_posix: could not resize shared memory segment ... No space left on device
+    # which is a deployment fault rather than a query fault, and it looks like one.
+    shm_size: 1gb
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U verity -d veritymem"]
       interval: 3s

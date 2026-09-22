@@ -24,7 +24,7 @@
  * captured as the owner would not contain the row-level-security predicate — and the
  * predicate is one of the things this artifact exists to record.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -46,7 +46,9 @@ import {
   type QueryObserver,
   type RetrievalStage,
 } from "@veritymem/retrieval";
+import type { TimeSpec } from "@veritymem/contracts";
 import { planCounters, planOutline, planTimings, structuralDigest } from "./plan-digest.ts";
+import { findLeaks, findMarkers, redactUuids, sanitizePlan, type SecretProbe } from "./plan-sanitize.ts";
 
 /** Bumped when the artifact's shape changes in a way a reader would have to handle. */
 export const PLAN_SCHEMA_VERSION = "vm-a3.plan-capture.1";
@@ -97,10 +99,14 @@ export interface PlanCaptureOptions {
    */
   readonly subjects: readonly string[];
   /**
-   * The query's time mode. `current` by default; `during` is what makes the temporal
-   * channel issue a statement at all.
+   * The complete `TimeSpec`, as the contract defines it.
+   *
+   * Passed through to `compose` unchanged. It is the contract's own union rather than a
+   * mode plus optional fields, so a request cannot express "during with no window" and
+   * this module never has to decide what such a request would mean. The CLI is responsible
+   * for rejecting bad input; see `buildTimeSpec`.
    */
-  readonly timeMode: "current" | "as_of" | "during";
+  readonly time: TimeSpec;
   readonly log: (message: string) => void;
 }
 
@@ -108,7 +114,15 @@ export interface StageCapture {
   readonly stage: RetrievalStage;
   readonly success: boolean;
   readonly structural_plan_digest: string | null;
-  readonly raw_plan: readonly unknown[] | null;
+  /**
+   * The plan with every bound value replaced.
+   *
+   * Named `sanitized_plan`, not `raw_plan`. `EXPLAIN (FORMAT JSON)` rewrites the statement
+   * with its parameter values substituted, so the raw document carries tenant UUIDs, query
+   * text and declared subjects in fields such as `Filter` and `Index Cond`. Calling a
+   * sanitized document "raw" would be a false claim about what a reader is looking at.
+   */
+  readonly sanitized_plan: readonly unknown[] | null;
   readonly plan_outline: readonly string[];
   readonly planning_time_ms: number | null;
   readonly execution_time_ms: number | null;
@@ -386,7 +400,6 @@ async function preflight(admin: Db, app: Db, options: PlanCaptureOptions): Promi
  */
 class Collector implements QueryObserver {
   private readonly entries: StageCapture[] = [];
-  private readonly types = new Map<string, readonly string[]>();
 
 
   observed(entry: ObservedQuery): void {
@@ -395,22 +408,24 @@ class Collector implements QueryObserver {
       stage: entry.stage,
       success: entry.error === null && plan !== null,
       structural_plan_digest: plan === null ? null : structuralDigest(plan),
-      raw_plan: plan,
+      sanitized_plan: plan === null ? null : sanitizePlan(plan),
       plan_outline: plan === null ? [] : planOutline(plan),
       planning_time_ms: plan === null ? null : planTimings(plan).planning_time_ms,
       execution_time_ms: plan === null ? null : planTimings(plan).execution_time_ms,
       buffers: plan === null ? null : planCounters(plan),
-      parameter_types: this.types.get(`${entry.stage}:${entry.sql.length}`) ?? [],
+      /**
+       * Types come from the observation itself.
+       *
+       * The first version keyed them by `stage:sql.length`, which is wrong twice over: two
+       * different statements can have the same length, and a statement whose text changed by
+       * one character would silently inherit the previous statement's types.
+       */
+      parameter_types: entry.parameterTypes,
       selected_settings: plan === null ? {} : planSettings(plan),
       // Values are dropped: the artifact carries the statement's shape, not its inputs.
       sanitized_sql: sanitizeSql(entry.sql),
       error: entry.error,
     });
-  }
-
-  /** Record the parameter types PostgreSQL inferred, keyed by stage and statement length. */
-  attachParameterTypes(stage: RetrievalStage, sql: string, types: readonly string[]): void {
-    this.types.set(`${stage}:${sql.length}`, types);
   }
 
   /** An entry recorded by the caller rather than by the executor seam. */
@@ -470,7 +485,16 @@ async function parameterTypes(
   sql: string,
   params: readonly unknown[],
 ): Promise<readonly string[]> {
-  const name = "vm_a3_probe";
+  /**
+   * A unique name per call.
+   *
+   * A fixed name collides: the dense channel's model-version lookup and its vector search are
+   * issued from two executors on the same connection, and the ordinary lane runs concurrently
+   * on another. A `PREPARE` under a name already in use is an error in PostgreSQL, so a fixed
+   * name would make one of the two statements report no types — silently, because the catch
+   * below turns any failure into an empty list.
+   */
+  const name = `vm_a3_probe_${randomBytes(8).toString("hex")}`;
   try {
     await executor.query(`PREPARE ${name} AS ${sql}`);
     const row = await executor.query<{ parameter_types: string[] }>(
@@ -478,10 +502,23 @@ async function parameterTypes(
       [name],
     );
     return row.rows[0]?.parameter_types ?? [];
-  } catch {
-    // A statement that cannot be prepared reports no types rather than failing a capture.
+  } catch (cause) {
+    /**
+     * Recorded rather than swallowed.
+     *
+     * An empty list is a legitimate answer — a statement with no placeholders has no types —
+     * so a caller cannot distinguish "no parameters" from "the probe failed" by looking at
+     * the value. The failure is therefore reported on stderr, which keeps it visible without
+     * making a diagnostic gap fail an otherwise-successful capture.
+     */
+    process.stderr.write(
+      `plan capture: could not determine parameter types for one statement ` +
+        `(${redactUuids((cause as Error).message)}); recording an empty list\n`,
+    );
     return [];
   } finally {
+    // Always, including on the failure path: a prepared statement left behind would keep a
+    // plan pinned for the life of the session and could collide with a later probe.
     await executor.query(`DEALLOCATE ${name}`).catch(() => undefined);
   }
 }
@@ -524,7 +561,7 @@ function planSettings(explainRows: readonly unknown[]): Record<string, string> {
 /** Capture the artifact. Throws `PlanCaptureRefusal` for a refusal. */
 export async function capturePlans(
   options: PlanCaptureOptions,
-): Promise<{ artifact: unknown; output: string }> {
+): Promise<{ artifact: unknown; output: string; completion: StageCompletion }> {
   const env = loadEnv();
   const databaseUrl = options.databaseUrl ?? env.databaseUrl;
   const migrationUrl = options.migrationUrl ?? env.migrationDatabaseUrl;
@@ -616,16 +653,19 @@ export async function capturePlans(
         const params = [facts.tenantId, facts.principal, scopeIds, [options.purpose], "query:read"];
         let plan: readonly unknown[] | null = null;
         let error: string | null = null;
+        let types: readonly string[] = [];
         try {
           // Explained on its own, before the surrounding `withRequest` binding is reused:
           // the resulting plan is of a statement whose settings are the transaction's, and
           // the real call below is what the later stages inherit.
           plan = await explainVia(executor, sql, params);
-          collector.attachParameterTypes("scope_binding", sql, await parameterTypes(executor, sql, params));
+          types = await parameterTypes(executor, sql, params);
         } catch (cause) {
-          error = (cause as Error).message;
+          // Sanitized, because a PostgreSQL error repeats the offending value and the values
+          // here are the tenant UUID and the principal.
+          error = redactUuids((cause as Error).message);
         }
-        collector.observed({ stage: "scope_binding", sql, params, plan, error });
+        collector.observed({ stage: "scope_binding", sql, params, plan, error, parameterTypes: types });
       },
     );
 
@@ -640,7 +680,9 @@ export async function capturePlans(
         scope: { tenant: options.tenant },
         purpose: options.purpose,
         limit: options.limit,
-        time: { mode: options.timeMode },
+        // The contract's TimeSpec, not a cast: `compose` receives exactly what the caller
+        // asked for, and the union means there is no invalid shape to express.
+        time: options.time,
         ...(options.subjects.length > 0 ? { subjects: [...options.subjects] } : {}),
       } as never,
       {
@@ -651,6 +693,9 @@ export async function capturePlans(
             observer,
             stageName,
             explain: (sql, params) => explainVia(executor, sql, params),
+            // Read on the same connection as the statement, so the prepared statement it
+            // creates is scoped to this session and cannot collide with a concurrent lane's.
+            parameterTypes: (sql, params) => parameterTypes(executor, sql, params),
             shouldCapture: looksReadOnly,
           }),
       },
@@ -659,17 +704,24 @@ export async function capturePlans(
 
     const entries = collector.all();
     const report = collector.stageReport();
-    const missing = REQUIRED_STAGES.filter((name) => !report.seen.includes(name));
+    const completion = assessCompletion(entries, {
+      timeMode: options.time.mode,
+      declaredSubjects: options.subjects.length,
+    });
+    const missing = completion.missing;
     for (const name of missing) {
-      options.log(`WARNING     stage '${name}' produced no statement; recorded as missing`);
+      const conditional =
+        !completion.unexpected_missing.includes(name) ? " (not selected by this request)" : "";
+      options.log(`WARNING     stage '${name}' produced no statement${conditional}`);
     }
+    for (const reason of completion.reasons) options.log(`INCOMPLETE  ${reason}`);
 
     const artifact = buildArtifact({
       options,
       facts,
       entries,
       missing,
-      duplicates: report.duplicates,
+      completion,
       wallMs: Date.now() - started,
       heldScopes: scopeIds.length,
       embeddings: {
@@ -679,21 +731,150 @@ export async function capturePlans(
       },
     });
 
+    /**
+     * Refuse to write an artifact that carries a secret.
+     *
+     * This runs on the assembled object rather than trusting the sanitizer, because the
+     * sanitizer's coverage is a claim about which fields PostgreSQL fills with values, and a
+     * claim is not a proof. The probes are the values this specific run actually handled, so a
+     * leak of any one of them is caught even if it arrived through a field nobody anticipated.
+     */
+    const probes: SecretProbe[] = [
+      { label: "tenant id", value: facts.tenantId },
+      { label: "tenant slug", value: options.tenant },
+      { label: "principal", value: facts.principal },
+      { label: "query text", value: options.query },
+      ...scopeIds.map((scope, i) => ({ label: `held scope ${i}`, value: scope })),
+      ...options.subjects.map((subject, i) => ({ label: `declared subject ${i}`, value: subject })),
+      ...(databaseUrl === null ? [] : [{ label: "database url", value: databaseUrl }]),
+      ...(migrationUrl === null ? [] : [{ label: "migration url", value: migrationUrl }]),
+    ];
+    const leaked = findLeaks(artifact, probes);
+    if (leaked.length > 0) {
+      throw new Error(
+        `refusing to write ${output}: the artifact contains ${leaked
+          .map((probe) => probe.label)
+          .join(", ")}. This is a sanitization defect, not an input problem — the plan fields ` +
+          `carry bound values and one has survived. Nothing was written.`,
+      );
+    }
+    const markers = findMarkers(artifact, ["postgres://", "postgresql://", "password", "bearer "]);
+    if (markers.length > 0) {
+      throw new Error(
+        `refusing to write ${output}: the artifact contains ${markers.join(", ")}, which is a ` +
+          `credential or a connection string. Nothing was written.`,
+      );
+    }
+
     mkdirSync(dirname(output), { recursive: true });
     writeFileSync(output, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
-    return { artifact, output };
+    return { artifact, output, completion };
   } finally {
     await app.close();
     await admin.close();
   }
 }
 
+/**
+ * Why a stage may legitimately be absent, or absent only under a condition.
+ *
+ * The point of writing this down is that "the stage is missing" and "the request did not
+ * select the stage" are different outcomes with different responses, and an artifact that
+ * cannot distinguish them is not evidence. Each entry states the condition under which
+ * absence is acceptable; anything else is a failure.
+ */
+export interface StageCompletion {
+  readonly complete: boolean;
+  readonly missing: readonly RetrievalStage[];
+  readonly unexpected_missing: readonly RetrievalStage[];
+  readonly failed: readonly RetrievalStage[];
+  readonly duplicated: readonly RetrievalStage[];
+  readonly unlabeled: number;
+  readonly reasons: readonly string[];
+}
+
+/**
+ * Decide whether a capture is complete.
+ *
+ * A stage is *unexpectedly* missing when it is required and the request selected it. The
+ * two conditional channels are the only ones whose absence is ever acceptable:
+ *
+ *   * `relation_channel` is planned only for caller-declared subjects;
+ *   * `temporal_channel` issues no statement unless the time mode is `during`.
+ *
+ * Everything else — and any captured statement without a stage name, or a stage that failed
+ * to plan — makes the capture incomplete. Callers treat `complete: false` as a non-zero
+ * exit, because a capture with a hole in it is the failure this whole artifact exists to
+ * make visible.
+ */
+export function assessCompletion(
+  stages: readonly { readonly stage: RetrievalStage; readonly success: boolean }[],
+  request: { readonly timeMode: string; readonly declaredSubjects: number },
+): StageCompletion {
+  const counts = new Map<string, number>();
+  for (const stage of stages) counts.set(stage.stage, (counts.get(stage.stage) ?? 0) + 1);
+
+  const conditional = new Set<string>(["relation_channel", "temporal_channel"]);
+  const unconditional: readonly string[] = REQUIRED_STAGES.filter((stage) => !conditional.has(stage));
+  const missing: RetrievalStage[] = REQUIRED_STAGES.filter((stage) => !counts.has(stage));
+  const unexpected: RetrievalStage[] = missing.filter((stage) => unconditional.includes(stage));
+
+  const reasons: string[] = [];
+  if (request.timeMode === "during" && missing.includes("temporal_channel")) {
+    unexpected.push("temporal_channel");
+    reasons.push(
+      "temporal_channel produced no statement for a during request, which is not a conditional absence",
+    );
+  }
+  if (request.declaredSubjects > 0 && missing.includes("relation_channel")) {
+    unexpected.push("relation_channel");
+    reasons.push(
+      "relation_channel produced no statement although subjects were declared, which is not a conditional absence",
+    );
+  }
+
+  const failed = stages.filter((stage) => !stage.success).map((stage) => stage.stage);
+  if (failed.length > 0) {
+    reasons.push(`${failed.length} stage(s) failed to produce a plan: ${failed.join(", ")}`);
+  }
+
+  // Each stage is expected at most once. A repeat means two statements were attributed to
+  // one stage, which would hide a statement's real name — the mislabelling defect this
+  // module has already produced once.
+  const duplicated: RetrievalStage[] = [...counts.entries()]
+    .filter(([, n]) => n > 1)
+    .map(([name]) => name as RetrievalStage);
+  if (duplicated.length > 0) {
+    reasons.push(
+      `${duplicated.length} stage(s) captured more than one statement, so at least one is ` +
+        `mislabelled: ${duplicated.join(", ")}`,
+    );
+  }
+
+  const unlabeled = counts.get("unlabeled") ?? 0;
+  if (unlabeled > 0) {
+    reasons.push(
+      `${unlabeled} statement(s) were captured without a stage name, so the artifact cannot say what they are`,
+    );
+  }
+
+  return {
+    complete: unexpected.length === 0 && failed.length === 0 && duplicated.length === 0 && unlabeled === 0,
+    missing,
+    unexpected_missing: unexpected,
+    failed,
+    duplicated,
+    unlabeled,
+    reasons,
+  };
+}
+
 interface BuildInput {
   readonly options: PlanCaptureOptions;
   readonly facts: PreflightFacts;
   readonly entries: readonly StageCapture[];
-  readonly missing: readonly string[];
-  readonly duplicates: readonly string[];
+  readonly missing: readonly RetrievalStage[];
+  readonly completion: StageCompletion;
   readonly wallMs: number;
   readonly heldScopes: number;
   readonly embeddings: {
@@ -742,7 +923,14 @@ function buildArtifact(input: BuildInput): unknown {
        * lets a reader tell "the stage did not run because the query did not ask for it" from
        * "the stage ran and was not captured", which are different problems.
        */
-      time_mode: options.timeMode,
+      time_mode: options.time.mode,
+      /** The resolved window, when the mode has one. Echoed so the artifact is self-contained. */
+      time_window:
+        options.time.mode === "during"
+          ? { from: options.time.from, to: options.time.to }
+          : options.time.mode === "as_of"
+            ? { as_of: options.time.as_of }
+            : null,
       /**
        * How many subjects the caller declared. `relation_channel` is planned only for
        * declared subjects, so this is the other half of reading `missing_stages` correctly.
@@ -767,7 +955,15 @@ function buildArtifact(input: BuildInput): unknown {
         "execution, so actual times and buffer counters describe a second, warm-cache run. They " +
         "are evidence about plan shape, not about latency.",
       missing_stages: input.missing,
-      duplicated_stages: input.duplicates,
+      /** Missing stages the request *did* select, which is the only kind that is a defect. */
+      unexpectedly_missing_stages: input.completion.unexpected_missing,
+      failed_stages: input.completion.failed,
+      duplicated_stages: input.completion.duplicated,
+      unlabeled_statements: input.completion.unlabeled,
+      /** The single field a caller should branch on. */
+      complete: input.completion.complete,
+      /** Why it is not complete, in the words of the check that failed. */
+      incompleteness_reasons: input.completion.reasons,
     },
     stages: entries,
   };

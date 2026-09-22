@@ -31,6 +31,32 @@
  * is for. The estimates survive in the raw plan.
  */
 import { createHash } from "node:crypto";
+import { canonicalExpression } from "./plan-sanitize.ts";
+
+/**
+ * Keys whose string value is a rewritten SQL expression rather than an identifier.
+ *
+ * The same set the sanitizer uses, for the same reason: these are the fields PostgreSQL
+ * fills with the statement plus its bound values.
+ */
+const EXPRESSION_BEARING = new Set([
+  "Filter",
+  "Index Cond",
+  "Recheck Cond",
+  "Hash Cond",
+  "Join Filter",
+  "Merge Cond",
+  "One-Time Filter",
+  "Index Recheck",
+  "Function Call",
+  "Output",
+  "Sort Key",
+  "Group Key",
+  "Cache Key",
+  "Cache Mode",
+  "Presorted Key",
+  "Order By",
+]);
 
 /**
  * Fields dropped from the canonical form: everything that varies between two executions
@@ -66,10 +92,19 @@ const VOLATILE_KEYS = new Set([
   "WAL FPI",
   "WAL Bytes",
   "WAL Buffers Full",
-  // Worker runtime statistics.
-  "Workers Planned",
+  /**
+   * `Workers Launched` is runtime: PostgreSQL reports how many workers it actually started,
+   * which varies with load and `max_parallel_workers`. Two runs of the same plan can report
+   * different numbers, so it cannot be part of a digest that is meant to detect *shape*
+   * change.
+   */
   "Workers Launched",
-  "Parallel Aware",
+  /**
+   * `Workers Planned` is **kept**. It is the planner's decision — part of the topology —
+   * and dropping it would make a plan that intends two workers indistinguishable from one
+   * that intends none. `Parallel Aware` is likewise kept, because it is what distinguishes a
+   * parallel-aware node from its serial form.
+   */
   // Measurements that move with the data rather than with the shape.
   "Peak Memory Usage",
   "Rows Removed by Filter",
@@ -86,17 +121,34 @@ const VOLATILE_KEYS = new Set([
  * Reduce one plan node — and its children — to a canonical structural value.
  *
  * Objects are emitted with sorted keys so that key order, which PostgreSQL does not
- * promise, cannot change the digest. Arrays keep their order: sibling plan nodes are
- * ordered by execution and a reordering is a real change.
+ * promise, cannot change the digest. Arrays keep their order: sibling plan nodes are ordered
+ * by execution and a reordering is a real change.
+ *
+ * **Expression strings are canonicalized**, not merely sanitized. `EXPLAIN` rewrites a
+ * statement with its bound values substituted, so two captures of the same query shape for
+ * two different tenants produce `Index Cond: (tenant_id = '3f2a…'::uuid)` and
+ * `(tenant_id = '9c1b…'::uuid)`. Hashing those verbatim would give different digests for
+ * identical topology — which defeats the whole purpose, since the digest exists to answer
+ * "did the plan shape change?" and the answer would be "yes" on every run against different
+ * data. Canonicalization replaces literals and UUIDs with placeholders first, so the digest
+ * is a function of topology, relations, indexes, join structure and operators.
  */
-function canonicalNode(node: unknown): unknown {
-  if (Array.isArray(node)) return node.map(canonicalNode);
+function canonicalNode(node: unknown, key?: string): unknown {
+  if (Array.isArray(node)) return node.map((child) => canonicalNode(child, key));
   if (node === null || typeof node !== "object") return node;
 
   const out: Record<string, unknown> = {};
-  for (const key of Object.keys(node as Record<string, unknown>).sort()) {
-    if (VOLATILE_KEYS.has(key)) continue;
-    out[key] = canonicalNode((node as Record<string, unknown>)[key]);
+  for (const childKey of Object.keys(node as Record<string, unknown>).sort()) {
+    if (VOLATILE_KEYS.has(childKey)) continue;
+    const value = (node as Record<string, unknown>)[childKey];
+    // A string under a key that carries an expression is canonicalized; identifiers such as
+    // `Relation Name` and `Index Name` are preserved because a different relation *is* a
+    // different plan.
+    if (typeof value === "string" && EXPRESSION_BEARING.has(childKey)) {
+      out[childKey] = canonicalExpression(value);
+    } else {
+      out[childKey] = canonicalNode(value, childKey);
+    }
   }
   return out;
 }
