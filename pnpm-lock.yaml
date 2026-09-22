@@ -293,9 +293,15 @@ importers:
         specifier: workspace:*
         version: link:../policy
     devDependencies:
+      '@types/pg':
+        specifier: 8.15.5
+        version: 8.15.5
       '@veritymem/testkit':
         specifier: workspace:*
         version: link:../testkit
+      pg:
+        specifier: 8.16.3
+        version: 8.16.3
 
   packages/sdk-ts:
     dependencies:

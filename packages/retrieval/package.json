@@ -17,6 +17,8 @@
     "@veritymem/model-adapters": "workspace:*"
   },
   "devDependencies": {
-    "@veritymem/testkit": "workspace:*"
+    "@types/pg": "8.15.5",
+    "@veritymem/testkit": "workspace:*",
+    "pg": "8.16.3"
   }
 }
