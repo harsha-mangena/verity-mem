@@ -23,6 +23,7 @@ import { loadEnv, resolveTenantId } from "@veritymem/ledger";
 import { HashEmbeddingBackend } from "@veritymem/retrieval";
 import { bootstrapDatabase } from "./isolated.ts";
 import { countAll, loadCorpus, syncStreams } from "./load.ts";
+import { capturePlans, PlanCaptureRefusal } from "./plan-capture.ts";
 import { TARGET_CLAIMS } from "./report.ts";
 import { DEFAULT_ANCHOR, defaultAnchor, runBenchmark } from "./run.ts";
 
@@ -295,7 +296,155 @@ function env0(): { readonly databaseUrl: string; readonly migrationDatabaseUrl: 
 }
 
 /** Run the CLI. Returns the process exit code. */
+
+const EXPLAIN_USAGE = `Plan capture — real PostgreSQL plans for every retrieval stage
+
+Usage: pnpm eval:perf explain [options]
+
+Required
+  --tenant <slug>        tenant to capture against
+  --query <text>         the query text to plan
+  --limit <number>       QueryRequest.limit (1..100)
+  --output <path>        artifact path; refuses to overwrite without --force
+
+Optional
+  --database-url <url>   read path connection (RLS-bound application role)
+  --migration-url <url>  metadata and version reads (owner role)
+  --purpose <purpose>    declared purpose (default release_planning)
+  --principal <id>       caller principal; must participate in the tenant. Omit to
+                         use the first participant found, which is reported.
+  --subject <subject>    declare a subject, repeatable. The relation channel is only
+                         planned for caller-declared subjects, so without one the
+                         artifact reports that stage as missing rather than inventing it.
+  --force                overwrite an existing artifact
+
+Exit codes: 0 captured; 1 refused (see the message); 2 could not run.
+`;
+
+interface ExplainArgs {
+  readonly tenant: string;
+  readonly query: string;
+  readonly limit: number;
+  readonly output: string;
+  readonly databaseUrl: string | null;
+  readonly migrationUrl: string | null;
+  readonly purpose: string;
+  readonly principal: string | null;
+  readonly subjects: readonly string[];
+  readonly force: boolean;
+}
+
+/**
+ * Parse the `explain` command's arguments.
+ *
+ * Every required option is required here rather than defaulted. A capture run that guessed
+ * its tenant or its query would produce a well-formed artifact about something nobody
+ * asked for, and the artifact carries no way to notice.
+ */
+function parseExplainArgs(argv: readonly string[]): ExplainArgs {
+  let tenant: string | undefined;
+  let query: string | undefined;
+  let limit: number | undefined;
+  let output: string | undefined;
+  let databaseUrl: string | null = null;
+  let migrationUrl: string | null = null;
+  let purpose = "release_planning";
+  let principal: string | null = null;
+  const subjects: string[] = [];
+  let force = false;
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    const next = (): string => {
+      const value = argv[index + 1];
+      if (value === undefined) throw new Error(`${String(arg)} requires a value`);
+      index += 1;
+      return value;
+    };
+    switch (arg) {
+      case "--tenant": tenant = next(); break;
+      case "--query": query = next(); break;
+      case "--output": output = next(); break;
+      case "--purpose": purpose = next(); break;
+      case "--principal": principal = next(); break;
+      case "--subject": subjects.push(next()); break;
+      case "--limit": limit = Number.parseInt(next(), 10); break;
+      case "--database-url": databaseUrl = next(); break;
+      case "--migration-url": migrationUrl = next(); break;
+      case "--force": force = true; break;
+      case "--help":
+      case "-h":
+        process.stdout.write(EXPLAIN_USAGE);
+        process.exit(0);
+        break;
+      default:
+        throw new Error(`unknown option ${String(arg)} for explain`);
+    }
+  }
+
+  if (tenant === undefined) throw new Error("--tenant is required");
+  if (query === undefined || query.length === 0) throw new Error("--query is required");
+  if (output === undefined) throw new Error("--output is required");
+  if (limit === undefined || !Number.isFinite(limit) || limit < 1 || limit > 100) {
+    throw new Error("--limit is required and must be 1..100 (the contract's maximum)");
+  }
+  return { tenant, query, limit, output, databaseUrl, migrationUrl, purpose, principal, subjects, force };
+}
+
+/** Run `explain`. Returns the process exit code. */
+async function runExplainCommand(argv: readonly string[]): Promise<number> {
+  const log = (message: string): void => {
+    process.stdout.write(`${message}\n`);
+  };
+  let args: ExplainArgs;
+  try {
+    args = parseExplainArgs(argv);
+  } catch (error) {
+    process.stderr.write(`${(error as Error).message}\n\n${EXPLAIN_USAGE}`);
+    return 1;
+  }
+
+  try {
+    const { artifact, output } = await capturePlans({ ...args, log });
+    const parsed = artifact as {
+      stages: readonly { stage: string; success: boolean; structural_plan_digest: string | null }[];
+    };
+    const failed = parsed.stages.filter((stage) => !stage.success);
+    const missing = (artifact as { capture: { missing_stages: readonly string[] } }).capture.missing_stages;
+    log("");
+    log(`artifact    ${output}`);
+    for (const stage of parsed.stages) {
+      const digest = stage.structural_plan_digest;
+      log(`  ${stage.success ? "ok  " : "FAIL"} ${stage.stage.padEnd(20)} ${digest?.slice(0, 16) ?? "-"}`);
+    }
+    if (missing.length > 0) log(`missing     ${missing.join(", ")}`);
+    if (failed.length > 0) {
+      log(`\n${failed.length} stage(s) could not be captured. See the artifact's raw entries.`);
+      return 1;
+    }
+    return 0;
+  } catch (error) {
+    if (error instanceof PlanCaptureRefusal) {
+      // A refusal is an answer about the environment, so it is printed as one line and
+      // without a stack trace. Exit 1 distinguishes it from "could not run at all".
+      process.stderr.write(`refused: ${error.message}\n`);
+      return 1;
+    }
+    throw error;
+  }
+}
+
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
+  // `explain` is dispatched before the benchmark parser, on the raw argv.
+  //
+  // It takes different arguments (`--query`, `--output`, `--force`) and different
+  // defaults — a benchmark run defaults its tenant, a plan capture must be told which one —
+  // and it is a different kind of command: a diagnostic that refuses to run on an
+  // unsuitable database, not a measurement that reports whatever it found. Folding it into
+  // `parseArgs` would have meant its required arguments were optional to the benchmark and
+  // the benchmark's were optional to it.
+  if (argv.includes("explain")) return runExplainCommand(argv.filter((arg) => arg !== "explain"));
+
   const options = parseArgs(argv);
   const env = loadEnv();
   const log = (message: string): void => {

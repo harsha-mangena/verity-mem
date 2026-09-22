@@ -56,6 +56,7 @@ import {
 import type { EmbeddingBackend } from "./embeddings.ts";
 import { extractEntityTerms } from "./channels.ts";
 import { planQuery, type QueryPlan } from "./planner.ts";
+import { stage, type QueryObserver } from "./query-observer.ts";
 
 export interface RetrievalDependencies {
   readonly db: Db;
@@ -75,6 +76,29 @@ export interface ComposeOptions {
    * it is recorded on the trace when it happens.
    */
   readonly rerank?: (candidates: readonly FusedCandidate[], plan: QueryPlan) => Promise<readonly FusedCandidate[]>;
+  /**
+   * An optional read-path observer, used by the plan-capture profiler.
+   *
+   * This is the entirety of `compose`'s knowledge of plan capture: when present, the
+   * executors it builds are wrapped so the profiler sees each statement and its plan.
+   * The observer cannot change what `compose` returns — it is handed rows that have
+   * already been fetched — and every stage below is tagged so the profiler does not have
+   * to guess which query is which from its text. See `query-observer.ts`.
+   *
+   * Absent on every production path, which is why the wrapper is applied conditionally
+   * rather than always: an observation seam that costs a wrapper per query on every read
+   * would be a tax on the thing it measures.
+   */
+  readonly observer?: QueryObserver;
+  /**
+   * Builds the observing executor from a raw one. Supplied alongside `observer`, because
+   * `packages/retrieval` has no database driver of its own and must not acquire one just
+   * to explain a query.
+   */
+  readonly makeExplainingExecutor?: (
+    executor: QueryExecutor,
+    observer: QueryObserver,
+  ) => QueryExecutor;
 }
 
 export interface ComposeResult {
@@ -108,6 +132,19 @@ export async function compose(
   const started = performance.now();
   const now = dependencies.clock.now().toISOString();
   const query: QueryRequest = request;
+  const observer = options.observer;
+  /**
+   * Wrap an executor for observation, or return it unchanged when nobody is watching.
+   *
+   * Conditional rather than unconditional so an ordinary read pays nothing for the
+   * existence of the profiler: no wrapper object, no per-query branch, no allocation.
+   * `makeExplainingExecutor` is supplied by the caller because only it knows how to
+   * reach PostgreSQL for `EXPLAIN`; this module just applies it.
+   */
+  const observe = (executor: QueryExecutor): QueryExecutor =>
+    observer === undefined || options.makeExplainingExecutor === undefined
+      ? executor
+      : options.makeExplainingExecutor(executor, observer);
 
   // ---- 1. Plan -----------------------------------------------------------
   const entityTerms = extractEntityTerms(query.query);
@@ -160,12 +197,10 @@ export async function compose(
   };
 
   const channelsStarted = performance.now();
-  const channels = await runChannels(
-    dependencies,
-    planned,
-    channelQuery,
-    options.principal,
-  );
+  const channels = await runChannels(dependencies, planned, channelQuery, options.principal, {
+    observe,
+    observer,
+  });
   const channelWallMs = round(performance.now() - channelsStarted);
   const candidateCount = new Set(
     channels.flatMap((result) => result.hits.map((hit) => hit.claim_id)),
@@ -192,13 +227,16 @@ export async function compose(
       purposes: [query.purpose],
       action: "query:compose",
     },
-    async (executor) => {
+    async (rawExecutor) => {
+      const executor = observe(rawExecutor);
       const hydrationStarted = performance.now();
-      const packetClaims = await hydrate(dependencies, executor, planned, fused, query, now);
+      const packetClaims = await hydrate(dependencies, executor, planned, fused, query, now, observer);
       // This is projection progress, not ledger progress. Reading max(events.seq)
       // made a stale projection look current and paid for a separate privileged
       // transaction on every query.
-      const watermark = await readProjectionWatermark(executor, request.tenant_id);
+      const watermark = await stage(observer, "projection_watermark", () =>
+        readProjectionWatermark(executor, request.tenant_id),
+      );
       const hydrationMs = round(performance.now() - hydrationStarted);
       const returned = packetClaims.slice(0, planned.limit);
       const decision = combineDecisions(returned.map((claim) => claim.use));
@@ -249,12 +287,20 @@ export async function compose(
   return { packet, plan: planned, channels, fused, candidates_denied_by_authz: deniedCount };
 }
 
+/** What `runChannels` needs in order to report the stages it runs. */
+interface ChannelObservation {
+  readonly observe: (executor: QueryExecutor) => QueryExecutor;
+  readonly observer: QueryObserver | undefined;
+}
+
 async function runChannels(
   dependencies: RetrievalDependencies,
   plan: QueryPlan,
   query: ChannelQuery,
   principal: string,
+  observation: ChannelObservation,
 ): Promise<ChannelResult[]> {
+  const { observe, observer } = observation;
   const binding = {
     tenant: query.tenant_id,
     principal,
@@ -280,12 +326,24 @@ async function runChannels(
 
   const ordinaryLane = dependencies.db.withRequest(
     binding,
-    async (executor) => {
+    async (rawExecutor) => {
+      const executor = observe(rawExecutor);
       const results: ChannelResult[] = [];
-      if (plan.channels.includes("lexical")) results.push(await lexicalChannel(executor, query));
-      if (plan.channels.includes("entity")) results.push(await entityChannel(executor, query));
-      if (plan.channels.includes("temporal")) results.push(await temporalChannel(executor, query));
-      if (plan.channels.includes("relation")) results.push(await relationChannel(executor, query));
+      // Each channel is tagged immediately before it runs, so the profiler pairs a
+      // statement with its stage by position and never by parsing the SQL. A channel
+      // that is not planned is not tagged, and its statement is therefore not captured.
+      if (plan.channels.includes("lexical")) {
+        results.push(await stage(observer, "lexical_channel", () => lexicalChannel(executor, query)));
+      }
+      if (plan.channels.includes("entity")) {
+        results.push(await stage(observer, "entity_channel", () => entityChannel(executor, query)));
+      }
+      if (plan.channels.includes("temporal")) {
+        results.push(await stage(observer, "temporal_channel", () => temporalChannel(executor, query)));
+      }
+      if (plan.channels.includes("relation")) {
+        results.push(await stage(observer, "relation_channel", () => relationChannel(executor, query)));
+      }
       return results;
     },
     { readOnly: true },
@@ -305,7 +363,21 @@ async function runChannels(
     }
     const result = await dependencies.db.withRequest(
       binding,
-      async (executor) => denseChannel(executor, query, dependencies.embeddings, vector),
+      // `denseChannel` issues two statements — the projection model-version lookup and
+      // the vector search — and the profiler has to report them separately, because they
+      // are different kinds of query against different tables: the first is a
+      // `projection_versions` read that must not be confused with the second's index
+      // choice. Tagging the channel as a whole would merge them into one stage, so the
+      // two tags are declared here in the order the channel issues them. This is the one
+      // place where a stage label is not attached to the call that makes the statement,
+      // and it is deliberate: `denseChannel` cannot tag its own internals without
+      // depending on the profiler.
+      async (rawExecutor) => {
+        const executor = observe(rawExecutor);
+        observer?.aboutToRun("dense_model_version");
+        observer?.aboutToRun("dense_vector_search");
+        return denseChannel(executor, query, dependencies.embeddings, vector);
+      },
       { readOnly: true },
     );
     return {
@@ -346,19 +418,22 @@ async function hydrate(
   fused: readonly FusedCandidate[],
   query: QueryRequest,
   now: string,
+  observer: QueryObserver | undefined,
 ): Promise<PacketClaim[]> {
   if (fused.length === 0) return [];
 
-  const claimMap = await readClaims(
-    executor,
-    fused.map((candidate) => toPublicId("clm", candidate.claim_id)),
+  // Each hydration sub-query is tagged where it is issued. An earlier version tagged the
+  // whole of `hydrate` with one name, which meant only its first statement was labelled and
+  // the evidence, event and watermark reads arrived as `unlabeled` — the artifact could not
+  // say what they were.
+  const ids = fused.map((candidate) => toPublicId("clm", candidate.claim_id));
+  const claimMap = await stage(observer, "claim_hydration", () => readClaims(executor, ids));
+  const relations = await stage(observer, "claim_relations_read", () =>
+    readRelations(executor, ids),
   );
-  const relations = await readRelations(
-    executor,
-    fused.map((candidate) => toPublicId("clm", candidate.claim_id)),
+  const evidenceByClaim = await stage(observer, "claim_evidence_read", () =>
+    readEvidence(dependencies.ledger, executor, [...claimMap.values()]),
   );
-
-  const evidenceByClaim = await readEvidence(dependencies.ledger, executor, [...claimMap.values()]);
   const out: PacketClaim[] = [];
 
   for (const candidate of fused) {
