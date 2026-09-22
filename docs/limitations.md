@@ -89,14 +89,35 @@ work on a held-out corpus, not a code change, and it is not done.
   practical consequence is that at reference scale a free-text query is bounded by the
   policy evaluation rather than by the search.
 
-  The shape of the fix is to evaluate the caller's reachable scope set once per statement
-  instead of once per row — a session variable written at request start and read by the
-  policy, in place of `scope_reachable` calling `current_scope_ids()` inside a PL/pgSQL
-  body where it cannot be hoisted as an initplan. That is a change to
-  `veritymem.row_authorized` and to the migration that defines it, so it is deliberately
-  **not** attempted here: an authorization predicate is the wrong place for a change made
-  at the end of a session, and `docs/isolation-assessment.md`'s external review should see
-  it. It is the single highest-value performance change identified in this repository.
+  **Rewriting `scope_reachable` in SQL was tried and does not work.** The reasoning was
+  that PL/pgSQL hides `caller_scopes()` from the planner, which therefore cannot hoist it
+  as an initplan. Migration `0014` rewrote the function clause-for-clause in SQL,
+  preserving the semantics, and it was measured rather than assumed:
+
+  | configuration | app-role query, same corpus |
+  | --- | --- |
+  | PL/pgSQL `scope_reachable` | cancelled at the 120 s timeout |
+  | SQL `scope_reachable` | cancelled at the 120 s timeout; a longer run took **231,335 ms** |
+
+  It passed the isolation gate (22/22, `isolation.test.ts`,
+  `isolation-corpus.test.ts`, `rest-isolation.test.ts`) and is **semantically equivalent**
+  — but it is not faster, and it *loses* the PL/pgSQL version's early exit on the purpose
+  check, which returns before touching `caller_scopes()` when the row's scope declares a
+  purpose the caller did not. It was therefore reverted in the same session rather than
+  merged: a change to an authorization predicate must buy something, and this one bought
+  nothing. The predicate was never the cost — 20,000 direct calls take 1.5 ms.
+  **The remaining cost is planner path selection, and this attempted fix did not address it.**
+
+  What the plan shows, and what a real fix needs: with the policy active the planner
+  drives from `claims_scope_idx` and evaluates `veritymem.scope_reachable` as part of the
+  per-row filter, so `claims_tsv_gin` — the index that answers the text search in 8 ms as
+  the owner — is never the driving path. Since the predicate is cheap per call, the
+  problem is that it is *reached* for far more rows than the search selects. Making that
+  better requires either a form the planner can push below the scan, or evaluating the
+  caller's reachable set once per statement and having the policy read it, which means
+  changing how the request context is bound rather than how the predicate is written.
+  Both are design changes to the authorization path, and `docs/isolation-assessment.md`'s
+  external review should see either before it lands.
 - **At one million claims the read path does not complete inside its own statement
   timeout.** A complete corpus now exists
   (`perf-ref-1190477-<suffix>`, 1,190,477 claims, events, spans, evidence rows and
