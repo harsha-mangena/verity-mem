@@ -133,9 +133,10 @@ pnpm eval:perf migration-rehearsal --profile local --output reports/vm-a2-local.
 ### 3.3 An explicit disposable database
 
 ```bash
-# Created if absent; recreated if it already carries this command's marker.
+# Created if absent. Reusing an existing VM-A2 target requires an explicit --recreate.
 pnpm eval:perf migration-rehearsal \
   --rehearsal-url 'postgres://verity:verity@127.0.0.1:55432/veritymem_rehearsal_scratch' \
+  --recreate \
   --claims 5000 \
   --duration 60 \
   --output reports/vm-a2-scratch.json
@@ -159,6 +160,7 @@ contain `rehearsal` is refused before connecting.
 | `--output <path>` | required | report path; parent directories are created |
 | `--rehearsal-url <url>` | — | an explicit disposable database |
 | `--database <name>` | generated | name for a newly created database |
+| `--recreate` | false | explicitly drop and recreate an existing target with a valid VM-A2 marker |
 | `--migrations <dir>` | `<repo>/migrations` | migrations directory |
 | `--sample-interval <ms>` | 200 | how often `pg_stat_activity` and `pg_locks` are sampled |
 | `--blocked-threshold <ms>` | 1000 | a blocked statement longer than this is counted |
@@ -171,12 +173,14 @@ refused; **2** the command could not run at all.
 
 ### 3.5 Safety rules, restated as a checklist
 
-1. **Never** pass `--rehearsal-url` a database you care about. The validator will refuse the
-   obvious cases, but the rule is yours to keep.
-2. Omit `--rehearsal-url` unless you specifically want to reuse a database. The default
+1. **Never** pass `--rehearsal-url` a database you care about. It must point to the same
+   PostgreSQL host and port as the configured migration connection; cross-server targets are
+   refused before inspection.
+2. Omit explicit target options unless you specifically need a named database. The default
    creates a fresh one and drops nothing.
-3. If you pass `--rehearsal-url` for a database that already exists, it will be **dropped and
-   recreated** when it carries the marker. That is what "disposable" means here.
+3. An existing target is never dropped implicitly. `--recreate` is required, and it works only
+   when the target has one exact VM-A2 ownership record with the expected schema, sentinel and
+   marker version. A table merely named `vm_a2_rehearsal` is refused.
 4. Do not point the rehearsal at a PostgreSQL instance you do not own. It terminates one of
    its own backends and reads cluster-wide WAL figures.
 5. The rehearsal leaves its database correct but no longer pristine: a handful of probe claims
@@ -232,7 +236,7 @@ re-parse the body. The server log for the run shows it exactly:
 
 ```
 ERROR:  syntax error at or near "SELECT" at character 4
-QUERY:  
+QUERY:
       SELECT COALESCE(
         p_scope IS NOT NULL
         AND COALESCE(array_length(p_purposes, 1), 0) > 0

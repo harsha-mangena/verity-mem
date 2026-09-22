@@ -12,7 +12,7 @@
  * one interval — visible in the reported sample count, not hidden.
  */
 import pg from "pg";
-import { runMigrations, type MigrationResult } from "@veritymem/ledger";
+import { MigrationPostCommitHookError, runMigrations, type MigrationResult } from "@veritymem/ledger";
 import { readProjectionCounts } from "./rehearsal-verify.ts";
 import {
   MigrationSampler,
@@ -56,6 +56,8 @@ export interface InstrumentedRun {
   readonly result: MigrationResult | null;
   readonly error: Error | null;
   readonly error_code: string | null;
+  /** The migration committed but telemetry could not finish. This is never a rollback. */
+  readonly post_commit_observation_error: Error | null;
   readonly telemetry: readonly MigrationTelemetry[];
   readonly history: readonly MigrationHistoryRow[];
   readonly elapsed_ms: number;
@@ -174,10 +176,15 @@ export async function runInstrumentedMigrations(
 
   const history = await readHistory(options.telemetryClient);
   if (!result.ok) {
+    const failure = result.error;
+    const postCommit = failure instanceof MigrationPostCommitHookError;
     return {
-      result: null,
-      error: result.error,
+      result: postCommit
+        ? { applied: [failure.context.name], skipped: [], verified: [] }
+        : null,
+      error: postCommit ? null : failure,
       error_code: failureCode,
+      post_commit_observation_error: postCommit ? failure : null,
       telemetry,
       history,
       elapsed_ms: Date.now() - started,
@@ -187,6 +194,7 @@ export async function runInstrumentedMigrations(
     result: result.value,
     error: null,
     error_code: null,
+    post_commit_observation_error: null,
     telemetry,
     history,
     elapsed_ms: Date.now() - started,

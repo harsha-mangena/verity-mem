@@ -95,6 +95,22 @@ describe("rehearsal command arguments", () => {
     );
   });
 
+  it("requires an explicit target before allowing recreation", () => {
+    assert.throws(
+      () => parseRehearsalArguments(["--recreate", "--output", "/tmp/x.json"]),
+      /--recreate requires --rehearsal-url or --database/,
+    );
+    const args = parseRehearsalArguments([
+      "--database",
+      "veritymem_rehearsal_explicit",
+      "--recreate",
+      "--output",
+      "/tmp/x.json",
+    ]);
+    assert.ok(args);
+    assert.equal(args.recreate, true);
+  });
+
   it("refuses an anchor that is not a timestamp", () => {
     assert.throws(
       () => parseRehearsalArguments(["--output", "/tmp/x.json", "--anchor", "yesterday"]),
@@ -466,6 +482,7 @@ describe("live rehearsal", () => {
       output: `/tmp/veritymem-vm-a2-test-${process.pid}-${Date.now()}.json`,
       rehearsal_url: null,
       database_name: null,
+      recreate: false,
       migrations_dir: loadEnv().migrationsDir,
       sample_interval_ms: 50,
       blocked_threshold_ms: 200,
@@ -655,16 +672,16 @@ describe("live rehearsal", () => {
 /**
  * The destructive path, live.
  *
- * A rehearsal database that already carries the marker is **dropped and recreated**, so the
- * marker check is the only thing standing between a mistyped URL and somebody's data. That
- * check is unit-tested; this exercises it against a real server, where "does it carry the
- * marker" is answered by `pg_class` rather than by a fixture.
+ * An existing rehearsal database is never dropped unless the caller supplied `--recreate`.
+ * The live checks exercise the ownership marker against PostgreSQL itself, where a lookalike
+ * table must not become permission to delete somebody else's database.
  */
 describe("explicit rehearsal databases, live", () => {
   const adminUrl = (): string => loadEnv().migrationDatabaseUrl ?? loadEnv().databaseUrl;
   const stamp = `${process.pid}_${Date.now().toString(36)}`;
   const marked = `veritymem_rehearsal_livetest_${stamp}`;
   const foreign = `veritymem_rehearsal_foreign_${stamp}`;
+  const lookalike = `veritymem_rehearsal_lookalike_${stamp}`;
   const protectedNames = (): string[] =>
     [loadEnv().databaseUrl, loadEnv().migrationDatabaseUrl]
       .filter((value): value is string => typeof value === "string" && value.length > 0)
@@ -696,11 +713,13 @@ describe("explicit rehearsal databases, live", () => {
   before(async () => {
     await drop(marked);
     await drop(foreign);
+    await drop(lookalike);
   });
 
   after(async () => {
     await drop(marked);
     await drop(foreign);
+    await drop(lookalike);
   });
 
   it("creates a named database, marks it, and recognises it on the next run", async () => {
@@ -708,6 +727,7 @@ describe("explicit rehearsal databases, live", () => {
       adminUrl: adminUrl(),
       rehearsalUrl: urlFor(marked),
       databaseName: null,
+      recreate: false,
       protectedNames: protectedNames(),
       runId: "livetest",
       log: () => undefined,
@@ -723,19 +743,29 @@ describe("explicit rehearsal databases, live", () => {
       log: () => undefined,
     });
 
-    const second = await planTarget({
+    await assert.rejects(
+      () =>
+        planTarget({
+          adminUrl: adminUrl(),
+          rehearsalUrl: urlFor(marked),
+          databaseName: null,
+          recreate: false,
+          protectedNames: protectedNames(),
+          runId: "livetest",
+          log: () => undefined,
+        }),
+      /without --recreate/,
+    );
+    const recreated = await planTarget({
       adminUrl: adminUrl(),
       rehearsalUrl: urlFor(marked),
       databaseName: null,
+      recreate: true,
       protectedNames: protectedNames(),
       runId: "livetest",
       log: () => undefined,
     });
-    assert.equal(
-      second.mode,
-      "recreated",
-      "a database carrying the rehearsal marker must be recognised as disposable",
-    );
+    assert.equal(recreated.mode, "recreated");
   });
 
   it("refuses a database that holds tables but carries no marker", async () => {
@@ -758,11 +788,54 @@ describe("explicit rehearsal databases, live", () => {
           adminUrl: adminUrl(),
           rehearsalUrl: urlFor(foreign),
           databaseName: null,
+          recreate: false,
           protectedNames: protectedNames(),
           runId: "livetest",
           log: () => undefined,
         }),
       /no vm_a2_rehearsal marker but holds 1 relation\(s\) in public \(somebody_elses_data\)/,
+    );
+    await assert.rejects(
+      () =>
+        planTarget({
+          adminUrl: adminUrl(),
+          rehearsalUrl: null,
+          databaseName: foreign,
+          recreate: false,
+          protectedNames: protectedNames(),
+          runId: "livetest",
+          log: () => undefined,
+        }),
+      /no vm_a2_rehearsal marker but holds 1 relation\(s\) in public \(somebody_elses_data\)/,
+      "--database must inspect an existing database just as --rehearsal-url does",
+    );
+  });
+
+  it("refuses a marker-shaped table with no VM-A2 ownership record", async () => {
+    const client = await connect();
+    try {
+      await client.query(`CREATE DATABASE ${lookalike}`);
+    } finally {
+      await client.end();
+    }
+    const inside = await connect(lookalike);
+    try {
+      await inside.query("CREATE TABLE vm_a2_rehearsal (label text not null)");
+    } finally {
+      await inside.end();
+    }
+    await assert.rejects(
+      () =>
+        planTarget({
+          adminUrl: adminUrl(),
+          rehearsalUrl: urlFor(lookalike),
+          databaseName: null,
+          recreate: true,
+          protectedNames: protectedNames(),
+          runId: "livetest",
+          log: () => undefined,
+        }),
+      /not a valid VM-A2 ownership marker/,
     );
   });
 });

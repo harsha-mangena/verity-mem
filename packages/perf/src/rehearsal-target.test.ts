@@ -9,6 +9,7 @@ import { describe, it } from "node:test";
 import {
   REHEARSAL_DATABASE_PREFIX,
   SYSTEM_DATABASES,
+  assertSameCluster,
   assertSelectableTarget,
   databaseNameFromUrl,
   rehearsalDatabaseName,
@@ -181,7 +182,8 @@ describe("deciding whether an existing database may be reused", () => {
   const inspection = (overrides: Partial<TargetInspection>): TargetInspection => ({
     exists: true,
     foreign_relations: [],
-    has_marker: false,
+    marker_state: "absent",
+    marker_detail: null,
     marker_label: null,
     marker_created_at: null,
     ...overrides,
@@ -202,9 +204,16 @@ describe("deciding whether an existing database may be reused", () => {
   it("allows a database carrying this command's marker", () => {
     assert.doesNotThrow(() =>
       assertSelectableTarget(
-        inspection({ has_marker: true, foreign_relations: ["claims", "events"] }),
+        inspection({ marker_state: "valid", foreign_relations: ["claims", "events"] }),
         "veritymem_rehearsal_marked",
       ),
+    );
+  });
+
+  it("refuses a lookalike marker rather than treating its table name as ownership", () => {
+    assert.throws(
+      () => assertSelectableTarget(inspection({ marker_state: "invalid", marker_detail: "wrong sentinel" }), "veritymem_rehearsal_x"),
+      /not a valid VM-A2 ownership marker/,
     );
   });
 
@@ -224,6 +233,28 @@ describe("deciding whether an existing database may be reused", () => {
     assert.throws(
       () => assertSelectableTarget(inspection({ foreign_relations: many }), "veritymem_rehearsal_x"),
       /table_0, table_1, table_2, table_3, table_4, table_5, table_6, table_7, …/,
+    );
+  });
+});
+
+describe("administrative and target server identity", () => {
+  it("accepts postgres and postgresql aliases on the same host and port", () => {
+    assert.doesNotThrow(() =>
+      assertSameCluster(
+        "postgres://owner:pw@127.0.0.1:55432/postgres",
+        "postgresql://owner:pw@127.0.0.1:55432/veritymem_rehearsal_x",
+      ),
+    );
+  });
+
+  it("refuses a target on a different server before it can be inspected", () => {
+    assert.throws(
+      () =>
+        assertSameCluster(
+          "postgres://owner:pw@127.0.0.1:55432/postgres",
+          "postgres://owner:pw@127.0.0.1:55433/veritymem_rehearsal_x",
+        ),
+      /differs from the configured administrative server/,
     );
   });
 });

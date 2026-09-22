@@ -47,13 +47,34 @@ export interface MigrationRunContext {
  * be a migration runner. They exist so a rehearsal can sample the server while a
  * migration is in flight.
  *
- * A hook that throws aborts the migration, which is the correct behaviour for an
- * observer that has lost its connection to the thing it is measuring.
+ * A `beforeApply` hook that throws aborts the migration. `afterApply` runs after COMMIT;
+ * its failure is reported as `MigrationPostCommitHookError`, never as a rollback.
  */
 export interface MigrationHooks {
   readonly beforeApply?: (context: MigrationRunContext) => void | Promise<void>;
   readonly afterApply?: (context: MigrationRunContext) => void | Promise<void>;
   readonly onFailure?: (context: MigrationRunContext, error: unknown) => void | Promise<void>;
+}
+
+/**
+ * An observer failed only after PostgreSQL committed the migration.
+ *
+ * This must not be reported as a rollback: callers need to know that schema history is
+ * durable but their telemetry is incomplete. `onFailure` is intentionally not called.
+ */
+export class MigrationPostCommitHookError extends Error {
+  readonly context: MigrationRunContext;
+  override readonly cause: unknown;
+
+  constructor(context: MigrationRunContext, cause: unknown) {
+    super(
+      `migration ${context.name} committed, but afterApply failed: ` +
+        `${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+    this.name = "MigrationPostCommitHookError";
+    this.context = context;
+    this.cause = cause;
+  }
 }
 
 export interface RunMigrationsOptions {
@@ -213,8 +234,6 @@ export async function runMigrations(options: RunMigrationsOptions): Promise<Migr
           [file.name, file.checksum],
         );
         await client.query("COMMIT");
-        applied.push(file.name);
-        await options.hooks?.afterApply?.(context);
       } catch (error) {
         try {
           await client.query("ROLLBACK");
@@ -230,6 +249,14 @@ export async function runMigrations(options: RunMigrationsOptions): Promise<Migr
         throw new Error(
           `migration ${file.name} failed: ${reported instanceof Error ? reported.message : String(reported)}`,
         );
+      }
+      applied.push(file.name);
+      try {
+        await options.hooks?.afterApply?.(context);
+      } catch (error) {
+        // COMMIT already succeeded. Never enter the rollback/onFailure path above, which
+        // would make a committed schema look absent in a recovery report.
+        throw new MigrationPostCommitHookError(context, error);
       }
     }
     return { applied, skipped, verified };

@@ -633,10 +633,13 @@ Where the rehearsal runs
                             "rehearsal" and must differ from the database named by
                             DATABASE_URL and MIGRATION_DATABASE_URL, or the command refuses
                             before connecting. An existing database carrying this command's
-                            marker is recreated; one holding unknown tables is refused.
+                            marker is recreated only with --recreate; one holding unknown
+                            tables is refused.
                             Omit it to have a uniquely named database created instead.
   --database <name>         name for the created database (default
                             veritymem_rehearsal_<timestamp>_<suffix>)
+  --recreate                explicitly drop and recreate an existing database only when it
+                            has a valid VM-A2 ownership marker; never implicit
   --migrations <dir>        migrations directory (default <repo>/migrations)
 
 Telemetry
@@ -667,6 +670,7 @@ function parseRehearsalArgs(argv: readonly string[]): RehearsalArgs | null {
   let output: string | null = null;
   let rehearsalUrl: string | null = null;
   let databaseName: string | null = null;
+  let recreate = false;
   let migrationsDir: string | null = null;
   let seed = "veritymem-perf-v1";
   let anchor = DEFAULT_ANCHOR;
@@ -720,6 +724,7 @@ function parseRehearsalArgs(argv: readonly string[]): RehearsalArgs | null {
       case "--output": output = next(); break;
       case "--rehearsal-url": rehearsalUrl = next(); break;
       case "--database": databaseName = next(); break;
+      case "--recreate": recreate = true; break;
       case "--migrations": migrationsDir = resolve(next()); break;
       case "--seed": seed = next(); break;
       case "--anchor": anchor = next(); break;
@@ -745,6 +750,9 @@ function parseRehearsalArgs(argv: readonly string[]): RehearsalArgs | null {
     throw new Error(`--anchor must be an ISO timestamp; got ${JSON.stringify(anchor)}`);
   }
   if (output === null) throw new Error("--output is required");
+  if (recreate && rehearsalUrl === null && databaseName === null) {
+    throw new Error("--recreate requires --rehearsal-url or --database; generated targets are never dropped");
+  }
 
   return {
     profile,
@@ -763,6 +771,7 @@ function parseRehearsalArgs(argv: readonly string[]): RehearsalArgs | null {
     output,
     rehearsal_url: rehearsalUrl,
     database_name: databaseName,
+    recreate,
     migrations_dir: migrationsDir ?? env.migrationsDir,
     sample_interval_ms: value(sampleInterval, 200, "--sample-interval", 20),
     blocked_threshold_ms: value(blockedThreshold, 1_000, "--blocked-threshold", 1),

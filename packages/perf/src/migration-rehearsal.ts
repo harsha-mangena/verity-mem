@@ -32,10 +32,10 @@
  *
  * ## The safety rule that overrides everything
  *
- * The developer's ordinary database is never touched. The target is validated by name against
- * the configured `DATABASE_URL` and `MIGRATION_DATABASE_URL` before a single connection is
- * opened; see `rehearsal-target.ts`. There is no flag that turns that check off, and the
- * rehearsal never drops a database it did not create or one that does not carry its marker.
+ * The developer's ordinary database is never touched. The target is validated and inspected on
+ * the configured PostgreSQL server before a target connection is opened; see
+ * `rehearsal-target.ts`. An existing database is dropped only with explicit `--recreate` and an
+ * exact ownership marker, re-validated immediately before deletion.
  */
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -106,8 +106,11 @@ import {
   type RecoveryCase,
 } from "./rehearsal-recovery.ts";
 import {
+  assertSameCluster,
   assertSelectableTarget,
   inspectTarget,
+  REHEARSAL_MARKER_SENTINEL,
+  REHEARSAL_MARKER_VERSION,
   rehearsalDatabaseName,
   validateRehearsalTarget,
 } from "./rehearsal-target.ts";
@@ -181,6 +184,8 @@ export interface RehearsalOptions {
   /** An explicit disposable database URL, or null to create a uniquely named one. */
   readonly rehearsal_url: string | null;
   readonly database_name: string | null;
+  /** Required before an existing, validly marked target may be dropped and recreated. */
+  readonly recreate: boolean;
   readonly migrations_dir: string;
   readonly sample_interval_ms: number;
   readonly blocked_threshold_ms: number;
@@ -654,34 +659,43 @@ interface TargetPlan {
 /**
  * Decide the target, then prove it is disposable.
  *
- * When no URL is given, a uniquely named database is created and nothing is dropped. When a
- * URL is given, the name is validated first; a database that already carries this
- * rehearsal's marker is recreated, and one that holds relations without the marker is
- * refused outright rather than dropped.
+ * When no URL is given, a uniquely named database is created and nothing is dropped. Existing
+ * targets are inspected in every mode; only an explicit `--recreate` may drop one, and then
+ * only after its exact ownership marker has been re-validated immediately before deletion.
  */
 export async function planTarget(input: {
   readonly adminUrl: string;
   readonly rehearsalUrl: string | null;
   readonly databaseName: string | null;
+  readonly recreate: boolean;
   readonly protectedNames: readonly string[];
   readonly runId: string;
   readonly log: (message: string) => void;
 }): Promise<TargetPlan> {
   if (input.rehearsalUrl !== null) {
+    assertSameCluster(input.adminUrl, input.rehearsalUrl);
     const validated = validateRehearsalTarget({
       url: input.rehearsalUrl,
       protected_names: input.protectedNames,
     });
     const inspection = await inspectTarget(input.adminUrl, validated.database);
     assertSelectableTarget(inspection, validated.database);
-    const mode: TargetPlan["mode"] = !inspection.exists
-      ? "created"
-      : inspection.has_marker
-        ? "recreated"
-        : "selected";
+    if (inspection.marker_state === "valid" && !input.recreate) {
+      throw new Error(
+        `refusing to reuse marked rehearsal database ${validated.database} without --recreate. ` +
+          `An existing database is never dropped implicitly.`,
+      );
+    }
+    if (input.recreate && inspection.marker_state !== "valid") {
+      throw new Error(
+        `--recreate requires an existing database with a valid VM-A2 ownership marker; ` +
+          `${validated.database} is ${inspection.marker_state}.`,
+      );
+    }
+    const mode: TargetPlan["mode"] = !inspection.exists ? "created" : input.recreate ? "recreated" : "selected";
     input.log(
       `target ${validated.database}: exists=${String(inspection.exists)} ` +
-        `marker=${String(inspection.has_marker)} relations=${inspection.foreign_relations.length} -> ${mode}`,
+        `marker=${inspection.marker_state} relations=${inspection.foreign_relations.length} -> ${mode}`,
     );
     return {
       database: validated.database,
@@ -698,10 +712,30 @@ export async function planTarget(input: {
     url: candidate.toString(),
     protected_names: input.protectedNames,
   });
+  const inspection = await inspectTarget(input.adminUrl, validated.database);
+  assertSelectableTarget(inspection, validated.database);
+  if (input.databaseName === null && inspection.exists) {
+    throw new Error(
+      `refusing generated rehearsal database ${validated.database}: the name already exists. ` +
+        `Choose --database explicitly after inspecting it rather than reusing a collision.`,
+    );
+  }
+  if (inspection.marker_state === "valid" && !input.recreate) {
+    throw new Error(
+      `refusing to reuse marked rehearsal database ${validated.database} without --recreate. ` +
+        `An existing database is never dropped implicitly.`,
+    );
+  }
+  if (input.recreate && inspection.marker_state !== "valid") {
+    throw new Error(
+      `--recreate requires an existing database with a valid VM-A2 ownership marker; ` +
+        `${validated.database} is ${inspection.marker_state}.`,
+    );
+  }
   return {
     database: validated.database,
     migrationUrl: validated.url,
-    mode: "created",
+    mode: !inspection.exists ? "created" : input.recreate ? "recreated" : "selected",
     protections: validated.protections,
   };
 }
@@ -717,14 +751,34 @@ export async function prepareTarget(input: {
   const admin = new pg.Client({ connectionString: input.adminUrl });
   await admin.connect();
   try {
+    // Re-check immediately before a destructive action. A plan made seconds ago is not
+    // ownership proof if another process has since changed the database.
+    const inspection = await inspectTarget(input.adminUrl, input.database);
     const existing = await admin.query<{ present: boolean }>(
       "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1) AS present",
       [input.database],
     );
     const present = existing.rows[0]?.present === true;
     if (input.mode === "recreated" && present) {
+      if (inspection.marker_state !== "valid") {
+        throw new Error(
+          `refusing to drop ${input.database}: the target no longer has a valid VM-A2 ownership marker`,
+        );
+      }
       input.log(`dropping and recreating rehearsal database ${input.database}`);
       await admin.query(`DROP DATABASE ${input.database} WITH (FORCE)`);
+    }
+    if (input.mode === "selected") {
+      assertSelectableTarget(inspection, input.database);
+      if (inspection.marker_state !== "absent" || inspection.foreign_relations.length !== 0) {
+        throw new Error(`refusing to reuse ${input.database}: selected targets must still be empty immediately before use`);
+      }
+      if (!present) {
+        throw new Error(`refusing to reuse ${input.database}: selected target disappeared after inspection`);
+      }
+    }
+    if (input.mode === "created" && present) {
+      throw new Error(`refusing to create ${input.database}: it appeared after target inspection`);
     }
     if (input.mode === "recreated" || !present) {
       await admin.query(`CREATE DATABASE ${input.database}`);
@@ -761,8 +815,8 @@ export async function prepareTarget(input: {
       )
     `);
     await owner.query("INSERT INTO vm_a2_rehearsal (label, report_version) VALUES ($1, $2)", [
-      `created by eval:perf migration-rehearsal at ${new Date().toISOString()}`,
-      REHEARSAL_SCHEMA_VERSION,
+      REHEARSAL_MARKER_SENTINEL,
+      REHEARSAL_MARKER_VERSION,
     ]);
   } finally {
     await owner.end();
@@ -956,6 +1010,7 @@ export async function runRehearsal(options: RehearsalOptions): Promise<Rehearsal
     adminUrl,
     rehearsalUrl: options.rehearsal_url,
     databaseName: options.database_name,
+    recreate: options.recreate,
     protectedNames,
     runId,
     log,
