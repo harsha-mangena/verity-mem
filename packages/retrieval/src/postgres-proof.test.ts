@@ -66,7 +66,19 @@ interface ScopeIds {
   readonly alice: string;
   readonly bob: string;
   readonly foreignTenant: string;
+  readonly foreignTenantSlug: string;
   readonly foreignScope: string;
+  /**
+   * The claim in tenant B that carries the same alias as tenant A's claims.
+   *
+   * Stored explicitly rather than looked up later, because the case that matters is "each
+   * tenant sees its own row and not the other's". A negative-only assertion — tenant A does
+   * not see B's claim — passes just as well when *neither* tenant can see anything, so both
+   * directions are asserted and both ids have to be known.
+   */
+  readonly foreignClaim: string;
+  /** A claim carrying the same alias but closed by supersession, not revoked. */
+  readonly supersededClaim: string;
   readonly otherPurposeScope: string;
   /**
    * A scope that binds a user but no project.
@@ -143,6 +155,9 @@ async function seed(): Promise<void> {
     otherPurposeScope: randomUUID(),
     userOnly: randomUUID(),
     knownClaim: randomUUID(),
+    foreignTenantSlug: `${tenantSlug}-foreign`,
+    foreignClaim: randomUUID(),
+    supersededClaim: randomUUID(),
   };
 
   try {
@@ -195,6 +210,10 @@ async function seed(): Promise<void> {
       { scope: ids.alice, subject: "user:erin", object: "7", status: "accepted", tenantId: tenant },
       // A revoked claim in a reachable scope. Must be excluded by the temporal clause.
       { scope: ids.alice, subject: "user:frank", object: '"acme"', status: "revoked", tenantId: tenant },
+      // A superseded claim with the same alias: a different exclusion mechanism from
+      // `revoked` (the temporal clause closes it) and the one the entity channel meets most
+      // often in practice, since every corrected fact passes through it.
+      { scope: ids.alice, subject: "user:superseded", object: '"acme"', status: "superseded", tenantId: tenant },
       // A claim in a scope this tenant may not read at all.
       { scope: ids.bob, subject: "user:grace", object: '"acme"', status: "accepted", tenantId: tenant },
       // A claim admitted for a different purpose.
@@ -208,8 +227,23 @@ async function seed(): Promise<void> {
 
     let firstClaim = true;
     for (const row of rows) {
-      const claimId = firstClaim ? ids.knownClaim : randomUUID();
+      const claimId =
+        firstClaim
+          ? ids.knownClaim
+          : row.tenantId === foreignTenant
+            ? ids.foreignClaim
+            : row.status === "superseded"
+              ? ids.supersededClaim
+              : randomUUID();
       firstClaim = false;
+      // The exact positive set for the alias `acme`: accepted, in this tenant, in a scope
+      // tenant A reaches, and matching the alias through either the subject or the unquoted
+      // object. The scope filter excludes `ids.bob` (a sibling user scope) and the
+      // other-purpose scope; the status excludes revoked and superseded; the alias match
+      // excludes `useronlyrow`, whose object is a different scalar.
+      //
+      // Derived from the same expressions the projection uses, so the set is a statement
+      // about the corpus rather than a hand-list that drifts when a row is added.
       // `valid_to` is set to a strictly later instant for a revoked claim, never to
       // `now()` in the same statement: `valid_range` is generated from the pair, and a
       // closed interval whose bounds are equal is refused by `claims_check` rather than
@@ -369,16 +403,32 @@ function entityQuery(reach: string, variant: "legacy" | "current"): string {
      LIMIT 12`;
 }
 
+/**
+ * A request binding, named explicitly.
+ *
+ * `tenant` is a parameter rather than an implicit `ids.tenant`. The two-tenant alias case
+ * has to run the *same* query against tenant A and tenant B and compare, and a helper that
+ * closes over one tenant cannot express that — which is exactly why the first version of
+ * that case could only assert what tenant A did not see.
+ */
+interface EntityBinding {
+  readonly tenant: string;
+  readonly principal: string;
+  readonly scopes: readonly string[];
+  readonly purposes: readonly string[];
+  readonly terms: readonly string[];
+}
+
 /** Run one query variant as the application role, inside a bound request context. */
 async function runEntityQuery(
   client: pg.Client,
-  binding: { scopes: readonly string[]; purposes: readonly string[]; terms: readonly string[] },
+  binding: EntityBinding,
   reach: (heldScopes: readonly string[]) => string,
   variant: "legacy" | "current",
 ): Promise<string[]> {
   await bind(client, {
-    tenant: ids.tenant,
-    principal: "user:probe",
+    tenant: binding.tenant,
+    principal: binding.principal,
     scopes: binding.scopes,
     purposes: binding.purposes,
   });
@@ -388,7 +438,7 @@ async function runEntityQuery(
     // and a placeholder that nothing references is exactly what produced
     // `could not determine data type of parameter $2` while this was being written.
     const result = await client.query<{ claim_id: string }>(entityQuery(reach(binding.scopes), variant), [
-      ids.tenant,
+      binding.tenant,
       [...binding.terms],
       [...binding.purposes],
     ]);
@@ -398,14 +448,16 @@ async function runEntityQuery(
   }
 }
 
-/** The channel's own answer, through the real code path. */
-async function runEntityChannel(
-  client: pg.Client,
-  binding: { scopes: readonly string[]; purposes: readonly string[]; terms: readonly string[] },
-): Promise<string[]> {
+/**
+ * The channel's own answer, through the real code path.
+ *
+ * Tenant and principal come from the binding, so the same helper can be pointed at either
+ * tenant. Nothing about the tenant is hardcoded here.
+ */
+async function runEntityChannel(client: pg.Client, binding: EntityBinding): Promise<string[]> {
   await bind(client, {
-    tenant: ids.tenant,
-    principal: "user:probe",
+    tenant: binding.tenant,
+    principal: binding.principal,
     scopes: binding.scopes,
     purposes: binding.purposes,
   });
@@ -417,7 +469,7 @@ async function runEntityChannel(
       },
     };
     const query: ChannelQuery = {
-      tenant_id: ids.tenant,
+      tenant_id: binding.tenant,
       text: binding.terms.join(" "),
       authorized_scopes: [],
       purposes: binding.purposes,
@@ -433,6 +485,23 @@ async function runEntityChannel(
   } finally {
     await unbind(client);
   }
+}
+
+/**
+ * The tenant-A binding used by most entity cases.
+ *
+ * Holds the project scope *and* the project-unbound user scope, because those are the two
+ * on which the old two-sided reach rule and the directional rule agree — so a difference in
+ * the result is a difference in the entity query rather than in reach.
+ */
+function bindingInA(terms: readonly string[]): EntityBinding {
+  return {
+    tenant: ids.tenant,
+    principal: "user:probe",
+    scopes: [ids.project, ids.userOnly],
+    purposes: PURPOSE,
+    terms: [...terms],
+  };
 }
 
 /** The closure the database computed for a binding, straight out of the GUC. */
@@ -810,16 +879,16 @@ describe("VM-A1 · claim entity projection (0015)", () => {
     // and the directional rule agree, so a difference in the result is a difference in the
     // entity query rather than in reach. Where the rules disagree is asserted separately,
     // in the reach suite and in "returns nothing for a project-unbound row".
-    const bindings = [
-      { label: "project and user-only scope", scopes: [ids.project, ids.userOnly], purposes: PURPOSE, terms: ["acme"] },
-      { label: "subject alias", scopes: [ids.project, ids.userOnly], purposes: PURPOSE, terms: ["user:alice"] },
-      { label: "no terms matched", scopes: [ids.project, ids.userOnly], purposes: PURPOSE, terms: ["nothing-matches-this"] },
-    ] as const;
+    const bindings: Array<{ label: string; binding: EntityBinding }> = [
+      { label: "object alias", binding: bindingInA(["acme"]) },
+      { label: "subject alias", binding: bindingInA(["user:alice"]) },
+      { label: "no terms matched", binding: bindingInA(["nothing-matches-this"]) },
+    ];
 
-    for (const binding of bindings) {
+    for (const { label, binding } of bindings) {
       const legacy = await runEntityQuery(app, binding, legacyReach, "legacy");
       const current = await runEntityQuery(app, binding, precomputedReach, "current");
-      assert.deepEqual(current, legacy, `the projection must return the same ids as the old join (${binding.label})`);
+      assert.deepEqual(current, legacy, `the projection must return the same ids as the old join (${label})`);
     }
   });
 
@@ -827,12 +896,7 @@ describe("VM-A1 · claim entity projection (0015)", () => {
     // The previous case compares two hand-written queries. This one compares the
     // hand-written query against the code that actually runs in production, so a drift
     // between the test's SQL and `channels.ts` cannot hide.
-    const binding = {
-      label: "project and user-only scope",
-      scopes: [ids.project, ids.userOnly],
-      purposes: PURPOSE,
-      terms: ["acme"],
-    };
+    const binding = bindingInA(["acme"]);
     const legacy = await runEntityQuery(app, binding, legacyReach, "legacy");
     const viaChannel = await runEntityChannel(app, binding);
     assert.deepEqual(viaChannel, legacy, "the entity channel must agree with the pre-migration query");
@@ -847,9 +911,8 @@ describe("VM-A1 · claim entity projection (0015)", () => {
   });
 
   it("matches a subject string", async () => {
-    const scopes = [ids.project, ids.userOnly];
-    const legacy = await runEntityQuery(app, { scopes, purposes: PURPOSE, terms: ["user:alice"] }, legacyReach, "legacy");
-    const current = await runEntityQuery(app, { scopes, purposes: PURPOSE, terms: ["user:alice"] }, precomputedReach, "current");
+    const legacy = await runEntityQuery(app, bindingInA(["user:alice"]), legacyReach, "legacy");
+    const current = await runEntityQuery(app, bindingInA(["user:alice"]), precomputedReach, "current");
     assert.ok(current.length > 0, "a subject string must match through the projection");
     assert.deepEqual(current, legacy);
   });
@@ -858,10 +921,9 @@ describe("VM-A1 · claim entity projection (0015)", () => {
     // `lower(object::text)` for the JSON string `"acme"` is `"acme"` — with the quotes.
     // `object #>> '{}'` is `acme`. The projection uses the unquoted value, so the alias
     // `acme` matches the row and the alias `"acme"` does not.
-    const scopes = [ids.project, ids.userOnly];
-    const unquoted = await runEntityQuery(app, { scopes, purposes: PURPOSE, terms: ["acme"] }, precomputedReach, "current");
+    const unquoted = await runEntityQuery(app, bindingInA(["acme"]), precomputedReach, "current");
     assert.ok(unquoted.length > 0, "the unquoted canonical must match");
-    const quoted = await runEntityQuery(app, { scopes, purposes: PURPOSE, terms: ['"acme"'] }, precomputedReach, "current");
+    const quoted = await runEntityQuery(app, bindingInA(['"acme"']), precomputedReach, "current");
     assert.deepEqual(quoted, [], "the quoted JSON literal must not be a canonical value");
   });
 
@@ -870,9 +932,8 @@ describe("VM-A1 · claim entity projection (0015)", () => {
     // legacy query computes `lower(object::text)` = `{"a":1}` for the same row, which is
     // also not the alias, so the two agree. The case is here because "they agree" is only
     // meaningful once the shape is actually present in the corpus.
-    const scopes = [ids.project, ids.userOnly];
-    const current = await runEntityQuery(app, { scopes, purposes: PURPOSE, terms: ["acme"] }, precomputedReach, "current");
-    const legacy = await runEntityQuery(app, { scopes, purposes: PURPOSE, terms: ["acme"] }, legacyReach, "legacy");
+    const current = await runEntityQuery(app, bindingInA(["acme"]), precomputedReach, "current");
+    const legacy = await runEntityQuery(app, bindingInA(["acme"]), legacyReach, "legacy");
     assert.deepEqual(current, legacy, "a non-string object must be treated identically by both queries");
     const rows = await owner.query<{ n: string }>(
       `SELECT count(*)::text AS n FROM claim_entities ce JOIN claims c ON c.claim_id = ce.claim_id
@@ -883,8 +944,7 @@ describe("VM-A1 · claim entity projection (0015)", () => {
   });
 
   it("excludes a revoked claim", async () => {
-    const scopes = [ids.project, ids.userOnly];
-    const current = await runEntityQuery(app, { scopes, purposes: PURPOSE, terms: ["acme"] }, precomputedReach, "current");
+    const current = await runEntityQuery(app, bindingInA(["acme"]), precomputedReach, "current");
     const revoked = await owner.query<{ claim_id: string }>(
       "SELECT claim_id FROM claims WHERE tenant_id = $1::uuid AND status = 'revoked'",
       [ids.tenant],
@@ -895,19 +955,91 @@ describe("VM-A1 · claim entity projection (0015)", () => {
     }
   });
 
-  it("keeps identical aliases in two tenants separate", async () => {
-    // Both tenants declare `acme`. The channel filters `a.tenant_id = $1::uuid`, so the
-    // foreign claim must not appear — and must not inflate the score by matching twice.
-    const scopes = [ids.project, ids.userOnly];
-    const current = await runEntityQuery(app, { scopes, purposes: PURPOSE, terms: ["acme"] }, precomputedReach, "current");
-    const foreign = await owner.query<{ claim_id: string }>(
-      "SELECT claim_id FROM claims WHERE tenant_id = $1::uuid",
-      [ids.foreignTenant],
-    );
-    assert.ok(foreign.rows.length > 0, "the foreign tenant must hold a claim with the same alias");
-    for (const row of foreign.rows) {
-      assert.ok(!current.includes(row.claim_id), "another tenant's claim must never be returned");
+  it("keeps identical aliases in two tenants separate, in both directions", async () => {
+    // Both tenants declare the alias `acme`, and the channel filters `a.tenant_id = $1::uuid`.
+    //
+    // The case runs the **same helper** against tenant A and tenant B and asserts both
+    // directions, because a negative-only assertion is satisfied by hiding both tenants:
+    // "A does not see B's claim" passes just as well when A can see nothing at all. Each
+    // direction therefore carries its own positive control — the tenant's own claim must be
+    // returned — and both result sets must be non-empty.
+    //
+    // This is what the earlier version of this case could not express: its helper closed
+    // over `ids.tenant`, so it could only ever ask what tenant A saw.
+    const asA = await runEntityChannel(app, bindingInA(["acme"]));
+    const asB = await runEntityChannel(app, {
+      tenant: ids.foreignTenant,
+      principal: "user:probe",
+      scopes: [ids.foreignScope],
+      purposes: PURPOSE,
+      terms: ["acme"],
+    });
+
+    // Positive control for tenant A, derived with the **same scope closure the channel
+    // uses**.
+    //
+    // This is the part that took several attempts. Computing the expected set needs the
+    // reachable scope set, and every hand-built version of it was wrong in a different way —
+    // first a missing scope, then a wrong object filter, then an undefined scope id that
+    // silently widened the query. The closure is not a second implementation of the rule
+    // under test: it is `veritymem.current_reachable_scope_ids()`, the value migration 0014
+    // installs and the channel reads. Using it makes this a genuine unit test of the entity
+    // *query* — the projection join and its filters — rather than a comparison against a
+    // replica of the whole read path, which would fail whenever the replica drifted.
+    await bind(app, {
+      tenant: ids.tenant,
+      principal: "user:probe",
+      scopes: [ids.project, ids.userOnly],
+      purposes: PURPOSE,
+    });
+    let expectedForA: string[];
+    try {
+      expectedForA = (
+        await app.query<{ claim_id: string }>(
+          `SELECT DISTINCT ce.claim_id
+             FROM entity_aliases a
+             JOIN claim_entities ce ON ce.tenant_id = a.tenant_id AND ce.canonical = a.canonical
+             JOIN claims c ON c.claim_id = ce.claim_id AND c.tenant_id = ce.tenant_id
+            WHERE a.tenant_id = $1::uuid
+              AND a.alias = 'acme'
+              AND c.status = 'accepted' AND c.valid_to IS NULL
+              AND c.scope_id = ANY(veritymem.current_reachable_scope_ids())`,
+          [ids.tenant],
+        )
+      ).rows.map((row) => row.claim_id).sort();
+    } finally {
+      await unbind(app);
     }
+
+    assert.deepEqual(
+      asA,
+      expectedForA,
+      "tenant A must see exactly the alias-matching claims in the scopes it can reach",
+    );
+    assert.ok(asA.length > 0, "tenant A's result set must be non-empty");
+    assert.deepEqual(asB, [ids.foreignClaim], "tenant B must see exactly its own claim carrying the alias");
+
+    // And neither sees the other's.
+    assert.ok(!asA.includes(ids.foreignClaim), "tenant A must not receive tenant B's claim");
+    assert.ok(!asB.includes(ids.knownClaim), "tenant B must not receive tenant A's claim");
+
+    // The ids are genuinely different rows, so the assertions above are about the boundary
+    // and not about one id being compared with itself.
+    assert.notEqual(ids.foreignClaim, ids.knownClaim);
+
+    // The same claim is also directly visible to its own tenant and invisible to the other
+    // through the query form, which does not go through the channel's planner.
+    const foreignDirect = await runEntityQuery(
+      app,
+      { tenant: ids.foreignTenant, principal: "user:probe", scopes: [ids.foreignScope], purposes: PURPOSE, terms: ["acme"] },
+      precomputedReach,
+      "current",
+    );
+    assert.deepEqual(foreignDirect, [ids.foreignClaim], "tenant B's own query must return its claim");
+    assert.ok(
+      !foreignDirect.includes(ids.knownClaim),
+      "tenant B's own query must not return tenant A's claim",
+    );
   });
 
   it("enforces RLS on claim_entities itself, so the projection cannot be read around claims", async () => {
