@@ -109,6 +109,15 @@ export interface LoadOptions {
    * reported by the caller.
    */
   readonly indexStrategy?: "maintain" | "defer";
+  /**
+   * Stop after this phase, leaving the later phases unloaded.
+   *
+   * Exists for one caller: the migration rehearsal builds a database migrated to 0013, and
+   * `claim_entities` is created by 0015. Loading it there is impossible, and skipping it is
+   * not a shortcut — a production database at 0013 has no entity projection at all, so the
+   * rehearsal's corpus has to reproduce that state before 0015 backfills it.
+   */
+  readonly stopAfterPhase?: LoadPhase;
   /** Rows per INSERT per phase. Zero uses the built-in defaults. */
   readonly batchSize?: number;
   /** Progress callback. Called after each committed batch. */
@@ -335,6 +344,7 @@ export async function loadCorpus(options: LoadOptions): Promise<LoadResult> {
 
     const strategy = options.indexStrategy ?? "maintain";
     let indexRebuildMs: number | null = null;
+    const completed: LoadPhase[] = [];
     for (const spec of phaseSpecs(context)) {
       // The index is dropped immediately before the embeddings phase and rebuilt
       // immediately after it, so no other phase ever runs without it and the final
@@ -343,12 +353,14 @@ export async function loadCorpus(options: LoadOptions): Promise<LoadResult> {
         await client.query(`DROP INDEX IF EXISTS ${HNSW_INDEX_NAME}`);
       }
       state = await runPhase(client, state, spec, options, context);
+      completed.push(spec.phase);
       if (strategy === "defer" && spec.phase === "embeddings") {
         const rebuildStarted = Date.now();
         await client.query(HNSW_INDEX_DDL);
         await client.query(`ANALYZE claim_embeddings`);
         indexRebuildMs = Date.now() - rebuildStarted;
       }
+      if (options.stopAfterPhase !== undefined && spec.phase === options.stopAfterPhase) break;
     }
 
     // Verify the load actually landed, rather than trusting that the phases ran.
@@ -366,7 +378,7 @@ export async function loadCorpus(options: LoadOptions): Promise<LoadResult> {
     // A loader that reports success while writing nothing is the failure this project
     // exists to prevent, so this is an error rather than a warning. It runs on the same
     // client, inside the same tenant, so it observes exactly what a reader will.
-    const landed = await readCounts(client, options.tenantId);
+    const landed = await readCounts(client, options.tenantId, completed);
     const emptyPhases = landed.filter((entry) => entry.rows === 0);
     if (emptyPhases.length > 0) {
       throw new Error(
@@ -398,7 +410,7 @@ export async function loadCorpus(options: LoadOptions): Promise<LoadResult> {
       scopes,
       elapsed_ms: Date.now() - started,
       resumed_from: resumedFrom,
-      counts: await readCounts(client, options.tenantId),
+      counts: await readCounts(client, options.tenantId, completed),
       index_strategy: strategy,
       index_rebuild_ms: indexRebuildMs,
     };
@@ -681,27 +693,88 @@ async function ensureScopes(client: pg.PoolClient, tenantId: string): Promise<Sc
   return scopes;
 }
 
-/** Row counts for the benchmark tenant, read with an unbound connection. */
+/**
+ * Every table the loader is responsible for, paired with the phase that fills it.
+ *
+ * The phase matters because a caller may stop the load early: a database migrated to 0013
+ * has no `claim_entities` at all, and a count query naming it would fail with `relation
+ * does not exist` rather than report the table as unloaded.
+ */
+const COUNT_SPECS: ReadonlyArray<{
+  readonly phase: LoadPhase;
+  readonly table: string;
+  readonly from: string;
+}> = [
+  { phase: "claims", table: "claims", from: "claims WHERE tenant_id = $1::uuid" },
+  { phase: "events", table: "events", from: "events WHERE tenant_id = $1::uuid" },
+  {
+    phase: "spans",
+    table: "evidence_spans",
+    from: "evidence_spans s JOIN events e ON e.event_id = s.event_id WHERE e.tenant_id = $1::uuid",
+  },
+  {
+    phase: "claim_evidence",
+    table: "claim_evidence",
+    from: "claim_evidence ce JOIN claims c ON c.claim_id = ce.claim_id WHERE c.tenant_id = $1::uuid",
+  },
+  {
+    phase: "embeddings",
+    table: "claim_embeddings",
+    from: "claim_embeddings WHERE tenant_id = $1::uuid",
+  },
+  {
+    phase: "relations",
+    table: "claim_relations",
+    from: "claim_relations r JOIN claims c ON c.claim_id = r.from_claim WHERE c.tenant_id = $1::uuid",
+  },
+  {
+    phase: "aliases",
+    table: "entity_aliases",
+    from: "entity_aliases WHERE tenant_id = $1::uuid",
+  },
+  {
+    phase: "claim_entities",
+    table: "claim_entities",
+    from: "claim_entities WHERE tenant_id = $1::uuid",
+  },
+];
+
+/**
+ * Row counts for the benchmark tenant, read with an unbound connection.
+ *
+ * `phases` narrows the report to the tables a partial load is responsible for. Omitted,
+ * every table is counted, which is what a complete load and `status` both want.
+ */
 export async function readCounts(
   client: pg.PoolClient,
   tenantId: string,
+  phases?: readonly LoadPhase[],
 ): Promise<readonly TableCount[]> {
-  const result = await client.query<{ table_name: string; rows: number }>(
-    `SELECT 'claims' AS table_name, count(*)::int AS rows FROM claims WHERE tenant_id = $1::uuid
-     UNION ALL SELECT 'events', count(*)::int FROM events WHERE tenant_id = $1::uuid
-     UNION ALL SELECT 'evidence_spans', count(*)::int FROM evidence_spans s
-       JOIN events e ON e.event_id = s.event_id WHERE e.tenant_id = $1::uuid
-     UNION ALL SELECT 'claim_evidence', count(*)::int FROM claim_evidence ce
-       JOIN claims c ON c.claim_id = ce.claim_id WHERE c.tenant_id = $1::uuid
-     UNION ALL SELECT 'claim_embeddings', count(*)::int FROM claim_embeddings WHERE tenant_id = $1::uuid
-     UNION ALL SELECT 'claim_relations', count(*)::int FROM claim_relations r
-       JOIN claims c ON c.claim_id = r.from_claim WHERE c.tenant_id = $1::uuid
-     UNION ALL SELECT 'entity_aliases', count(*)::int FROM entity_aliases WHERE tenant_id = $1::uuid
-     UNION ALL SELECT 'claim_entities', count(*)::int FROM claim_entities WHERE tenant_id = $1::uuid
+  const selected =
+    phases === undefined ? COUNT_SPECS : COUNT_SPECS.filter((spec) => phases.includes(spec.phase));
+  if (selected.length === 0) return [];
+  // Every branch aliases its count. Without the alias the first branch's expression name
+  // (`count`) becomes the whole UNION's column name, `row.rows` reads as `undefined`, and
+  // `Number(undefined)` is `NaN` — which compares unequal to zero, so the "did the corpus
+  // land" check below would pass over a completely empty load. The count is validated for
+  // the same reason: a count that is not a finite number is a broken query, not a zero.
+  const result = await client.query<{ table_name: string; rows: string }>(
+    `${selected
+      .map((spec) => `SELECT '${spec.table}' AS table_name, count(*)::int AS rows FROM ${spec.from}`)
+      .join("\n     UNION ALL ")}
      ORDER BY table_name`,
     [tenantId],
   );
-  return result.rows.map((row) => ({ table: String(row.table_name), rows: Number(row.rows) }));
+  return result.rows.map((row) => {
+    const rows = Number(row.rows);
+    if (!Number.isFinite(rows)) {
+      throw new Error(
+        `the row count for ${String(row.table_name)} came back as ${JSON.stringify(row.rows)}, ` +
+          `which is not a number. A count that cannot be read must not become zero.`,
+      );
+    }
+    return { table: String(row.table_name), rows };
+  });
 }
 
 /** Table row counts on a fresh connection, for the CLI's `status` command. */

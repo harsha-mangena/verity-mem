@@ -246,12 +246,21 @@ importers:
 
   packages/perf:
     dependencies:
+      '@veritymem/claims':
+        specifier: workspace:*
+        version: link:../claims
       '@veritymem/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@veritymem/gate':
+        specifier: workspace:*
+        version: link:../gate
       '@veritymem/ledger':
         specifier: workspace:*
         version: link:../ledger
+      '@veritymem/model-adapters':
+        specifier: workspace:*
+        version: link:../model-adapters
       '@veritymem/retrieval':
         specifier: workspace:*
         version: link:../retrieval

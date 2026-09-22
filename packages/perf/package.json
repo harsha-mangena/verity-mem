@@ -13,8 +13,11 @@
     "test": "node --experimental-strip-types --test src/perf.test.ts"
   },
   "dependencies": {
+    "@veritymem/claims": "workspace:*",
     "@veritymem/contracts": "workspace:*",
+    "@veritymem/gate": "workspace:*",
     "@veritymem/ledger": "workspace:*",
+    "@veritymem/model-adapters": "workspace:*",
     "@veritymem/retrieval": "workspace:*",
     "pg": "8.16.3"
   },

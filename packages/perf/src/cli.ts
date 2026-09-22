@@ -26,6 +26,12 @@ import { bootstrapDatabase } from "./isolated.ts";
 import { countAll, loadCorpus, syncStreams } from "./load.ts";
 import { capturePlans, PlanCaptureRefusal } from "./plan-capture.ts";
 import { FIXTURE_FROM, FIXTURE_TO, provisionFixture } from "./plan-fixture.ts";
+import {
+  REHEARSAL_PROFILES,
+  runRehearsal,
+  type ProfileName,
+  type RehearsalOptions,
+} from "./migration-rehearsal.ts";
 import { TARGET_CLAIMS } from "./report.ts";
 import { DEFAULT_ANCHOR, defaultAnchor, runBenchmark } from "./run.ts";
 
@@ -602,6 +608,197 @@ async function runExplainCommand(argv: readonly string[]): Promise<number> {
   }
 }
 
+const REHEARSAL_USAGE = `Migration rehearsal — apply 0014 and 0015 to a production-shaped database
+while the application keeps working
+
+Usage: pnpm eval:perf migration-rehearsal [--profile ci|local] [options]
+
+Sizing
+  --profile <name>          ci (default) or local. Neither is production scale; each is a
+                            documented set of the parameters below, and any explicit option
+                            overrides the profile.
+  --claims <n>              claims per tenant
+  --tenants <n>             how many tenants to load (at least 2 exercises the RLS check)
+  --read-concurrency <n>    simultaneous read probes
+  --write-concurrency <n>   simultaneous append probes, and again as many projection probes
+  --duration <seconds>      length of the measured probe window, excluding the paused
+                            failing migration attempts
+
+Timeouts
+  --statement-timeout <ms>  statement_timeout for every application probe connection
+  --lock-timeout <ms>       lock_timeout for the probes, and for each migration attempt
+
+Where the rehearsal runs
+  --rehearsal-url <url>     an explicit disposable database. Its name must contain
+                            "rehearsal" and must differ from the database named by
+                            DATABASE_URL and MIGRATION_DATABASE_URL, or the command refuses
+                            before connecting. An existing database carrying this command's
+                            marker is recreated; one holding unknown tables is refused.
+                            Omit it to have a uniquely named database created instead.
+  --database <name>         name for the created database (default
+                            veritymem_rehearsal_<timestamp>_<suffix>)
+  --migrations <dir>        migrations directory (default <repo>/migrations)
+
+Telemetry
+  --sample-interval <ms>    how often pg_stat_activity and pg_locks are sampled (default 200)
+  --blocked-threshold <ms>  a blocked statement longer than this is counted (default 1000)
+  --observation-timeout <ms> how long to wait for a migration to reach the statement the
+                            interruption case blocks it on (default 20000)
+
+Corpus and output
+  --seed <text>             corpus seed (default veritymem-perf-v1)
+  --anchor <iso>            corpus time anchor (default ${DEFAULT_ANCHOR})
+  --output <path>           report path (required)
+
+Exit codes: 0 rehearsal complete; 1 the report is incomplete or the run was refused; 2 could
+not run at all.
+
+Nothing here measures latency improvements, ANN performance or production readiness.
+`;
+
+interface RehearsalArgs extends RehearsalOptions {}
+
+function parseRehearsalArgs(argv: readonly string[]): RehearsalArgs | null {
+  if (argv.includes("--help") || argv.includes("-h")) {
+    process.stdout.write(REHEARSAL_USAGE);
+    return null;
+  }
+  let profile: ProfileName = "ci";
+  let output: string | null = null;
+  let rehearsalUrl: string | null = null;
+  let databaseName: string | null = null;
+  let migrationsDir: string | null = null;
+  let seed = "veritymem-perf-v1";
+  let anchor = DEFAULT_ANCHOR;
+  let sampleInterval = 200;
+  let blockedThreshold = 1_000;
+  let observationTimeout = 20_000;
+
+  const numbers: Record<string, (value: number) => void> = {};
+  const numeric = (flag: string, assign: (value: number) => void): void => {
+    numbers[flag] = assign;
+  };
+  let claims: number | null = null;
+  let tenants: number | null = null;
+  let readConcurrency: number | null = null;
+  let writeConcurrency: number | null = null;
+  let duration: number | null = null;
+  let statementTimeout: number | null = null;
+  let lockTimeout: number | null = null;
+  numeric("--claims", (value) => { claims = value; });
+  numeric("--tenants", (value) => { tenants = value; });
+  numeric("--read-concurrency", (value) => { readConcurrency = value; });
+  numeric("--write-concurrency", (value) => { writeConcurrency = value; });
+  numeric("--duration", (value) => { duration = value; });
+  numeric("--statement-timeout", (value) => { statementTimeout = value; });
+  numeric("--lock-timeout", (value) => { lockTimeout = value; });
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    const next = (): string => {
+      const value = argv[index + 1];
+      if (value === undefined) throw new Error(`${String(arg)} requires a value`);
+      index += 1;
+      return value;
+    };
+    const assign = arg === undefined ? undefined : numbers[arg];
+    if (assign !== undefined) {
+      const value = Number.parseInt(next(), 10);
+      if (!Number.isFinite(value)) throw new Error(`${String(arg)} requires an integer`);
+      assign(value);
+      continue;
+    }
+    switch (arg) {
+      case "--profile": {
+        const value = next();
+        if (value !== "ci" && value !== "local") {
+          throw new Error(`--profile must be ci or local; got ${JSON.stringify(value)}`);
+        }
+        profile = value;
+        break;
+      }
+      case "--output": output = next(); break;
+      case "--rehearsal-url": rehearsalUrl = next(); break;
+      case "--database": databaseName = next(); break;
+      case "--migrations": migrationsDir = resolve(next()); break;
+      case "--seed": seed = next(); break;
+      case "--anchor": anchor = next(); break;
+      case "--sample-interval": sampleInterval = Number.parseInt(next(), 10); break;
+      case "--blocked-threshold": blockedThreshold = Number.parseInt(next(), 10); break;
+      case "--observation-timeout": observationTimeout = Number.parseInt(next(), 10); break;
+      default:
+        throw new Error(`unknown option ${String(arg)} for migration-rehearsal`);
+    }
+  }
+  const env = loadEnv();
+  const profileDefaults = REHEARSAL_PROFILES[profile];
+  const value = (given: number | null, fallback: number, flag: string, minimum: number): number => {
+    const resolved = given ?? fallback;
+    if (!Number.isFinite(resolved) || resolved < minimum) {
+      throw new Error(`${flag} must be at least ${minimum}; got ${String(resolved)}`);
+    }
+    return resolved;
+  };
+
+  const anchorDate = new Date(anchor);
+  if (Number.isNaN(anchorDate.getTime())) {
+    throw new Error(`--anchor must be an ISO timestamp; got ${JSON.stringify(anchor)}`);
+  }
+  if (output === null) throw new Error("--output is required");
+
+  return {
+    profile,
+    claims_per_tenant: value(claims, profileDefaults.claims_per_tenant, "--claims", 10),
+    tenants: value(tenants, profileDefaults.tenants, "--tenants", 1),
+    read_concurrency: value(readConcurrency, profileDefaults.read_concurrency, "--read-concurrency", 0),
+    write_concurrency: value(writeConcurrency, profileDefaults.write_concurrency, "--write-concurrency", 0),
+    duration_seconds: value(duration, profileDefaults.duration_seconds, "--duration", 3),
+    statement_timeout_ms: value(
+      statementTimeout,
+      profileDefaults.statement_timeout_ms,
+      "--statement-timeout",
+      100,
+    ),
+    lock_timeout_ms: value(lockTimeout, profileDefaults.lock_timeout_ms, "--lock-timeout", 10),
+    output,
+    rehearsal_url: rehearsalUrl,
+    database_name: databaseName,
+    migrations_dir: migrationsDir ?? env.migrationsDir,
+    sample_interval_ms: value(sampleInterval, 200, "--sample-interval", 20),
+    blocked_threshold_ms: value(blockedThreshold, 1_000, "--blocked-threshold", 1),
+    observation_timeout_ms: value(observationTimeout, 20_000, "--observation-timeout", 1_000),
+    corpus_seed: seed,
+    anchor: anchorDate.toISOString(),
+    log: (message) => process.stdout.write(`${message}\n`),
+  };
+}
+
+/** Run `migration-rehearsal`. Returns the process exit code. */
+async function runRehearsalCommand(argv: readonly string[]): Promise<number> {
+  let args: RehearsalArgs | null;
+  try {
+    args = parseRehearsalArguments(argv);
+  } catch (error) {
+    process.stderr.write(`${(error as Error).message}\n\n${REHEARSAL_USAGE}`);
+    return 1;
+  }
+  if (args === null) return 0;
+
+  try {
+    const outcome = await runRehearsal(args);
+    process.stdout.write(`\n${outcome.summary}\n\nreport: ${outcome.output}\n`);
+    return outcome.report.complete ? 0 : 1;
+  } catch (error) {
+    process.stderr.write(`migration rehearsal could not run: ${(error as Error).message}\n`);
+    return 1;
+  }
+}
+
+/** Exposed so the argument parser can be unit-tested without a database. */
+export function parseRehearsalArguments(argv: readonly string[]): RehearsalArgs | null {
+  return parseRehearsalArgs(argv);
+}
+
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
   // `explain` is dispatched before the benchmark parser, on the raw argv.
   //
@@ -613,6 +810,12 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   // the benchmark's were optional to it.
   if (argv.includes("explain")) return runExplainCommand(argv.filter((arg) => arg !== "explain"));
   if (argv.includes("fixture")) return runFixtureCommand(argv.filter((arg) => arg !== "fixture"));
+  // `migration-rehearsal` gets the same treatment: it creates databases, applies migrations
+  // and terminates a backend of its own, so it must not share the benchmark's parser — whose
+  // `--claims` means something different and whose defaults assume the shared database.
+  if (argv.includes("migration-rehearsal")) {
+    return runRehearsalCommand(argv.filter((arg) => arg !== "migration-rehearsal"));
+  }
 
   const options = parseArgs(argv);
   const env = loadEnv();

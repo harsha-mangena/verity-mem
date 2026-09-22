@@ -50,6 +50,19 @@ export interface DbOptions {
   readonly connectionString: string;
   readonly max?: number;
   readonly applicationName?: string;
+  /**
+   * `statement_timeout` for every connection in this pool, in milliseconds.
+   *
+   * Configurable because 30 s is the production default and not a universal one: a
+   * rehearsal that wants to observe a blocked statement failing needs a bound it chose,
+   * and a batch job needs a bound far larger. Supplied here rather than through the
+   * connection URL's `options` parameter, which this pool's own `statement_timeout`
+   * overrides — the explicit configuration key wins over the startup `options` string, so a
+   * URL that claims to set a timeout would silently not.
+   */
+  readonly statementTimeoutMs?: number;
+  /** `lock_timeout` for every connection in this pool, in milliseconds. */
+  readonly lockTimeoutMs?: number;
 }
 
 export class Db {
@@ -63,7 +76,8 @@ export class Db {
       // Fail fast and loudly rather than hanging a request behind a dead connection.
       connectionTimeoutMillis: 5_000,
       idleTimeoutMillis: 30_000,
-      statement_timeout: 30_000,
+      statement_timeout: options.statementTimeoutMs ?? 30_000,
+      ...(options.lockTimeoutMs !== undefined ? { lock_timeout: options.lockTimeoutMs } : {}),
     });
   }
 
