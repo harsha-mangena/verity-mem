@@ -42,9 +42,11 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, before, describe, it } from "node:test";
 import pg from "pg";
-import { resolveTenantId } from "@veritymem/ledger";
+import { Db, resolveTenantId } from "@veritymem/ledger";
 import { env } from "@veritymem/testkit";
 import { entityChannel, type ChannelQuery } from "./channels.ts";
+import { HashEmbeddingBackend } from "./embeddings.ts";
+import { deindexClaim, projectClaim } from "./projections.ts";
 
 const { Client } = pg;
 
@@ -244,7 +246,8 @@ async function seed(): Promise<void> {
       //
       // Derived from the same expressions the projection uses, so the set is a statement
       // about the corpus rather than a hand-list that drifts when a row is added.
-      // `valid_to` is set to a strictly later instant for a revoked claim, never to
+      // `valid_to` is set to a strictly later instant for a closed claim (revoked or
+      // superseded), never to
       // `now()` in the same statement: `valid_range` is generated from the pair, and a
       // closed interval whose bounds are equal is refused by `claims_check` rather than
       // stored. This repository has been bitten by exactly that, so the fixture respects
@@ -254,7 +257,7 @@ async function seed(): Promise<void> {
                              authority, valid_from, valid_to, recorded_at, extractor, model_version, prompt_version)
          VALUES ($1::uuid,$2::uuid,$3::uuid,'observation',$4,'alias',$5::jsonb,$6::claim_status,
                  'user_self_report', now(),
-                 CASE WHEN $6 = 'revoked' THEN now() + interval '1 second' ELSE NULL END,
+                 CASE WHEN $6 IN ('revoked','superseded') THEN now() + interval '1 second' ELSE NULL END,
                  now(), 'vm-a1-fixture','fixture@1','fixture@1')`,
         [claimId, row.tenantId, row.scope, row.subject, row.object, row.status],
       );
@@ -831,6 +834,115 @@ describe("VM-A1 · precomputed scope reach (0014)", () => {
     assert.equal(after.rows[0]?.tenant, null, "the tenant binding must not survive the transaction");
   });
 
+  it("clears every context GUC before a pooled connection is handed to the next request", async () => {
+    // The commit and rollback cases above prove the GUCs are transaction-local on *one*
+    // connection. This proves the property that actually protects a deployment: a pooled
+    // physical connection returned to the pool carries nothing from its previous user.
+    //
+    // `pg.Pool` with `max: 1` makes reuse deterministic rather than hoped for — with one slot
+    // there is no other connection the second acquisition could return. The backend pid is
+    // asserted identical so "reuse" is a measurement and not an assumption about the driver.
+    const pool = new pg.Pool({ connectionString: env.databaseUrl, max: 1 });
+
+    const readContext = async (client: pg.PoolClient) => {
+      const result = await client.query<{
+        pid: number;
+        tenant: string | null;
+        principal: string | null;
+        scopes: string[] | null;
+        reachable: string[] | null;
+        purposes: string[] | null;
+        system: string | null;
+      }>(
+        `SELECT pg_backend_pid() AS pid,
+                NULLIF(current_setting('veritymem.tenant_id', true), '')    AS tenant,
+                NULLIF(current_setting('veritymem.principal_id', true), '') AS principal,
+                veritymem.current_scope_ids()            AS scopes,
+                veritymem.current_reachable_scope_ids()  AS reachable,
+                veritymem.current_purposes()             AS purposes,
+                NULLIF(current_setting('veritymem.system', true), '')       AS system`,
+      );
+      return result.rows[0]!;
+    };
+
+    // --- connection 1: bind tenant A, confirm the closure is real, release ---------------
+    const first = await pool.connect();
+    const pidBefore = (await readContext(first)).pid;
+    try {
+      await first.query("BEGIN");
+      await first.query("SELECT veritymem.set_request_context($1::uuid,$2,$3::uuid[],$4::text[],$5)", [
+        ids.tenant,
+        "user:probe",
+        [ids.project, ids.userOnly],
+        [...PURPOSE],
+        "read",
+      ]);
+      const bound = await readContext(first);
+      assert.equal(bound.pid, pidBefore, "the pid must not change inside one acquisition");
+      assert.equal(bound.tenant, ids.tenant, "the binding must record tenant A");
+      assert.ok((bound.reachable ?? []).length > 0, "the bound closure must be non-empty");
+      assert.ok((bound.scopes ?? []).length > 0, "the binding must record the held scopes");
+      await first.query("ROLLBACK");
+    } finally {
+      first.release();
+    }
+
+    // --- connection 2: same physical backend, nothing carried over -----------------------
+    const second = await pool.connect();
+    try {
+      const reused = await readContext(second);
+      assert.equal(
+        reused.pid,
+        pidBefore,
+        "the pool must hand back the same backend, or this case proves nothing about reuse",
+      );
+
+      // Before any new request is bound, every dimension must read empty. A connection that
+      // remembered tenant A would let the next request read tenant A's rows.
+      assert.equal(reused.tenant, null, "tenant_id must be empty on a reused connection");
+      assert.equal(reused.principal, null, "principal_id must be empty on a reused connection");
+      assert.deepEqual(reused.scopes ?? [], [], "scope_ids must be empty on a reused connection");
+      assert.deepEqual(reused.reachable ?? [], [], "the reachable closure must be empty on a reused connection");
+      assert.deepEqual(reused.purposes ?? [], [], "purposes must be empty on a reused connection");
+      assert.notEqual(reused.system, "true", "a reused connection must not still be in system context");
+
+      // And tenant A's state is not merely unreadable through these accessors: binding
+      // tenant B and asking the same questions must produce tenant B's answers.
+      await second.query("BEGIN");
+      await second.query("SELECT veritymem.set_request_context($1::uuid,$2,$3::uuid[],$4::text[],$5)", [
+        ids.foreignTenant,
+        "user:probe",
+        [ids.foreignScope],
+        [...PURPOSE],
+        "read",
+      ]);
+      const asB = await readContext(second);
+      assert.equal(asB.tenant, ids.foreignTenant, "tenant B must be the bound tenant");
+      assert.ok(
+        !(asB.reachable ?? []).includes(ids.alice),
+        "tenant B's closure must not contain tenant A's scope",
+      );
+      assert.ok(
+        !(asB.reachable ?? []).includes(ids.project),
+        "tenant B's closure must not contain tenant A's project scope",
+      );
+      const aClaimVisible = await second.query(
+        "SELECT true AS found FROM claims WHERE claim_id = $1::uuid LIMIT 1",
+        [ids.knownClaim],
+      );
+      assert.equal(
+        aClaimVisible.rows.length,
+        0,
+        "tenant B must not be able to read tenant A's claim on the reused connection",
+      );
+      await second.query("ROLLBACK");
+    } finally {
+      second.release();
+    }
+
+    await pool.end();
+  });
+
   it("commits the closure and discards it at commit, not only at rollback", async () => {
     await bind(app, { tenant: ids.tenant, principal: "probe", scopes: [ids.project], purposes: PURPOSE });
     await app.query("COMMIT");
@@ -955,6 +1067,35 @@ describe("VM-A1 · claim entity projection (0015)", () => {
     }
   });
 
+  it("excludes a superseded claim carrying the same alias", async () => {
+    // `revoked` and `superseded` are excluded by the same temporal clause, but they are
+    // different lifecycle events and each is worth its own case: revocation is an operator
+    // decision, supersession is what happens to every fact that gets corrected. The revoked
+    // assertion below is unchanged.
+    const superseded = await owner.query<{ status: string; valid_to: string | null }>(
+      "SELECT status, valid_to::text FROM claims WHERE claim_id = $1::uuid",
+      [ids.supersededClaim],
+    );
+    assert.equal(superseded.rows[0]?.status, "superseded", "the fixture must contain a superseded claim");
+    assert.notEqual(
+      superseded.rows[0]?.valid_to,
+      null,
+      "a superseded claim must have a closed valid range, or the temporal clause cannot exclude it",
+    );
+
+    const current = await runEntityQuery(app, bindingInA(["acme"]), precomputedReach, "current");
+    assert.ok(
+      !current.includes(ids.supersededClaim),
+      "a superseded claim must not be returned by the current entity query",
+    );
+    // And the channel itself agrees, not only the reconstructed query.
+    const viaChannel = await runEntityChannel(app, bindingInA(["acme"]));
+    assert.ok(
+      !viaChannel.includes(ids.supersededClaim),
+      "a superseded claim must not be entity-retrievable through the channel",
+    );
+  });
+
   it("keeps identical aliases in two tenants separate, in both directions", async () => {
     // Both tenants declare the alias `acme`, and the channel filters `a.tenant_id = $1::uuid`.
     //
@@ -1042,6 +1183,122 @@ describe("VM-A1 · claim entity projection (0015)", () => {
     );
   });
 
+  it("populates and removes claim_entities through the production projection path", async () => {
+    // Every other entity case seeds `claim_entities` by hand, which proves the *query* but
+    // not that the write path ever fills it. A projection that nothing maintains is a
+    // projection that silently empties, and the entity channel's recall degrades to zero
+    // while every query test still passes on hand-inserted rows.
+    //
+    // So this case inserts a claim and then calls `projectClaim` — the same function the
+    // outbox processor and the ingest path call. The projection SQL is not repeated here;
+    // that is the operation under test.
+    const tenant = ids.tenant;
+    const claimId = randomUUID();
+    const subject = `user:runtime-${randomUUID().slice(0, 8)}`;
+    const object = "runtimealias";
+
+    await owner.query(
+      `INSERT INTO claims (claim_id, tenant_id, scope_id, kind, subject, predicate, object, status,
+                           authority, valid_from, valid_to, recorded_at, extractor, model_version, prompt_version)
+       VALUES ($1::uuid,$2::uuid,$3::uuid,'observation',$4,'runtime',$5::jsonb,'accepted',
+               'user_self_report', now(), NULL, now(), 'vm-a1-fixture','fixture@1','fixture@1')`,
+      [claimId, tenant, ids.alice, subject, JSON.stringify(object)],
+    );
+    // The alias must exist for the channel to find anything; the dictionary is a separate
+    // table from the projection, and 0015 deliberately did not change that.
+    await owner.query(
+      `INSERT INTO entity_aliases (tenant_id, alias, canonical, source, confidence)
+       VALUES ($1::uuid,$2,$2,'vm_a1_fixture',1.0)
+       ON CONFLICT (tenant_id, alias, canonical) DO NOTHING`,
+      [tenant, object],
+    );
+
+    // Before projection: the claim exists but is not reachable through the entity channel.
+    const before = await runEntityChannel(app, bindingInA([object]));
+    assert.ok(!before.includes(claimId), "the claim must not be entity-retrievable before projection");
+
+    // Run the production projection through the real `Db`.
+    //
+    // `Db` satisfies `QueryExecutor`, so no adapter stands between the test and the
+    // production code, and the connection is the migration/owner role — which is what the
+    // outbox worker uses for projection work and which is exempt from the row policies, so
+    // the projection can write across the tenant's rows in one transaction.
+    const projectionDb = new Db({ connectionString: ownerUrl(), max: 2 });
+    const embeddingBackend = new HashEmbeddingBackend({
+      dimensions: env.embedding.dimensions,
+      modelId: env.embedding.modelId,
+    });
+    let entityRows: number;
+    try {
+      // `projectClaim` deliberately refuses to run without a request context — the `Db`
+      // guard that stops tenant data being read outside one. The projection path runs under
+      // a tenant-bound system context, which is what maintenance work uses, so the test
+      // supplies one rather than reaching for a privileged escape.
+      const outcome = await projectionDb.withSystemContext(
+        { tenant: ids.tenant, actor: "vm-a1-projection" },
+        (executor) => projectClaim(executor, { db: projectionDb, embeddings: embeddingBackend }, claimId),
+      );
+      assert.equal(outcome.projected, true, `projectClaim did not project the claim: ${outcome.reason}`);
+      assert.ok(outcome.entities > 0, "projectClaim must report at least one entity row");
+    } finally {
+      await projectionDb.close();
+    }
+
+    // Populated, with the exact values the projection is supposed to derive.
+    const rows = await owner.query<{ tenant_id: string; canonical: string; source: string; claim_id: string }>(
+      "SELECT tenant_id::text, canonical, source, claim_id::text FROM claim_entities WHERE claim_id = $1::uuid ORDER BY canonical",
+      [claimId],
+    );
+    assert.ok(rows.rows.length > 0, "claim_entities must be populated by the production path");
+    for (const row of rows.rows) {
+      assert.equal(row.tenant_id, tenant, "the projection must record the claim's own tenant");
+      assert.equal(row.claim_id, claimId, "the projection must record the claim's own id");
+      assert.ok(row.source.length > 0, "the projection must record where the entity came from");
+    }
+    assert.ok(
+      rows.rows.some((row) => row.canonical === object),
+      `the unquoted object must be a canonical; got ${rows.rows.map((r) => r.canonical).join(", ")}`,
+    );
+    assert.ok(
+      rows.rows.some((row) => row.canonical === subject.toLowerCase()),
+      "the subject must be a canonical",
+    );
+    entityRows = rows.rows.length;
+
+    // And the channel now returns it, through the real budgeted read path.
+    const after = await runEntityChannel(app, bindingInA([object]));
+    assert.ok(after.includes(claimId), "the entity channel must return the newly projected claim");
+
+    // Another tenant cannot see it.
+    const asForeign = await runEntityChannel(app, {
+      tenant: ids.foreignTenant,
+      principal: "user:probe",
+      scopes: [ids.foreignScope],
+      purposes: PURPOSE,
+      terms: [object],
+    });
+    assert.ok(!asForeign.includes(claimId), "another tenant must not see the projected claim");
+
+    // Deindexing is the other half of the lifecycle, and it must remove the projection rows
+    // rather than leave them pointing at a claim the channel can no longer return.
+    const deindexDb = new Db({ connectionString: ownerUrl(), max: 2 });
+    try {
+      await deindexDb.withSystemContext({ tenant: ids.tenant, actor: "vm-a1-deindex" }, (executor) =>
+        deindexClaim(executor, claimId),
+      );
+    } finally {
+      await deindexDb.close();
+    }
+
+    const remaining = await owner.query<{ n: string }>(
+      "SELECT count(*)::text AS n FROM claim_entities WHERE claim_id = $1::uuid",
+      [claimId],
+    );
+    assert.equal(remaining.rows[0]?.n, "0", `deindexClaim must remove the projection rows (was ${entityRows})`);
+    const afterDeindex = await runEntityChannel(app, bindingInA([object]));
+    assert.ok(!afterDeindex.includes(claimId), "a deindexed claim must no longer be entity-retrievable");
+  });
+
   it("enforces RLS on claim_entities itself, so the projection cannot be read around claims", async () => {
     // The projection is a second copy of tenant data. If it were readable unbound it would
     // be a bypass of the claim policies, so the policy on it is load-bearing and is
@@ -1051,22 +1308,137 @@ describe("VM-A1 · claim entity projection (0015)", () => {
     );
     assert.equal(enabled.rows[0]?.relrowsecurity, true, "claim_entities must have RLS enabled");
 
-    // Unbound: zero rows.
-    const unbound = await app.query<{ n: string }>("SELECT count(*)::text AS n FROM claim_entities");
-    assert.equal(unbound.rows[0]?.n, "0", "an unbound connection must read no claim_entities rows");
+    // Unbound: the known row is not there.
+    //
+    // Targeted rather than `count(*)`. A count must scan the whole table, and under RLS that
+    // is a scan with a policy evaluation per row — on the shared database that took ~19 s and
+    // eventually exceeded the statement timeout. No unbound authorization assertion in this
+    // file may scan millions of rows, so this asks for one known row and stops at the first
+    // match.
+    const unbound = await app.query<{ found: boolean }>(
+      "SELECT true AS found FROM claim_entities WHERE claim_id = $1::uuid LIMIT 1",
+      [ids.knownClaim],
+    );
+    assert.equal(unbound.rows.length, 0, "an unbound connection must read no claim_entities rows");
 
-    // Bound to the tenant: rows appear, and only for claims this tenant can reach.
+    // Positive control: the row is really there, read by the owner, so the refusal above is
+    // the policy and not a missing fixture.
+    const control = await owner.query(
+      "SELECT true AS found FROM claim_entities WHERE claim_id = $1::uuid LIMIT 1",
+      [ids.knownClaim],
+    );
+    assert.equal(control.rows.length, 1, "the fixture must contain the probed claim_entities row");
+
+    // Bound to the tenant: the row appears, and another tenant's does not.
     await bind(app, { tenant: ids.tenant, principal: "probe", scopes: [ids.project], purposes: PURPOSE });
     try {
-      const bound = await app.query<{ n: string }>("SELECT count(*)::text AS n FROM claim_entities");
-      assert.notEqual(bound.rows[0]?.n, "0", "a bound connection must read its own tenant's rows");
-      const foreign = await app.query<{ n: string }>(
-        "SELECT count(*)::text AS n FROM claim_entities WHERE tenant_id = $1::uuid",
-        [ids.foreignTenant],
+      const bound = await app.query(
+        "SELECT true AS found FROM claim_entities WHERE claim_id = $1::uuid LIMIT 1",
+        [ids.knownClaim],
       );
-      assert.equal(foreign.rows[0]?.n, "0", "claim_entities must not expose another tenant's rows");
+      assert.equal(bound.rows.length, 1, "a bound connection must read its own tenant's rows");
+      const foreign = await app.query(
+        "SELECT true AS found FROM claim_entities WHERE claim_id = $1::uuid LIMIT 1",
+        [ids.foreignClaim],
+      );
+      assert.equal(foreign.rows.length, 0, "claim_entities must not expose another tenant's rows");
     } finally {
       await unbind(app);
     }
+  });
+});
+
+describe("VM-A1 · the application role cannot change the schema", () => {
+  let app: pg.Client;
+  let owner: pg.Client;
+
+  before(async () => {
+    await seed();
+    app = await connect(env.databaseUrl!);
+    owner = await connect(ownerUrl());
+  });
+  after(async () => {
+    await app?.end();
+    await owner?.end();
+  });
+
+  it("is a plain login role with no superuser, no BYPASSRLS and no CREATEDB", async () => {
+    const row = await app.query<{ rolname: string; rolsuper: boolean; rolbypassrls: boolean; rolcreatedb: boolean; rolcreaterole: boolean }>(
+      `SELECT rolname, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole
+         FROM pg_roles WHERE rolname = current_user`,
+    );
+    const role = row.rows[0];
+    assert.equal(role?.rolname, "veritymem_app", "the cases must run as the application role");
+    assert.equal(role?.rolsuper, false, "the application role must not be a superuser");
+    assert.equal(role?.rolbypassrls, false, "the application role must not bypass row-level security");
+    assert.equal(role?.rolcreatedb, false, "the application role must not be able to create databases");
+    assert.equal(role?.rolcreaterole, false, "the application role must not be able to create roles");
+  });
+
+  it("has no CREATE privilege on the database or the application schema", async () => {
+    // Asserted from the catalog rather than by attempting DDL: an attempt that happened to
+    // succeed would leave a schema change behind, and one that failed would only prove this
+    // particular statement was refused.
+    const createdb = await app.query<{ ok: boolean }>(
+      "SELECT has_database_privilege(current_user, current_database(), 'CREATE') AS ok",
+    );
+    assert.equal(createdb.rows[0]?.ok, false, "the application role must not hold CREATE on the database");
+
+    const createschema = await app.query<{ ok: boolean }>(
+      "SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS ok",
+    );
+    assert.equal(createschema.rows[0]?.ok, false, "the application role must not hold CREATE on the schema");
+
+    // What it *may* do, so the assertions above are about a restricted role rather than a
+    // role that can do nothing at all.
+    const usage = await app.query<{ ok: boolean }>(
+      "SELECT has_schema_privilege(current_user, 'public', 'USAGE') AS ok",
+    );
+    assert.equal(usage.rows[0]?.ok, true, "the application role must still be able to use the schema");
+  });
+
+  it("holds no ownership of the tables it reads, so the policies always bind to it", async () => {
+    // Table ownership would make the role exempt from its own policies — `relforcerowsecurity`
+    // is off, so the owner bypasses RLS whether or not it has BYPASSRLS.
+    const owned = await app.query<{ n: string }>(
+      `SELECT count(*)::text AS n
+         FROM pg_class c
+         JOIN pg_roles r ON r.oid = c.relowner
+        WHERE r.rolname = current_user
+          AND c.relnamespace = 'public'::regnamespace
+          AND c.relkind IN ('r','p')`,
+    );
+    assert.equal(owned.rows[0]?.n, "0", "the application role must own no table in the public schema");
+
+    // Positive control: this database does have tables owned by somebody, so the zero above
+    // is not an empty schema.
+    const total = await owner.query<{ n: string }>(
+      "SELECT count(*)::text AS n FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relkind IN ('r','p')",
+    );
+    assert.notEqual(total.rows[0]?.n, "0", "the public schema must contain tables for this to mean anything");
+  });
+
+  it("can only reach the schema changes through the migration role", async () => {
+    // The migration role is the one that may alter the schema, and the two are distinct
+    // logins. This is what makes "migrations are executable only through the migration role"
+    // a property of the deployment rather than a convention.
+    const roles = await owner.query<{ app: string; migrator: string; same: boolean }>(
+      `SELECT current_user AS migrator,
+              (SELECT rolname FROM pg_roles WHERE rolname = 'veritymem_app') AS app,
+              current_user = 'veritymem_app' AS same`,
+    );
+    assert.notEqual(roles.rows[0]?.same, true, "the migration connection must not be the application role");
+
+    // The migration role owns the schema objects, which is what lets it apply DDL.
+    const ownerRole = await owner.query<{ n: string }>(
+      `SELECT count(*)::text AS n
+         FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner
+        WHERE r.rolname = current_user AND c.relnamespace = 'public'::regnamespace AND c.relkind = 'r'`,
+    );
+    assert.notEqual(ownerRole.rows[0]?.n, "0", "the migration role must own the schema objects");
+
+    // And the application role cannot create one, checked from the catalog above. Attempting
+    // the DDL here would modify the database if the grant were ever wrong, which is the one
+    // outcome this test must not cause.
   });
 });
