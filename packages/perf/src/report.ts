@@ -20,7 +20,9 @@ import {
   compareToTarget,
   MIN_SAMPLES_FOR_P99,
   summarise,
+  summariseChannels,
   summariseContent,
+  type ChannelSummary,
   type ContentSummary,
   type LatencySummary,
   type Sample,
@@ -57,6 +59,8 @@ export interface ScenarioResult {
     readonly mode: TimeMode;
     readonly summary: LatencySummary;
   }[];
+  /** Per-channel cost, sorted by mean. This is where a slow mode's cause shows up. */
+  readonly channels: readonly ChannelSummary[];
   readonly buffers: {
     readonly before: BufferStats;
     readonly after: BufferStats;
@@ -313,6 +317,7 @@ export function summariseScenario(samples: readonly Sample[]): {
   readonly all: LatencySummary;
   readonly content: Readonly<Record<TimeMode, ContentSummary>>;
   readonly by_shape: readonly { readonly shape: string; readonly mode: TimeMode; readonly summary: LatencySummary }[];
+  readonly channels: readonly ChannelSummary[];
 } {
   const modes: TimeMode[] = ["current", "as_of", "during"];
   const byMode: Record<TimeMode, LatencySummary> = {
@@ -335,6 +340,7 @@ export function summariseScenario(samples: readonly Sample[]): {
     by_mode: byMode,
     all: summarise(samples),
     content,
+    channels: summariseChannels(samples),
     by_shape: [...shapes.entries()]
       .map(([shape, entry]) => ({ shape, mode: entry.mode, summary: summarise(entry.samples) }))
       .sort((left, right) => left.shape.localeCompare(right.shape)),
@@ -429,7 +435,7 @@ export function renderSummary(report: BenchmarkReport): string {
   }
   lines.push("");
   lines.push("  measurements");
-  lines.push("    mode    cache  n      p50       p90       p95       p99       max      mean    empty");
+  lines.push("    mode    cache  n      p50       p90       p95       p99       max      mean   empty  err");
   for (const scenario of report.measurements) {
     for (const name of ["current", "as_of", "during"] as const) {
       const summary = scenario.by_mode[name];
@@ -438,8 +444,11 @@ export function renderSummary(report: BenchmarkReport): string {
         `    ${mode(name)} ${scenario.cache_state.padEnd(6)} ${String(summary.n).padStart(5)} ` +
           `${ms(summary.p50_ms)} ${ms(summary.p90_ms)} ${ms(summary.p95_ms)} ${ms(summary.p99_ms)} ` +
           `${ms(summary.max_ms)} ${ms(summary.mean_ms)}  ` +
-          `${(content.empty_fraction * 100).toFixed(0).padStart(3)}%`,
+          `${(content.empty_fraction * 100).toFixed(0).padStart(3)}%  ${String(content.errors).padStart(4)}`,
       );
+      for (const example of content.error_examples) {
+        lines.push(`        error: ${example.slice(0, 160)}`);
+      }
     }
     lines.push(
       `    ${"all".padEnd(7)} ${scenario.cache_state.padEnd(6)} ${String(scenario.all.n).padStart(5)} ` +
@@ -450,6 +459,11 @@ export function renderSummary(report: BenchmarkReport): string {
       `      ${scenario.label}: ${scenario.duration_ms} ms wall; trace writes ${scenario.trace_writes ? "on" : "off"}; ` +
         `buffer hit ratio ${fmtRatio(scenario.buffers.delta.hit_ratio)} ` +
         `(${scenario.buffers.delta.heap_blks_read + scenario.buffers.delta.idx_blks_read} block reads during the pass)`,
+    );
+    lines.push(
+      `      channels: ${scenario.channels
+        .map((entry) => `${entry.channel} mean=${entry.mean_ms.toFixed(1)}ms p95=${entry.p95_ms.toFixed(1)}ms`)
+        .join("  ")}`,
     );
     lines.push("      by shape:");
     for (const entry of scenario.by_shape) {

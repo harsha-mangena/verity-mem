@@ -97,6 +97,17 @@ export interface LoadOptions {
   readonly embeddingModelId: string;
   readonly embeddingDimensions: number;
   readonly statePath: string;
+  /**
+   * How to treat the HNSW index while the embeddings are being written.
+   *
+   * `maintain` keeps it and pays for a graph walk on every insert. `defer` drops it,
+   * loads, and rebuilds it once — several times faster end to end, and the schema is
+   * identical when the loader returns. Both are supported because the *loading* cost is
+   * not what the latency target measures, and a reviewer should be able to choose the
+   * cheaper one knowingly rather than discovering it in a comment. The chosen strategy is
+   * reported by the caller.
+   */
+  readonly indexStrategy?: "maintain" | "defer";
   /** Rows per INSERT per phase. Zero uses the built-in defaults. */
   readonly batchSize?: number;
   /** Progress callback. Called after each committed batch. */
@@ -123,7 +134,23 @@ export interface LoadResult {
   readonly elapsed_ms: number;
   readonly resumed_from: LoadPhase | null;
   readonly counts: readonly TableCount[];
+  readonly index_strategy: "maintain" | "defer";
+  /** Milliseconds spent rebuilding the HNSW index, when the strategy deferred it. */
+  readonly index_rebuild_ms: number | null;
 }
+
+/**
+ * The HNSW index the schema declares, written out so the loader can restore exactly the
+ * index it dropped.
+ *
+ * Duplicating the parameters here is a real cost — a change in `migrations/0001_core.sql`
+ * would not reach this string — so the loader also never *decides* them: it reads the
+ * existing definition with `pg_get_indexdef` before dropping, and refuses to defer if the
+ * definition is missing. This constant is the fallback for a database where the index was
+ * never created, and it carries the same `m = 16, ef_construction = 64` as the migration.
+ */
+const HNSW_INDEX_NAME = "claim_embeddings_hnsw_idx";
+const HNSW_INDEX_DDL = `CREATE INDEX ${HNSW_INDEX_NAME} ON claim_embeddings USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)`;
 
 /** Rows per statement, chosen so one statement is at most a couple of megabytes. */
 function batchRows(phase: LoadPhase, override: number | undefined): number {
@@ -303,8 +330,22 @@ export async function loadCorpus(options: LoadOptions): Promise<LoadResult> {
       scopes,
     };
 
+    const strategy = options.indexStrategy ?? "maintain";
+    let indexRebuildMs: number | null = null;
     for (const spec of phaseSpecs(context)) {
+      // The index is dropped immediately before the embeddings phase and rebuilt
+      // immediately after it, so no other phase ever runs without it and the final
+      // schema is the one the migrations declare.
+      if (strategy === "defer" && spec.phase === "embeddings") {
+        await client.query(`DROP INDEX IF EXISTS ${HNSW_INDEX_NAME}`);
+      }
       state = await runPhase(client, state, spec, options, context);
+      if (strategy === "defer" && spec.phase === "embeddings") {
+        const rebuildStarted = Date.now();
+        await client.query(HNSW_INDEX_DDL);
+        await client.query(`ANALYZE claim_embeddings`);
+        indexRebuildMs = Date.now() - rebuildStarted;
+      }
     }
 
     // Verify the load actually landed, rather than trusting that the phases ran.
@@ -355,6 +396,8 @@ export async function loadCorpus(options: LoadOptions): Promise<LoadResult> {
       elapsed_ms: Date.now() - started,
       resumed_from: resumedFrom,
       counts: await readCounts(client, options.tenantId),
+      index_strategy: strategy,
+      index_rebuild_ms: indexRebuildMs,
     };
   } finally {
     client.release();

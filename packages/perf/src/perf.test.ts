@@ -231,7 +231,9 @@ describe("percentiles", () => {
       candidates_considered: 10,
       decision: "use",
       empty: false,
+      error: null,
       at_s: index / 100,
+      channels: { lexical: 1 },
     }));
   }
 
@@ -264,8 +266,8 @@ describe("percentiles", () => {
 
   it("reports emptiness, so an all-empty workload cannot pass as a fast one", () => {
     const content = summariseContent([
-      { position: 0, mode: "current", shape: "s", latency_us: 500, returned: 0, candidates_considered: 0, decision: "clarify", empty: true, at_s: 0 },
-      { position: 1, mode: "current", shape: "s", latency_us: 500, returned: 4, candidates_considered: 40, decision: "use", empty: false, at_s: 0 },
+      { position: 0, mode: "current", shape: "s", latency_us: 500, returned: 0, candidates_considered: 0, decision: "clarify", empty: true, error: null, at_s: 0, channels: {} },
+      { position: 1, mode: "current", shape: "s", latency_us: 500, returned: 4, candidates_considered: 40, decision: "use", empty: false, error: null, at_s: 0, channels: {} },
     ]);
     assert.equal(content.empty_packets, 1);
     assert.equal(content.empty_fraction, 0.5);
@@ -323,6 +325,7 @@ describe("verdict", () => {
       during: summariseContent([]),
     },
     by_shape: [],
+    channels: [],
     buffers: {
       before: { heap_blks_read: 0, heap_blks_hit: 0, idx_blks_read: 0, idx_blks_hit: 0, hit_ratio: null },
       after: { heap_blks_read: 0, heap_blks_hit: 0, idx_blks_read: 0, idx_blks_hit: 0, hit_ratio: null },

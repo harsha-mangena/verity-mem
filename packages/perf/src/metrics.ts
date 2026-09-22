@@ -19,8 +19,59 @@ export interface Sample {
   readonly decision: string;
   /** True when the packet came back empty. An all-empty workload measures nothing. */
   readonly empty: boolean;
+  /**
+   * Set when `compose()` rejected, e.g. a statement timeout. The request is not
+   * dropped: a slow query that hits the server's `statement_timeout` is the most
+   * important thing a latency benchmark can report, and quietly excluding it would
+   * turn a timeout into a missing sample.
+   */
+  readonly error: string | null;
   /** Seconds since the start of the pass. Used to check for drift within a pass. */
   readonly at_s: number;
+  /**
+   * Per-channel durations in milliseconds, as the channel itself measured them.
+   *
+   * Kept because a request's total says nothing about *which* channel is the problem,
+   * and at a million claims the answer is not predictable from a small-corpus run: the
+   * dense channel's plan changes with the row count.
+   */
+  readonly channels: Readonly<Record<string, number>>;
+}
+
+/** Per-channel mean/p95 duration, page reads included as the channel reported them. */
+export interface ChannelSummary {
+  readonly channel: string;
+  readonly n: number;
+  readonly mean_ms: number;
+  readonly p95_ms: number;
+  readonly max_ms: number;
+  /** Requests in which this channel did not run at all (skipped, not empty). */
+  readonly skipped: number;
+}
+
+export function summariseChannels(samples: readonly Sample[]): readonly ChannelSummary[] {
+  const byChannel = new Map<string, number[]>();
+  const seen = new Map<string, number>();
+  let total = 0;
+  for (const sample of samples) {
+    total += 1;
+    for (const [name, duration] of Object.entries(sample.channels)) {
+      const list = byChannel.get(name) ?? [];
+      list.push(duration);
+      byChannel.set(name, list);
+      seen.set(name, (seen.get(name) ?? 0) + 1);
+    }
+  }
+  return [...byChannel.entries()]
+    .map(([channel, values]) => ({
+      channel,
+      n: values.length,
+      mean_ms: round3(values.reduce((sum, value) => sum + value, 0) / values.length),
+      p95_ms: round3(percentile(values, 95)),
+      max_ms: round3(Math.max(...values)),
+      skipped: total - (seen.get(channel) ?? 0),
+    }))
+    .sort((left, right) => right.mean_ms - left.mean_ms);
 }
 
 export interface LatencySummary {
@@ -89,6 +140,8 @@ export function round3(value: number): number {
 
 /** Result-set and content statistics, so an empty workload cannot pass as a fast one. */
 export interface ContentSummary {
+  readonly errors: number;
+  readonly error_examples: readonly string[];
   readonly returned_total: number;
   readonly returned_mean: number;
   readonly returned_min: number;
@@ -105,9 +158,13 @@ export function summariseContent(samples: readonly Sample[]): ContentSummary {
   const decisions: Record<string, number> = {};
   for (const sample of samples) decisions[sample.decision] = (decisions[sample.decision] ?? 0) + 1;
   const empty = samples.filter((sample) => sample.empty).length;
+  const errored = samples.filter((sample) => sample.error !== null);
+  const errorExamples = [...new Set(errored.map((sample) => sample.error ?? ""))].slice(0, 5);
   const mean = (values: readonly number[]): number =>
     values.length === 0 ? 0 : round3(values.reduce((total, value) => total + value, 0) / values.length);
   return {
+    errors: errored.length,
+    error_examples: errorExamples,
     returned_total: returned.reduce((total, value) => total + value, 0),
     returned_mean: mean(returned),
     returned_min: returned.length === 0 ? 0 : Math.min(...returned),
