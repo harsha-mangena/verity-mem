@@ -497,11 +497,21 @@ async function parameterTypes(
   const name = `vm_a3_probe_${randomBytes(8).toString("hex")}`;
   try {
     await executor.query(`PREPARE ${name} AS ${sql}`);
+    /**
+     * Cast to `text[]` in the query.
+     *
+     * `parameter_types` is `regtype[]`, and node-postgres has no parser for `regtype`, so it
+     * hands back the array *literal* as a string — `"{uuid,text[]}"` — rather than an array.
+     * The first version returned that string typed as `string[]`, so a caller's
+     * `.length` gave the character count and `.some(...)` threw. Casting to `text[]` makes
+     * the driver decode it properly.
+     */
     const row = await executor.query<{ parameter_types: string[] }>(
-      "SELECT parameter_types FROM pg_prepared_statements WHERE name = $1",
+      "SELECT parameter_types::text[] AS parameter_types FROM pg_prepared_statements WHERE name = $1",
       [name],
     );
-    return row.rows[0]?.parameter_types ?? [];
+    const types = row.rows[0]?.parameter_types;
+    return Array.isArray(types) ? types : [];
   } catch (cause) {
     /**
      * Recorded rather than swallowed.
