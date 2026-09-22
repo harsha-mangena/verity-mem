@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import type { EventAppendRequest } from "@veritymem/contracts";
-import { LedgerError, resolveTenantId, sha256Hex } from "@veritymem/ledger";
+import { LedgerError, loadEnv, resolveTenantId, sha256Hex } from "@veritymem/ledger";
 import { captureError, createTestContext, type TestContext } from "@veritymem/testkit";
 
 function appendRequest(content: string, overrides: Partial<EventAppendRequest> = {}): EventAppendRequest {
@@ -721,7 +721,15 @@ async function mutateAsPrivileged(
 }
 
 function migrationUrl(): string {
-  const url = process.env["MIGRATION_DATABASE_URL"];
+  // `loadEnv()` rather than a raw `process.env` read, because this repository keeps its
+  // configuration in `.env` and `loadEnv` is the single parser for it. Reading the
+  // environment directly required the caller to have exported
+  // `MIGRATION_DATABASE_URL` into the shell first, which made `pnpm test` fail for a
+  // reason that had nothing to do with the code under test, while every other suite and
+  // `scripts/verify.sh` worked. The variable is still *required* and its absence still
+  // throws rather than skipping: the append-only triggers can only be toggled by the
+  // owner, so these cases cannot run as `veritymem_app` and must not silently pass.
+  const url = loadEnv().migrationDatabaseUrl;
   if (!url) {
     throw new Error("MIGRATION_DATABASE_URL is required for privileged test operations");
   }
