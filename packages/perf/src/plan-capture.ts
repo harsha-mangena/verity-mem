@@ -65,6 +65,7 @@ export const REQUIRED_STAGES: readonly RetrievalStage[] = [
   // artifact legible instead of reducing four plans to one stage and three `unlabeled`.
   "claim_relations_read",
   "claim_evidence_read",
+  "span_verification",
   "projection_watermark",
 ];
 
@@ -95,6 +96,11 @@ export interface PlanCaptureOptions {
    * run, and a fabricated entry for it would claim a plan nobody executed.
    */
   readonly subjects: readonly string[];
+  /**
+   * The query's time mode. `current` by default; `during` is what makes the temporal
+   * channel issue a statement at all.
+   */
+  readonly timeMode: "current" | "as_of" | "during";
   readonly log: (message: string) => void;
 }
 
@@ -108,6 +114,8 @@ export interface StageCapture {
   readonly execution_time_ms: number | null;
   readonly buffers: ReturnType<typeof planCounters> | null;
   readonly parameter_types: readonly string[];
+  /** The `Settings` block PostgreSQL reports for this plan, reduced to what matters. */
+  readonly selected_settings: Record<string, string>;
   readonly sanitized_sql: string;
   readonly error: string | null;
 }
@@ -379,16 +387,7 @@ async function preflight(admin: Db, app: Db, options: PlanCaptureOptions): Promi
 class Collector implements QueryObserver {
   private readonly entries: StageCapture[] = [];
   private readonly types = new Map<string, readonly string[]>();
-  /** Declared stages waiting to be paired with the statement that runs next. */
-  private readonly pending: RetrievalStage[] = [];
 
-  aboutToRun(stage: RetrievalStage): void {
-    this.pending.push(stage);
-  }
-
-  takeStage(): RetrievalStage | null {
-    return this.pending.shift() ?? null;
-  }
 
   observed(entry: ObservedQuery): void {
     const plan = entry.plan;
@@ -402,6 +401,7 @@ class Collector implements QueryObserver {
       execution_time_ms: plan === null ? null : planTimings(plan).execution_time_ms,
       buffers: plan === null ? null : planCounters(plan),
       parameter_types: this.types.get(`${entry.stage}:${entry.sql.length}`) ?? [],
+      selected_settings: plan === null ? {} : planSettings(plan),
       // Values are dropped: the artifact carries the statement's shape, not its inputs.
       sanitized_sql: sanitizeSql(entry.sql),
       error: entry.error,
@@ -484,6 +484,41 @@ async function parameterTypes(
   } finally {
     await executor.query(`DEALLOCATE ${name}`).catch(() => undefined);
   }
+}
+
+/**
+ * The `Settings` block PostgreSQL attaches to a plan under `EXPLAIN (SETTINGS)`.
+ *
+ * Recorded per stage because a plan is only interpretable next to the settings that
+ * produced it: the same query plans differently under a different `work_mem` or
+ * `enable_seqscan`, and a shape change caused by a configuration change is not a code
+ * regression. Reduced to the settings a planner decision depends on, so the artifact does
+ * not carry several hundred unchanged defaults per stage.
+ */
+const PLAN_SETTINGS_OF_INTEREST = new Set([
+  "enable_seqscan",
+  "enable_indexscan",
+  "enable_bitmapscan",
+  "enable_hashjoin",
+  "enable_mergejoin",
+  "enable_nestloop",
+  "work_mem",
+  "shared_buffers",
+  "effective_cache_size",
+  "random_page_cost",
+  "seq_page_cost",
+  "hnsw.ef_search",
+]);
+
+function planSettings(explainRows: readonly unknown[]): Record<string, string> {
+  const document = (explainRows[0] ?? {}) as Record<string, unknown>;
+  const raw = document["Settings"];
+  if (raw === null || typeof raw !== "object") return {};
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (PLAN_SETTINGS_OF_INTEREST.has(key) && typeof value === "string") out[key] = value;
+  }
+  return out;
 }
 
 /** Capture the artifact. Throws `PlanCaptureRefusal` for a refusal. */
@@ -605,14 +640,16 @@ export async function capturePlans(
         scope: { tenant: options.tenant },
         purpose: options.purpose,
         limit: options.limit,
+        time: { mode: options.timeMode },
         ...(options.subjects.length > 0 ? { subjects: [...options.subjects] } : {}),
       } as never,
       {
         principal: facts.principal,
         observer: collector,
-        makeExplainingExecutor: (executor, observer) =>
+        makeExplainingExecutor: (executor, observer, stageName) =>
           withObservation(executor, {
             observer,
+            stageName,
             explain: (sql, params) => explainVia(executor, sql, params),
             shouldCapture: looksReadOnly,
           }),
@@ -699,6 +736,18 @@ function buildArtifact(input: BuildInput): unknown {
       query_digest: redact(options.query),
       limit: options.limit,
       purpose: options.purpose,
+      /**
+       * The time mode, which is why `temporal_channel` is sometimes absent: that channel
+       * returns without issuing a statement unless the mode is `during`. Recording the mode
+       * lets a reader tell "the stage did not run because the query did not ask for it" from
+       * "the stage ran and was not captured", which are different problems.
+       */
+      time_mode: options.timeMode,
+      /**
+       * How many subjects the caller declared. `relation_channel` is planned only for
+       * declared subjects, so this is the other half of reading `missing_stages` correctly.
+       */
+      declared_subjects: options.subjects.length,
       principal_digest: redact(input.facts.principal),
       // How many scopes the principal actually holds, which is what the closure is built
       // from. A count, not the ids: the ids are authorization state.

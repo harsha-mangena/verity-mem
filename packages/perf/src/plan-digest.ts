@@ -110,13 +110,20 @@ function canonicalNode(node: unknown): unknown {
  */
 export function canonicalPlan(explainRows: readonly unknown[]): unknown {
   if (!Array.isArray(explainRows) || explainRows.length === 0) return null;
-  const document = explainRows[0] as Record<string, unknown> | undefined;
-  if (document === undefined || typeof document !== "object") return null;
+  const document = explainRows[0] as Record<string, unknown> | null | undefined;
+  // `null` is `typeof "object"`, so the null check is not redundant with the type check —
+  // without it the `in` below throws on a document PostgreSQL never produces but a caller
+  // can: an explain result that came back empty.
+  if (document === null || document === undefined || typeof document !== "object") return null;
 
   const out: Record<string, unknown> = {};
   if ("Plan" in document) out["Plan"] = canonicalNode(document["Plan"]);
   if ("Triggers" in document) out["Triggers"] = canonicalNode(document["Triggers"]);
-  return out;
+
+  // A document with neither has no plan tree. Returning `{}` would give every such
+  // document the same digest, so two *failed* captures would compare as equal — the
+  // failure mode this module exists to make impossible. `null` says "absent".
+  return Object.keys(out).length === 0 ? null : out;
 }
 
 /** SHA-256 of the canonical structural form, as lowercase hex. */
@@ -208,8 +215,11 @@ export function planOutline(explainRows: readonly unknown[]): readonly string[] 
       const index = typeof record["Index Name"] === "string" ? ` using ${record["Index Name"]}` : "";
       out.push(`${"  ".repeat(depth)}${record["Node Type"]}${relation}${index}`);
     }
-    for (const key of ["Plans", "InitPlan"]) {
-      if (key in record) walk(record[key], depth + (key === "Plans" ? 1 : 0));
+    // Descend into the child-bearing keys. `Plan` is the root document's key and holds the
+    // whole tree: omitting it — which the first version did — made every outline empty,
+    // because the walk started at the document rather than at the plan.
+    for (const key of ["Plan", "Plans", "InitPlan"]) {
+      if (key in record) walk(record[key], key === "Plans" ? depth + 1 : depth);
     }
   };
   walk(explainRows[0], 0);

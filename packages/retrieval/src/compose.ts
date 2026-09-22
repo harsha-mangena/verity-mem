@@ -56,7 +56,7 @@ import {
 import type { EmbeddingBackend } from "./embeddings.ts";
 import { extractEntityTerms } from "./channels.ts";
 import { planQuery, type QueryPlan } from "./planner.ts";
-import { stage, type QueryObserver } from "./query-observer.ts";
+import { forStage, type QueryObserver, type RetrievalStage } from "./query-observer.ts";
 
 export interface RetrievalDependencies {
   readonly db: Db;
@@ -98,6 +98,7 @@ export interface ComposeOptions {
   readonly makeExplainingExecutor?: (
     executor: QueryExecutor,
     observer: QueryObserver,
+    stageName: RetrievalStage,
   ) => QueryExecutor;
 }
 
@@ -141,10 +142,19 @@ export async function compose(
    * `makeExplainingExecutor` is supplied by the caller because only it knows how to
    * reach PostgreSQL for `EXPLAIN`; this module just applies it.
    */
-  const observe = (executor: QueryExecutor): QueryExecutor =>
-    observer === undefined || options.makeExplainingExecutor === undefined
-      ? executor
-      : options.makeExplainingExecutor(executor, observer);
+  /**
+   * An executor that attributes everything it runs to one stage.
+   *
+   * **Always called with the raw executor, never with a wrapper.** The first version was
+   * invoked as `observeAs(executor, …)` inside the lanes, where `executor` had already been
+   * wrapped — so the wrappers nested, each holding a different stage name, and a statement
+   * was attributed by its position in the wrapper chain rather than by the channel that
+   * issued it. That is why the artifact showed a statement under two different stage names
+   * in a row. Wrapping the raw executor each time keeps one wrapper per stage and nothing to
+   * nest.
+   */
+  const observeAs = (rawExecutor: QueryExecutor, stageName: RetrievalStage): QueryExecutor =>
+    forStage(rawExecutor, observer, options.makeExplainingExecutor, stageName);
 
   // ---- 1. Plan -----------------------------------------------------------
   const entityTerms = extractEntityTerms(query.query);
@@ -198,8 +208,7 @@ export async function compose(
 
   const channelsStarted = performance.now();
   const channels = await runChannels(dependencies, planned, channelQuery, options.principal, {
-    observe,
-    observer,
+    observeAs,
   });
   const channelWallMs = round(performance.now() - channelsStarted);
   const candidateCount = new Set(
@@ -228,14 +237,14 @@ export async function compose(
       action: "query:compose",
     },
     async (rawExecutor) => {
-      const executor = observe(rawExecutor);
       const hydrationStarted = performance.now();
-      const packetClaims = await hydrate(dependencies, executor, planned, fused, query, now, observer);
+      const packetClaims = await hydrate(dependencies, rawExecutor, planned, fused, query, now, observeAs);
       // This is projection progress, not ledger progress. Reading max(events.seq)
       // made a stale projection look current and paid for a separate privileged
       // transaction on every query.
-      const watermark = await stage(observer, "projection_watermark", () =>
-        readProjectionWatermark(executor, request.tenant_id),
+      const watermark = await readProjectionWatermark(
+        observeAs(rawExecutor, "projection_watermark"),
+        request.tenant_id,
       );
       const hydrationMs = round(performance.now() - hydrationStarted);
       const returned = packetClaims.slice(0, planned.limit);
@@ -265,7 +274,7 @@ export async function compose(
       };
 
       await insertTrace(
-        executor,
+        rawExecutor,
         request.tenant_id,
         options.principal,
         planned,
@@ -289,8 +298,7 @@ export async function compose(
 
 /** What `runChannels` needs in order to report the stages it runs. */
 interface ChannelObservation {
-  readonly observe: (executor: QueryExecutor) => QueryExecutor;
-  readonly observer: QueryObserver | undefined;
+  readonly observeAs: (executor: QueryExecutor, stageName: RetrievalStage) => QueryExecutor;
 }
 
 async function runChannels(
@@ -300,7 +308,7 @@ async function runChannels(
   principal: string,
   observation: ChannelObservation,
 ): Promise<ChannelResult[]> {
-  const { observe, observer } = observation;
+  const { observeAs } = observation;
   const binding = {
     tenant: query.tenant_id,
     principal,
@@ -327,22 +335,21 @@ async function runChannels(
   const ordinaryLane = dependencies.db.withRequest(
     binding,
     async (rawExecutor) => {
-      const executor = observe(rawExecutor);
       const results: ChannelResult[] = [];
-      // Each channel is tagged immediately before it runs, so the profiler pairs a
-      // statement with its stage by position and never by parsing the SQL. A channel
-      // that is not planned is not tagged, and its statement is therefore not captured.
+      // Each channel is handed an executor bound to its own stage, so the attribution is a
+      // property of the executor rather than of the order statements happen to run in. A
+      // channel that is not planned gets no executor and its statement is not captured.
       if (plan.channels.includes("lexical")) {
-        results.push(await stage(observer, "lexical_channel", () => lexicalChannel(executor, query)));
+        results.push(await lexicalChannel(observeAs(rawExecutor, "lexical_channel"), query));
       }
       if (plan.channels.includes("entity")) {
-        results.push(await stage(observer, "entity_channel", () => entityChannel(executor, query)));
+        results.push(await entityChannel(observeAs(rawExecutor, "entity_channel"), query));
       }
       if (plan.channels.includes("temporal")) {
-        results.push(await stage(observer, "temporal_channel", () => temporalChannel(executor, query)));
+        results.push(await temporalChannel(observeAs(rawExecutor, "temporal_channel"), query));
       }
       if (plan.channels.includes("relation")) {
-        results.push(await stage(observer, "relation_channel", () => relationChannel(executor, query)));
+        results.push(await relationChannel(observeAs(rawExecutor, "relation_channel"), query));
       }
       return results;
     },
@@ -373,10 +380,17 @@ async function runChannels(
       // and it is deliberate: `denseChannel` cannot tag its own internals without
       // depending on the profiler.
       async (rawExecutor) => {
-        const executor = observe(rawExecutor);
-        observer?.aboutToRun("dense_model_version");
-        observer?.aboutToRun("dense_vector_search");
-        return denseChannel(executor, query, dependencies.embeddings, vector);
+        // The dense channel issues two statements from inside itself, so it is given an
+        // executor per statement: the hook receives the stage name and returns the executor
+        // to use for that statement. Attribution therefore follows the statement rather than
+        // the wall clock.
+        return denseChannel(
+          rawExecutor,
+          query,
+          dependencies.embeddings,
+          vector,
+          (stageName) => observeAs(rawExecutor, stageName),
+        );
       },
       { readOnly: true },
     );
@@ -418,7 +432,7 @@ async function hydrate(
   fused: readonly FusedCandidate[],
   query: QueryRequest,
   now: string,
-  observer: QueryObserver | undefined,
+  observeAs: (executor: QueryExecutor, stageName: RetrievalStage) => QueryExecutor,
 ): Promise<PacketClaim[]> {
   if (fused.length === 0) return [];
 
@@ -427,12 +441,13 @@ async function hydrate(
   // the evidence, event and watermark reads arrived as `unlabeled` — the artifact could not
   // say what they were.
   const ids = fused.map((candidate) => toPublicId("clm", candidate.claim_id));
-  const claimMap = await stage(observer, "claim_hydration", () => readClaims(executor, ids));
-  const relations = await stage(observer, "claim_relations_read", () =>
-    readRelations(executor, ids),
-  );
-  const evidenceByClaim = await stage(observer, "claim_evidence_read", () =>
-    readEvidence(dependencies.ledger, executor, [...claimMap.values()]),
+  const claimMap = await readClaims(observeAs(executor, "claim_hydration"), ids);
+  const relations = await readRelations(observeAs(executor, "claim_relations_read"), ids);
+  const evidenceByClaim = await readEvidence(
+    dependencies.ledger,
+    executor,
+    [...claimMap.values()],
+    observeAs,
   );
   const out: PacketClaim[] = [];
 
@@ -518,17 +533,19 @@ async function readEvidence(
   ledger: Ledger,
   executor: QueryExecutor,
   claims: readonly ClaimRowShape[],
+  observeAs?: (executor: QueryExecutor, stageName: RetrievalStage) => QueryExecutor,
 ): Promise<Map<string, PacketEvidence[]>> {
   const out = new Map<string, PacketEvidence[]>();
   if (claims.length === 0) return out;
 
-  const rows = await executor.query<EvidenceRow>(
-    `SELECT ce.claim_id, s.span_id, s.event_id, s.start_off, s.end_off, s.span_digest, ce.role
-       FROM claim_evidence ce
-       JOIN evidence_spans s ON s.span_id = ce.span_id
-      WHERE ce.claim_id = ANY($1::uuid[])
-      ORDER BY s.start_off ASC`,
-    [claims.map((claim) => claim.claim_id)],
+  const evidenceExecutor = observeAs?.(executor, "claim_evidence_read") ?? executor;
+  const rows = await evidenceExecutor.query<EvidenceRow>(
+      `SELECT ce.claim_id, s.span_id, s.event_id, s.start_off, s.end_off, s.span_digest, ce.role
+         FROM claim_evidence ce
+         JOIN evidence_spans s ON s.span_id = ce.span_id
+        WHERE ce.claim_id = ANY($1::uuid[])
+        ORDER BY s.start_off ASC`,
+      [claims.map((claim) => claim.claim_id)],
   );
 
   const spanRecords: SpanRecord[] = rows.rows.map((row): SpanRecord => ({
@@ -541,7 +558,10 @@ async function readEvidence(
     quote: "",
   }));
 
-  const verifications = await ledger.verifySpans(executor, spanRecords);
+  // Span verification reads the events behind the spans, which is a separate plan against
+  // a different table and is named as such.
+  const verificationExecutor = observeAs?.(executor, "span_verification") ?? executor;
+  const verifications = await ledger.verifySpans(verificationExecutor, spanRecords);
 
   for (const row of rows.rows) {
     const claimId = toPublicId("clm", row.claim_id);

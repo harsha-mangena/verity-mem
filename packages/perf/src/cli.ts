@@ -316,6 +316,9 @@ Optional
   --subject <subject>    declare a subject, repeatable. The relation channel is only
                          planned for caller-declared subjects, so without one the
                          artifact reports that stage as missing rather than inventing it.
+  --time-mode <mode>     current | as_of | during (default current). Only 'during' makes
+                         the temporal channel issue a statement; the mode is recorded in
+                         the artifact so a missing stage can be read correctly.
   --force                overwrite an existing artifact
 
 Exit codes: 0 captured; 1 refused (see the message); 2 could not run.
@@ -331,6 +334,7 @@ interface ExplainArgs {
   readonly purpose: string;
   readonly principal: string | null;
   readonly subjects: readonly string[];
+  readonly timeMode: "current" | "as_of" | "during";
   readonly force: boolean;
 }
 
@@ -351,6 +355,7 @@ function parseExplainArgs(argv: readonly string[]): ExplainArgs {
   let purpose = "release_planning";
   let principal: string | null = null;
   const subjects: string[] = [];
+  let timeMode: "current" | "as_of" | "during" = "current";
   let force = false;
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -368,6 +373,14 @@ function parseExplainArgs(argv: readonly string[]): ExplainArgs {
       case "--purpose": purpose = next(); break;
       case "--principal": principal = next(); break;
       case "--subject": subjects.push(next()); break;
+      case "--time-mode": {
+        const value = next();
+        if (value !== "current" && value !== "as_of" && value !== "during") {
+          throw new Error("--time-mode must be current, as_of or during");
+        }
+        timeMode = value;
+        break;
+      }
       case "--limit": limit = Number.parseInt(next(), 10); break;
       case "--database-url": databaseUrl = next(); break;
       case "--migration-url": migrationUrl = next(); break;
@@ -388,7 +401,7 @@ function parseExplainArgs(argv: readonly string[]): ExplainArgs {
   if (limit === undefined || !Number.isFinite(limit) || limit < 1 || limit > 100) {
     throw new Error("--limit is required and must be 1..100 (the contract's maximum)");
   }
-  return { tenant, query, limit, output, databaseUrl, migrationUrl, purpose, principal, subjects, force };
+  return { tenant, query, limit, output, databaseUrl, migrationUrl, purpose, principal, subjects, timeMode, force };
 }
 
 /** Run `explain`. Returns the process exit code. */

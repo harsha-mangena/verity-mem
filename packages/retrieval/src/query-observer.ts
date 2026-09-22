@@ -57,19 +57,12 @@ export const RETRIEVAL_STAGES = [
   "claim_hydration",
   "claim_relations_read",
   "claim_evidence_read",
+  "span_verification",
   "projection_watermark",
 ] as const;
 
 export type RetrievalStage = (typeof RETRIEVAL_STAGES)[number] | "unlabeled";
 
-/**
- * What an observer is told about one statement.
- *
- * `sql` is the statement verbatim, because two of the required regression assertions are
- * about the SQL itself — that retrieval uses `current_reachable_scope_ids()`, and that
- * `scope_reachable` does not reappear in a per-candidate position. `plan` is the raw
- * `EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, FORMAT JSON)` output.
- */
 export interface ObservedQuery {
   readonly stage: RetrievalStage;
   readonly sql: string;
@@ -81,24 +74,6 @@ export interface ObservedQuery {
 }
 
 export interface QueryObserver {
-  /**
-   * Declare the stage of the next statement to be executed.
-   *
-   * Called immediately before a channel runs, so the pairing is positional rather than
-   * textual.
-   */
-  aboutToRun(stage: RetrievalStage): void;
-  /**
-   * Consume the most recently declared stage, or `null` when none is pending.
-   *
-   * **The queue lives in the observer, not in this module.** The first version kept it in
-   * `withObservation`, which silently produced nothing: the executor shifted from its own
-   * queue while `compose` pushed tags into the observer's, so every statement was captured
-   * as `unlabeled` and all eight required stages were reported missing — a capture run that
-   * looked like it had worked. Putting the queue on the interface makes the push and the pop
-   * two halves of one contract, rather than two private queues that never met.
-   */
-  takeStage(): RetrievalStage | null;
   /** Record a captured statement. Called after the statement has already executed. */
   observed(entry: ObservedQuery): void;
 }
@@ -106,6 +81,23 @@ export interface QueryObserver {
 /** Options for the explaining executor. */
 export interface ExplainingExecutorOptions {
   readonly observer: QueryObserver;
+  /**
+   * The stage every statement through this executor belongs to.
+   *
+   * **Bound to the executor rather than queued.** Two earlier versions tried a queue of
+   * pending stage names — first global, then per lane — and both mislabelled statements,
+   * because `runChannels` executes the ordinary channels and the dense channel on two
+   * concurrent transactions. Whatever the queue's granularity, a statement's stage is
+   * decided by *when it happens to run* relative to another lane's statements, and the
+   * lanes interleave differently on every run. A trace of the per-lane version showed
+   * `entity_channel` popping `dense_vector_search`.
+   *
+   * Binding the name to the executor removes the ordering assumption entirely: the executor
+   * a channel was handed knows which stage it is serving, so concurrency cannot change the
+   * answer. A stage that issues more than one statement gets one executor per stage, which
+   * is why `denseChannel` takes a hook to create them.
+   */
+  readonly stageName: RetrievalStage;
   /**
    * Runs `EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, FORMAT JSON) <sql>` with `params`
    * inside the same transaction as the observed statement.
@@ -167,10 +159,8 @@ export function withObservation(
     ): Promise<{ rows: R[]; rowCount: number | null }> {
       const result = await executor.query<R>(text, params);
 
-      // The tag is consumed whether or not the statement is captured, so the pairing stays
-      // aligned with the statements the channels actually issue.
-      const stage = options.observer.takeStage() ?? "unlabeled";
       if (!shouldCapture(text)) return result;
+      const stage = options.stageName;
 
       let plan: readonly unknown[] | null = null;
       let error: string | null = null;
@@ -189,17 +179,18 @@ export function withObservation(
 }
 
 /**
- * Pair a stage declaration with the executor for the duration of one call.
+ * Build an executor whose statements are all attributed to one stage.
  *
- * Reads as `await stage(observer, "lexical", () => lexicalChannel(executor, query))`
- * instead of an `aboutToRun` call five lines above the statement it describes, so the
- * label cannot drift away from the code it labels.
+ * The unit of attribution is the executor, so a channel is handed the executor for its own
+ * stage and nothing it runs can be credited to another stage. When nobody is observing, the
+ * executor is returned unchanged, so an ordinary read pays nothing for this seam.
  */
-export async function stage<T>(
+export function forStage(
+  executor: QueryExecutor,
   observer: QueryObserver | undefined,
-  name: RetrievalStage,
-  run: () => Promise<T>,
-): Promise<T> {
-  observer?.aboutToRun(name);
-  return run();
+  make: ((executor: QueryExecutor, observer: QueryObserver, stageName: RetrievalStage) => QueryExecutor) | undefined,
+  stageName: RetrievalStage,
+): QueryExecutor {
+  if (observer === undefined || make === undefined) return executor;
+  return make(executor, observer, stageName);
 }

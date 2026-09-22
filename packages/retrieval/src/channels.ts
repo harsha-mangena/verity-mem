@@ -198,6 +198,18 @@ export async function denseChannel(
   query: ChannelQuery,
   embeddings: EmbeddingBackend,
   preparedVector?: readonly number[],
+  /**
+   * Supplies the executor to use for each statement this channel issues.
+   *
+   * The two statements — the projection model-version lookup and the vector search — are
+   * issued from inside this function, so only this function knows their order. **It returns
+   * the executor rather than accepting one**, because `executor` is a parameter here: an
+   * earlier version took a `void` callback that reassigned a variable in the caller, which
+   * had no effect on the local `executor` the second query used. The vector search was
+   * consequently attributed to the model-version stage, and the artifact showed two
+   * statements under one name.
+   */
+  executorFor?: (stage: "dense_model_version" | "dense_vector_search") => QueryExecutor,
 ): Promise<ChannelResult> {
   const started = performance.now();
   const [embedded] = preparedVector === undefined ? await embeddings.embed([query.text]) : [];
@@ -226,7 +238,8 @@ export async function denseChannel(
   // constructor argument away from happening silently. `packages/ledger`'s
   // `projection_versions` table records the model that wrote the projection; if it
   // disagrees with the configured reader, the channel says so and does not run.
-  const projection = await executor.query<{ model_version: string | null; ledger_watermark: number }>(
+  const projectionExecutor = executorFor?.("dense_model_version") ?? executor;
+  const projection = await projectionExecutor.query<{ model_version: string | null; ledger_watermark: number }>(
     `SELECT model_version, ledger_watermark
        FROM projection_versions
       WHERE projection = 'dense' AND tenant_id = $1::uuid`,
@@ -256,7 +269,8 @@ export async function denseChannel(
   params.push(query.limit);
   const limitIndex = params.length;
 
-  const result = await executor.query<{ claim_id: string; score: number }>(
+  const searchExecutor = executorFor?.("dense_vector_search") ?? executor;
+  const result = await searchExecutor.query<{ claim_id: string; score: number }>(
     `SELECT c.claim_id, 1 - (e.embedding <=> $${vectorIndex}::vector) AS score
        FROM claims c
        JOIN scopes s ON s.scope_id = c.scope_id
