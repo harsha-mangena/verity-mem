@@ -58,6 +58,45 @@ work on a held-out corpus, not a code change, and it is not done.
 
 ## Measurements that do not exist
 
+- **The RLS policy defeats the selective index, which is why the read path times out at
+  scale.** Two independent costs were measured on the 1,190,477-claim isolated corpus, and
+  they have different fixes.
+
+  **One is fixed.** Every retrieval channel's `WHERE` clause came from
+  `reachableScopeIdsExpression()`, which referenced `c.tenant_id` — `c` being the *outer*
+  claims table — making the aggregate correlated so PostgreSQL re-evaluated it once per
+  candidate row. With the argument bound to the request's own tenant:
+  `rs.tenant_id = c.tenant_id` **13,862 ms** versus `rs.tenant_id = $1::uuid` **286 ms**.
+  Fixed in `packages/retrieval/src/channels.ts`; it is equivalent because `channelWhere`
+  already asserts `c.tenant_id = $1::uuid`.
+
+  **One is open.** As the RLS-bound application role, the same query that runs in 8 ms as
+  the owner is cancelled at the statement timeout, because the policy changes the plan:
+
+  ```
+  Nested Loop
+    ->  Seq Scan on scopes s
+    ->  Bitmap Heap Scan on claims c            <- claims_scope_idx, not the text index
+          Filter: (tenant_id = ...)
+            AND (... OR veritymem.scope_reachable(scope_id, veritymem.current_purposes()))
+            AND (search_tsv @@ websearch_to_tsquery(...))
+  ```
+
+  `row_authorized` is OR'd into the per-row filter, so the `claims_tsv_gin` index that
+  answers the text search is not used as the driving path, and `scope_reachable` is
+  evaluated over the rows the scope bitmap returns. The predicate itself is not the
+  problem — 10,000 direct calls take 0.8-1.6 ms, so the cost is call *volume*. The
+  practical consequence is that at reference scale a free-text query is bounded by the
+  policy evaluation rather than by the search.
+
+  The shape of the fix is to evaluate the caller's reachable scope set once per statement
+  instead of once per row — a session variable written at request start and read by the
+  policy, in place of `scope_reachable` calling `current_scope_ids()` inside a PL/pgSQL
+  body where it cannot be hoisted as an initplan. That is a change to
+  `veritymem.row_authorized` and to the migration that defines it, so it is deliberately
+  **not** attempted here: an authorization predicate is the wrong place for a change made
+  at the end of a session, and `docs/isolation-assessment.md`'s external review should see
+  it. It is the single highest-value performance change identified in this repository.
 - **At one million claims the read path does not complete inside its own statement
   timeout.** A complete corpus now exists
   (`perf-ref-1190477-<suffix>`, 1,190,477 claims, events, spans, evidence rows and
