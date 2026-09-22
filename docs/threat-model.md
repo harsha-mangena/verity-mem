@@ -805,9 +805,13 @@ label is set on every request and never read by a policy.
   ten RLS tables, so the table owner bypasses policies. `NOSUPERUSER NOBYPASSRLS`
   covers the application role today; the owner connection is a migration and
   maintenance tool and can read everything.
-- **`compose()` runs its channels sequentially on one connection.** Deliberate — *"a
-  parallel implementation would move the authorization context off the transaction
-  that enforces it"* — so a multi-channel query is the sum of its channels' latencies.
+- **`compose()` uses two independently RLS-bound retrieval lanes.** Lexical, entity,
+  temporal and relation retrieval share one transaction; dense retrieval uses a
+  second transaction with the same request binding. The query embedding is prepared
+  before the dense connection is checked out. This caps a request at two concurrent
+  connections while preventing a hosted embedding call from holding an idle database
+  transaction; latency is approximately the slower lane rather than the sum of every
+  channel.
 - **Rank fusion is rank-based, not score-based**, so per-channel `signals` are not
   comparable to each other and `fuse_score` is *"Relevance only — never a truth or
   confidence score"*.

@@ -78,7 +78,7 @@ Docker with `shared_buffers = 16 MB`), from the run this package's report came f
 | --- | --- | --- |
 | `load` phase 1–4 (events, spans, claims, claim_evidence) | ~6 min | ~18k events/s, ~13k claims/s, ~55k evidence rows/s |
 | `load` phase 5 (`claim_embeddings`) | ~55 min | ~350 rows/s, dominated by online HNSW index maintenance |
-| `load` phases 6–7 (relations, aliases) | ~1 min | |
+| `load` phases 6–8 (relations, aliases, claim entity index) | ~1 min | |
 | `bench` (cold + warm passes, 600 requests each) | see the report | scales with `--workload` |
 
 The embedding phase is the long pole and it is index-bound, not code-bound: with
@@ -137,7 +137,8 @@ than hardcoded:
 ## How latency is defined here
 
 * Wall-clock around `await compose(...)`, in microseconds, on the issuing process. It
-  includes pool checkout and the three transactions `compose()` opens.
+  includes pool checkout, planning, two concurrently bounded retrieval lanes,
+  hydration and the trace write.
 * **Percentiles are nearest-rank** — `ceil(p/100 × n)`-th smallest. Interpolating
   between two samples produces a latency no request experienced.
 * **Trace writes are inside the number**, because `compose()` writes a `query_traces`

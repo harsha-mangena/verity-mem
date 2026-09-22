@@ -34,6 +34,16 @@ services:
       - pg_stat_statements.track=all
       - -c
       - max_connections=200
+      # Safe laptop defaults, all overrideable. The benchmark records these
+      # values so a latency number remains attributable to a configuration.
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-512MB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-2GB}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:-16MB}
+      - -c
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-256MB}
 
   minio:
     # Content-addressed blob storage for large evidence payloads.

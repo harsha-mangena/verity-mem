@@ -68,9 +68,11 @@ work on a held-out corpus, not a code change, and it is not done.
   250 ms, so this is not a near miss; on this configuration the read path does not
   complete at the scale the target names.
 
-  The cause is a working set that cannot be cached, not a slow query in isolation.
-  Each measured in isolation against the same corpus, with `SET statement_timeout`
-  raised:
+  The original report attributed the failure to a working set that could not be
+  cached, but that attribution was too strong: it isolated lexical, dense and one
+  join, while the real request also ran an entity query and a row-security function
+  that consulted `scopes` for every candidate row. The measurements below remain
+  useful evidence of cache pressure; they do not prove it was the only cause.
 
   | piece | time |
   | --- | --- |
@@ -93,19 +95,18 @@ work on a held-out corpus, not a code change, and it is not done.
   index-driven access on `claims` for a parallel sequential scan, and concurrent
   requests evict each other. Four concurrent readers each sat at 16-30 s per query.
 
-  This is recorded as a configuration and design finding, not as a benchmark result:
-  the published deploy configuration has never been tuned for the scale its own target
-  names, and the honest statement is that **the one-million-claim p95 is unknown
-  because the workload does not finish**. Raising `shared_buffers`,
-  `effective_cache_size`, `work_mem` and `hnsw.ef_search`, and deciding between a
-  global HNSW index and a per-tenant one, are the work that would make the number
-  measurable. The target also still requires a *published reference machine*, which
-  this is not.
+  The subsequent read-path hardening precomputes the reachable scope closure once per
+  transaction, replaces the entity cross-join with a canonical-to-claim index, runs
+  dense retrieval alongside the ordinary lane, and gives the Compose deployment
+  explicit memory defaults. Those changes have not yet been run on the recorded
+  million-claim corpus, so they are fixes under test, not a passing benchmark. The
+  honest statement remains that **the one-million-claim p95 is unknown because the
+  workload did not finish**. A rerun on a published reference machine is required.
 - **The dense channel's ANN search is global across tenants.** `claim_embeddings_hnsw_idx`
-  indexes the bare `embedding` column with no tenant key, and the dense channel orders by
-  `e.embedding <=> $vector` over a join that is filtered by `c.tenant_id` afterwards, so
-  the index scan considers every tenant's vectors and the tenant predicate is applied to
-  the candidates it returns. On the reference corpus that index holds 1,011,129 vectors
+  indexes the bare `embedding` column with no tenant key. The dense query now carries
+  explicit tenant predicates on both `claims` and `claim_embeddings`, but pgvector applies
+  ordinary filters after an approximate index scan, so the global graph can still consider
+  other tenants' vectors before filtering. On the reference corpus that index holds 1,011,129 vectors
   from 1,217 tenants at the time of measurement. Beyond the latency consequence above,
   this is the "filtering after vector search leaks through counts, timing, and generated
   summaries" case that `docs/isolation-assessment.md` names: the number of candidates
@@ -119,7 +120,7 @@ work on a held-out corpus, not a code change, and it is not done.
   recorded model for that tenant. A latency measurement over it exercises a retrieval
   path with a partially populated vector index. The loader now refuses to report a
   corpus that did not land (see below), but this dataset predates that check and was
-  produced by an interrupted load whose phases checkpoint independently. Re-running
+  produced by an interrupted load whose phases checkpoint independently.
   Re-running `pnpm eval:perf bench --skip-load` for that tenant cannot repair it: the
   loader's checkpoint for it is gone (`.veritymem/` is generated state, not committed),
   so a resume restarts from the first phase rather than filling the remainder, and

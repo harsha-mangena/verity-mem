@@ -64,6 +64,7 @@ export const LOAD_PHASES = [
   "embeddings",
   "relations",
   "aliases",
+  "claim_entities",
 ] as const;
 export type LoadPhase = (typeof LOAD_PHASES)[number];
 
@@ -142,6 +143,8 @@ function batchRows(phase: LoadPhase, override: number | undefined): number {
     case "relations":
       return 1_000;
     case "aliases":
+      return 2_000;
+    case "claim_entities":
       return 2_000;
   }
 }
@@ -512,6 +515,18 @@ function phaseSpecs(context: PhaseContext): readonly PhaseSpec[] {
         [ctx.tenantId, claim.objectText.toLowerCase(), claim.objectText.toLowerCase(), "perf_corpus", 1],
       ],
     },
+    {
+      // The dictionary above resolves alias -> canonical. This inverted projection
+      // resolves canonical -> claim without scanning the tenant's claim population.
+      phase: "claim_entities",
+      columnsPerRow: 5,
+      sql: `INSERT INTO claim_entities (tenant_id, canonical, claim_id, source, confidence)
+            VALUES %%VALUES%% ON CONFLICT (tenant_id, canonical, claim_id) DO NOTHING`,
+      rows: (claim, ctx) => [
+        [ctx.tenantId, claim.subject.toLowerCase(), claim.claimId, "perf_corpus", 1],
+        [ctx.tenantId, claim.objectText.toLowerCase(), claim.claimId, "perf_corpus", 1],
+      ],
+    },
   ];
 }
 
@@ -639,6 +654,7 @@ export async function readCounts(
      UNION ALL SELECT 'claim_relations', count(*)::int FROM claim_relations r
        JOIN claims c ON c.claim_id = r.from_claim WHERE c.tenant_id = $1::uuid
      UNION ALL SELECT 'entity_aliases', count(*)::int FROM entity_aliases WHERE tenant_id = $1::uuid
+     UNION ALL SELECT 'claim_entities', count(*)::int FROM claim_entities WHERE tenant_id = $1::uuid
      ORDER BY table_name`,
     [tenantId],
   );

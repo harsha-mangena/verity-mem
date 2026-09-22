@@ -23,6 +23,7 @@ import { Db, Ledger, MemoryBlobStore, fixedClock, loadEnv, resolveTenantId, seed
 import { createLogger } from "./log.ts";
 import { EXTRACT_KIND, createEntailmentBackend, createGate, createIngestProcessor, createModelExtractor } from "./processors.ts";
 import { readProjectionLag } from "./outbox-runner.ts";
+import { shouldBackOff } from "./main.ts";
 
 describe("worker processors", () => {
   it("registers the kinds the write path enqueues", async () => {
@@ -162,5 +163,26 @@ describe("batch logging", () => {
     assert.equal(parsed["projection_lag_pending"], 7);
     // Sorted keys, so two lines describing the same event diff cleanly.
     assert.deepEqual(Object.keys(parsed), ["ts", "level", "service", "msg", "claimed", "completed", "failed", "kinds", "projection_lag_pending"]);
+  });
+});
+
+describe("worker polling", () => {
+  it("drains a real backlog immediately but backs off for retry-delayed rows", () => {
+    assert.equal(
+      shouldBackOff({ claimed: 25, completed: 25, failed: 0, kinds: {}, projection_lag: 50 }),
+      false,
+      "a productive cycle with queued work must not pay the poll interval",
+    );
+    assert.equal(
+      shouldBackOff({ claimed: 0, completed: 0, failed: 0, kinds: {}, projection_lag: 1 }),
+      true,
+      "a retry-delayed row must not cause a busy loop",
+    );
+    assert.equal(
+      shouldBackOff({ claimed: 1, completed: 1, failed: 0, kinds: {}, projection_lag: 0 }),
+      true,
+      "an empty queue should use the idle poll interval",
+    );
+    assert.equal(shouldBackOff(null), true, "a failed cycle should back off before retrying the database");
   });
 });

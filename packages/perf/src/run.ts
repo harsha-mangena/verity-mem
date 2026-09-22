@@ -15,8 +15,8 @@
  *   resolution, four channels, rank fusion, evidence re-verification, the use
  *   policy, the trace write — exist only in that call.
  * * Latency is wall-clock around the `await compose(...)`, in microseconds, taken on
- *   the issuing process. It therefore includes connection-pool checkout, the three
- *   transactions `compose()` opens, and the `query_traces` insert, because
+ *   the issuing process. It therefore includes connection-pool checkout, planning,
+ *   the two bounded retrieval lanes, hydration and the `query_traces` insert, because
  *   `compose()` writes one and it cannot be turned off without editing
  *   `packages/retrieval` — which this task explicitly forbids. The number of trace
  *   rows written is reported so the contribution is visible and bounded rather than
@@ -181,7 +181,9 @@ export async function runBenchmark(options: RunOptions): Promise<RunOutcome> {
 
   const db = new Db({
     connectionString: env.databaseUrl,
-    max: options.concurrency,
+    // `compose()` has two bounded read lanes (ordinary and dense). Size for both
+    // so a benchmark measures the database rather than self-inflicted pool waits.
+    max: Math.max(2, options.concurrency * 2),
     applicationName: "veritymem-perf-benchmark",
   });
   // A pooled connection can be closed under us — an operator restarting PostgreSQL, a
@@ -353,9 +355,9 @@ async function warmUp(
  * Run one pass over the workload at the declared concurrency and return its samples.
  *
  * Concurrency is N independent workers pulling from a shared cursor, which is what a
- * service does under N simultaneous callers. The pool is sized to N so a worker is
- * never waiting for a connection it cannot get — a pool smaller than the concurrency
- * would measure the pool, not the database.
+ * service does under N simultaneous callers. The caller sizes the pool for the two
+ * bounded connections each compose may use, so the measurement includes database
+ * contention without accidentally serialising the dense lane behind its own request.
  */
 async function issuePass(
   db: Db,
