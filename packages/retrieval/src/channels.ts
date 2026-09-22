@@ -92,10 +92,29 @@ function scopeArray(query: ChannelQuery): string[] {
  * definitions honest.
  */
 function reachableScopeIdsExpression(): string {
+  // `rs.tenant_id = $1::uuid` rather than `= c.tenant_id`, and the difference is the
+  // whole cost of the read path at scale.
+  //
+  // `c` is the *outer* claims table, so referencing it here made this expression
+  // correlated: PostgreSQL re-evaluated the aggregate once per candidate row. Every
+  // channel builds its WHERE clause from this expression, so every channel paid it.
+  // Measured on a 1,190,477-claim corpus with the argument bound to the request's own
+  // tenant:
+  //
+  //     rs.tenant_id = c.tenant_id   -> 13,862 ms   (loops=1000001)
+  //     rs.tenant_id = $1::uuid      ->     286 ms
+  //
+  // It is also *equivalent*: the outer clauses already assert `c.tenant_id = $1::uuid`
+  // (see `channelWhere`), so scopes belonging to any other tenant could never match.
+  // `$1` is bound by `channelWhere` and is always the request's tenant.
+  //
+  // `$2` was already a parameter, which is why the reach set itself was cheap and the
+  // correlation was invisible: the subquery looks parameterised, and the one reference
+  // that made it per-row is a single column name.
   return `(
     SELECT array_agg(rs.scope_id)
       FROM scopes rs
-     WHERE rs.tenant_id = c.tenant_id
+     WHERE rs.tenant_id = $1::uuid
        AND EXISTS (
          SELECT 1
            FROM unnest($2::uuid[]) AS owned(scope_id)
