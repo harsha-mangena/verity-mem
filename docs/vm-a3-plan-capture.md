@@ -200,7 +200,7 @@ exit 0
 | | |
 | --- | --- |
 | artifact | `reports/vm-a3-plan-capture.json` |
-| SHA-256 | `5dc7ed6f3f9f787767d9fa74429f1e578def0bf5458b907974904f1f3cdad9db` |
+| SHA-256 | `4be523dd6fc29738e92336bc56bb3c452cd5da0a320c432f61e59a9a0763fc94` |
 | schema | `vm-a3.plan-capture.1` |
 | PostgreSQL | 17.11 (Debian 17.11-1.pgdg13+2) |
 | pgvector | 0.8.6 |

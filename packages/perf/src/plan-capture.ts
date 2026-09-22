@@ -683,7 +683,7 @@ export async function capturePlans(
 
     // --- the channels and hydration, through the production read path -------
     const result = await compose(
-      { db: app, ledger, embeddings, ids: systemIds, clock: systemClock } as never,
+      { db: app, ledger, embeddings, ids: systemIds, clock: systemClock },
       {
         tenant_id: facts.tenantId,
         query: options.query,
@@ -694,7 +694,7 @@ export async function capturePlans(
         // asked for, and the union means there is no invalid shape to express.
         time: options.time,
         ...(options.subjects.length > 0 ? { subjects: [...options.subjects] } : {}),
-      } as never,
+      },
       {
         principal: facts.principal,
         observer: collector,
