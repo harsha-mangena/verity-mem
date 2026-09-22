@@ -163,17 +163,15 @@ work on a held-out corpus, not a code change, and it is not done.
   million-claim corpus, so they are fixes under test, not a passing benchmark. The
   honest statement remains that **the one-million-claim p95 is unknown because the
   workload did not finish**. A rerun on a published reference machine is required.
-- **The dense channel's ANN search is global across tenants.** `claim_embeddings_hnsw_idx`
-  indexes the bare `embedding` column with no tenant key. The dense query now carries
-  explicit tenant predicates on both `claims` and `claim_embeddings`, but pgvector applies
-  ordinary filters after an approximate index scan, so the global graph can still consider
-  other tenants' vectors before filtering. On the reference corpus that index holds 1,011,129 vectors
-  from 1,217 tenants at the time of measurement. Beyond the latency consequence above,
-  this is the "filtering after vector search leaks through counts, timing, and generated
-  summaries" case that `docs/isolation-assessment.md` names: the number of candidates
-  scanned, and the latency, depend on how much data *other* tenants hold. A per-tenant
-  index, or partitioning `claim_embeddings` by tenant so the index is local, is the
-  structural fix. It is not fixed here.
+- **The legacy HNSW index is global across tenants, so the read path bypasses it.**
+  `claim_embeddings_hnsw_idx` indexes the bare `embedding` column with no tenant key.
+  An approximate index scan could explore the global graph before ordinary tenant
+  filtering, so another tenant's vector volume could affect this request. The dense
+  channel now forces an exact distance sort *after* tenant, model and authorization
+  filtering. That removes the cross-tenant candidate path, but it does **not** prove
+  acceptable large-tenant latency. The global HNSW index remains in the historical
+  schema and is not a valid read-path optimisation. VM-B1–B3 must benchmark and add
+  physical tenant-local ANN storage before ANN is re-enabled.
 - **The original one-million-claim corpus that exists is incomplete.** The tenant
   `perf-bench-veritymem-perf-v1-1190477` holds 1,185,477 events, spans and claims, of
   which 995,801 are `accepted`, but only **395,000 embeddings** — 40% of the claims have

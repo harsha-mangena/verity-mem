@@ -81,6 +81,11 @@ describe("latency-safe retrieval query shapes", () => {
     assert.equal(statements.length, 2);
     assert.deepEqual(values[0], [QUERY.tenant_id]);
     assert.match(statements[1]!, /e\.tenant_id = \$1::uuid/);
+    assert.match(
+      statements[1]!,
+      /ORDER BY \(e\.embedding <=> \$3::vector\) \+ 0 ASC/,
+      "dense retrieval must remain an exact sort over the tenant-filtered candidate set, not use the global HNSW graph",
+    );
     assert.deepEqual(values[1], [QUERY.tenant_id, ["release_planning"], "[0.25000000,0.50000000]", "test-model", 12]);
   });
 });

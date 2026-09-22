@@ -167,7 +167,7 @@ export async function lexicalChannel(
 // ---------------------------------------------------------------------------
 
 /**
- * pgvector ANN over the claim embedding projection.
+ * Tenant-local exact search over the claim embedding projection.
  *
  * The embedding is computed for the query at read time, which is the one model
  * call the default path is allowed to make *if* a hosted embedder is configured.
@@ -278,7 +278,14 @@ export async function denseChannel(
       WHERE ${where}
         AND e.tenant_id = $1::uuid
         AND e.model_id = $${modelIndex}
-      ORDER BY e.embedding <=> $${vectorIndex}::vector ASC, c.claim_id ASC
+      -- Do not let PostgreSQL choose the global HNSW index here. An HNSW index on
+      -- the embedding column alone explores candidates from every tenant before the ordinary
+      -- tenant predicate is applied, which makes one tenant's vector volume affect
+      -- another tenant's request. The no-op expression keeps this as an exact sort
+      -- over the already tenant/model-filtered rows. A future tenant-partitioned ANN
+      -- implementation may replace this only after its recall and isolation evidence
+      -- exists; see docs/remaining-implementation-plan.md VM-B1/B2.
+      ORDER BY (e.embedding <=> $${vectorIndex}::vector) + 0 ASC, c.claim_id ASC
       LIMIT $${limitIndex}`,
     params,
   );
