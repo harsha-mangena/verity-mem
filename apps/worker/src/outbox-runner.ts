@@ -41,6 +41,8 @@ export interface CycleSummary extends OutboxRunSummary {
 export interface OutboxRunner {
   /** One cycle: claim and handle one batch, then read the lag. */
   runCycle(): Promise<CycleSummary>;
+  /** Read lag without claiming another batch. Used after a bounded drain. */
+  lag(): Promise<number>;
   /** Stop after the batch currently being handled. */
   stop(): void;
   /** Drain until the queue is empty. Used by `--once` and by the reference workload. */
@@ -63,6 +65,7 @@ export function createOutboxRunner(options: OutboxRunnerOptions): OutboxRunner {
 
   return {
     runCycle,
+    lag: () => readProjectionLag(worker, options.tenantIds),
     stop: () => worker.stop(),
     async drain(drainOptions = {}) {
       const maxCycles = drainOptions.maxCycles ?? 10_000;

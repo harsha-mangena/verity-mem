@@ -23,7 +23,7 @@ import { Db, Ledger, MemoryBlobStore, fixedClock, loadEnv, resolveTenantId, seed
 import { createLogger } from "./log.ts";
 import { EXTRACT_KIND, createEntailmentBackend, createGate, createIngestProcessor, createModelExtractor } from "./processors.ts";
 import { readProjectionLag } from "./outbox-runner.ts";
-import { shouldBackOff } from "./main.ts";
+import { drainRunnerOnce, shouldBackOff } from "./main.ts";
 
 describe("worker processors", () => {
   it("registers the kinds the write path enqueues", async () => {
@@ -163,6 +163,34 @@ describe("batch logging", () => {
     assert.equal(parsed["projection_lag_pending"], 7);
     // Sorted keys, so two lines describing the same event diff cleanly.
     assert.deepEqual(Object.keys(parsed), ["ts", "level", "service", "msg", "claimed", "completed", "failed", "kinds", "projection_lag_pending"]);
+  });
+
+  it("reads lag after a bounded drain without claiming another unreported batch", async () => {
+    const lines: string[] = [];
+    const logger = createLogger({ service: "veritymem-worker-test", sink: (line) => lines.push(line) });
+    let drained = 0;
+    let lagReads = 0;
+
+    await drainRunnerOnce(
+      {
+        async drain() {
+          drained += 1;
+          return { claimed: 4, completed: 3, failed: 1, kinds: { "extract.event": 4 } };
+        },
+        async lag() {
+          lagReads += 1;
+          return 2;
+        },
+      },
+      logger,
+    );
+
+    assert.equal(drained, 1);
+    assert.equal(lagReads, 1);
+    assert.equal(lines.length, 1);
+    const logged = JSON.parse(lines[0]!) as Record<string, unknown>;
+    assert.equal(logged["claimed"], 4);
+    assert.equal(logged["projection_lag_pending"], 2);
   });
 });
 

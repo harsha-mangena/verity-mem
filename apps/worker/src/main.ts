@@ -35,7 +35,7 @@ import {
 import { HashEmbeddingBackend, HostedEmbeddingBackend, createProjectionProcessor } from "@veritymem/retrieval";
 import { loadWorkerConfig, type WorkerConfig } from "./config.ts";
 import { createLogger, describeError, type Logger } from "./log.ts";
-import { createOutboxRunner, type CycleSummary } from "./outbox-runner.ts";
+import { createOutboxRunner, type CycleSummary, type OutboxRunner } from "./outbox-runner.ts";
 import {
   createEntailmentBackend,
   createGate,
@@ -209,17 +209,7 @@ export function startWorker(config: WorkerConfig, logger: Logger): WorkerHandle 
     async drainOnce(): Promise<void> {
       await started;
       if (runner === null) return;
-      const summary = await runner.drain();
-      // The lag is read after the drain, so a non-zero value here means messages that
-      // exhausted their attempts rather than messages still in flight.
-      const lag = await runner.runCycle();
-      logger.info("worker.drained", {
-        claimed: summary.claimed,
-        completed: summary.completed,
-        failed: summary.failed,
-        kinds: summary.kinds,
-        projection_lag_pending: lag.projection_lag,
-      });
+      await drainRunnerOnce(runner, logger);
     },
     async shutdown(reason: string): Promise<void> {
       if (closing) return;
@@ -242,6 +232,29 @@ export function startWorker(config: WorkerConfig, logger: Logger): WorkerHandle 
       logger.info("worker.stopped", { reason });
     },
   };
+}
+
+/**
+ * Drain a runner and report the lag without claiming another batch.
+ *
+ * Kept outside `startWorker` so the bounded `--once` contract can be tested with
+ * a fake runner. The distinction is important: `runCycle()` is a mutation, while
+ * `lag()` is an observation. Calling the former merely to obtain a metric makes
+ * the reported totals omit real work.
+ */
+export async function drainRunnerOnce(
+  runner: Pick<OutboxRunner, "drain" | "lag">,
+  logger: Logger,
+): Promise<void> {
+  const summary = await runner.drain();
+  const lag = await runner.lag();
+  logger.info("worker.drained", {
+    claimed: summary.claimed,
+    completed: summary.completed,
+    failed: summary.failed,
+    kinds: summary.kinds,
+    projection_lag_pending: lag,
+  });
 }
 
 /** Wire signal handlers to a graceful shutdown. */
